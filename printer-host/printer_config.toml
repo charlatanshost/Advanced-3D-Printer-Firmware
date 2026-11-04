@@ -1,0 +1,112 @@
+[printer]
+name = "Advanced 3D Printer"
+description = "LinuxCNC-style 3D printer with multi-motor support"
+version = "1.0.0"
+build_date = "2025-09-29"
+
+[kinematics]
+kinematics_type = "cartesian"
+max_z_velocity = 25.0
+max_z_accel = 300.0
+square_corner_velocity = 5.0
+
+[kinematics.five_axis_machine_type.ToolheadRotary]
+tool_offset = 45.0
+tilt_limits = [
+    -45.0,
+    45.0,
+]
+rotation_limits = [
+    -180.0,
+    180.0,
+]
+gear_ratios = [
+    50.0,
+    30.0,
+]
+steps_per_degree = [
+    11.11,
+    6.67,
+]
+
+[motors.stepper_x]
+motor_type = "Stepper"
+enable_pin = "PA1"
+step_pin = "PA2"
+dir_pin = "PA3"
+steps_per_mm = 80.0
+max_velocity = 300.0
+max_acceleration = 3000.0
+microsteps = 16
+current = 0.8
+hold_current = 0.5
+interpolate = true
+stealthchop_threshold = 999999
+
+[motors.stepper_x.function]
+XAxis = 0
+
+[extruders.extruder]
+motor = "extruder_stepper"
+heater_pin = "PA0"
+sensor_type = "Thermistor"
+sensor_pin = "PA4"
+min_temp = 0.0
+max_temp = 250.0
+max_power = 1.0
+nozzle_diameter = 0.4
+filament_diameter = 1.75
+
+[extruders.extruder.pressure_advance]
+pressure_advance = 0.0
+smooth_time = 0.04
+max_lookahead_distance = 5.0
+min_segment_time = 0.001
+
+[extruders.extruder.retraction]
+retract_length = 0.5
+retract_speed = 25.0
+unretract_extra_length = 0.0
+unretract_speed = 25.0
+
+[temperature]
+pid_ki_max = 1.0
+pid_kd_max = 2.0
+max_temp_error = 30.0
+thermal_protection = true
+thermal_protection_period = 40.0
+thermal_protection_hysteresis = 4.0
+
+[input_shaping]
+shaper_type_x = "MZV"
+shaper_type_y = "MZV"
+shaper_damping_ratio_x = 0.1
+shaper_damping_ratio_y = 0.1
+
+[motion]
+max_velocity = 300.0
+max_accel = 3000.0
+minimum_cruise_ratio = 0.5
+square_corner_velocity = 5.0
+max_accel_to_decel = 1500.0
+
+[communication]
+baudrate = 250000
+serial_port = "/dev/ttyUSB0"
+restart_method = "command"
+enable_can = false
+can_bitrate = 500000
+can_interface = "can0"
+
+[safety]
+min_temp = 0.0
+max_temp = 250.0
+max_hotend_temp = 275.0
+max_bed_temp = 110.0
+timeout_idle = 600.0
+timeout_long_idle = 1800.0
+homing_speed = 50.0
+second_homing_speed = 10.0
+homing_retract_dist = 5.0
+
+[macros]

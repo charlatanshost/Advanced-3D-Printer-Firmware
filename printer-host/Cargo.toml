@@ -1,0 +1,124 @@
+[package]
+name = "printer-host"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+[dependencies]
+printer-kinematics = { path = "../printer-kinematics" }
+eframe = { version = "0.32.2", default-features = false, features = ["wgpu", "default_fonts"] }
+toml = "0.9.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
+nalgebra = "0.34"
+libloading = { version = "0.8", optional = true }
+tokio = { version = "1.0", features = ["full"] }
+clap = { version = "4.5", features = ["derive"] }
+bytemuck = "1.16"
+winit = "0.30"
+futures = "0.3"
+serialport = "4.4"
+ethercrab = { version = "0.6.0", features = ["std"] }
+pnet = "0.35.0"
+gcode-parser = { path = "../printer-host/gcode-parser", optional = true }
+rfd = "0.15.0"
+wgpu = { version = "25", features = ["dx12", "vulkan"] }
+
+# Fieldbus and industrial communication protocols
+modbus = { version = "1.0", optional = true }
+socketcan = { version = "3.3", optional = true }  # For CANopen on Linux
+bxcan = { version = "0.7", optional = true }        # For STM32 CAN support  
+embedded-can = { version = "0.4", optional = true }  # Embedded CAN traits
+heapless = "0.8"      # No-std collections
+nb = "1.1"                                           # Non-blocking APIs
+embedded-hal = "0.2"                                 # Hardware abstraction
+
+# Input shaping and motion control
+# micro-math = { version = "2.0", optional = true }   # Fast math functions for embedded (not available)
+libm = { version = "0.2", optional = true }         # Mathematical functions
+fixed = { version = "1.24", optional = true }       # Fixed-point arithmetic for real-time
+num-traits = { version = "0.2", default-features = false }
+rustfft = { version = "6.0", optional = true }
+
+# Plugin system dependencies
+mlua = { version = "0.9", features = ["lua54", "async"], optional = true }  # Lua scripting
+wasmtime = { version = "26.0", optional = true }    # WebAssembly runtime
+
+# Accelerometer support  
+adxl345 = { version = "0.0.4", optional = true }    # ADXL345 accelerometer driver
+mpu9250 = { version = "0.25", optional = true }      # MPU9250 IMU driver
+lsm6ds33 = { version = "0.4", optional = true }      # LSM6DS33 accelerometer/gyro
+
+# Network and communication utilities
+socket2 = "0.5"
+mio = "1.0"
+bytes = "1.0"
+
+# Protocol parsing and utilities
+nom = "7.1"           # Parser combinators for protocol parsing
+thiserror = "1.0"     # Error handling
+anyhow = "1.0"        # Flexible error handling
+hex = "0.4"           # Hex encoding/decoding for protocol data
+crc = "3.0"           # CRC calculations for protocol validation
+
+# Async runtime for communication handling
+tokio-util = { version = "0.7", features = ["codec", "net"] }
+tokio-modbus = { version = "0.11", optional = true }
+
+# Time and scheduling for protocol timing
+instant = "0.1"       # Cross-platform instant timing
+timer = "0.2"         # Timer utilities
+
+# Additional industrial protocol implementations
+# backnet = { version = "0.8", optional = true }    # BACnet protocol support (not available)
+url = "2.5"             # URL parsing for web-based protocols
+base64 = { version = "0.22", optional = true }         # Base64 encoding for protocol authentication
+md5 = { version = "0.7", optional = true }             # MD5 hashing for legacy protocol authentication
+sha2 = { version = "0.10", optional = true }           # SHA-2 family for modern authentication
+uuid = "1.10"           # UUID generation for device identification
+rand = "0.8"            # Random number generation
+log = "0.4"             # Logging framework
+env_logger = "0.11"     # Environment-based logging
+
+# Performance optimization dependencies
+rayon = "1.10"          # Data parallelism
+num_cpus = "1.16"       # CPU core detection for parallel processing
+
+# Time-related utilities
+
+# Network scanning and discovery
+pnet_datalink = { version = "0.35", optional = true }  # Network interface access
+ping = { version = "0.5", optional = true }            # ICMP ping utilities
+
+# Windows EtherCAT support (optional)
+pcap = { version = "2.0", optional = true }            # WinPcap/Npcap for Windows packet capture (requires Npcap installation)
+winapi = { version = "0.3", features = ["winbase", "winsock2", "ws2def", "iphlpapi"], optional = true }
+
+# Protocol-specific implementations (when available)
+# Note: Some specialized industrial protocol crates may not be available on crates.io
+
+[build-dependencies]
+cc = "1.0"
+glob = "0.3"
+
+[features]
+default = ["gcode-parser", "input-shaping", "security"]
+dynamic = ["printer-kinematics/dynamic", "libloading"]
+fieldbus = ["modbus", "socketcan", "tokio-modbus"]
+industrial-protocols = ["fieldbus"]
+protocol-discovery = ["pnet_datalink", "ping"]
+security = ["base64", "md5", "sha2"]
+backnet = []
+can-toolheads = ["socketcan", "bxcan", "embedded-can"]
+klipper-can = ["can-toolheads"]
+input-shaping = ["libm", "fixed", "rustfft"]
+accelerometers = ["adxl345", "mpu9250", "lsm6ds33"]
+advanced-motion = ["input-shaping", "accelerometers"]
+plugins = ["mlua", "wasmtime"]
+sensor-fusion = ["input-shaping", "accelerometers"]
+volumetric-compensation = ["input-shaping"]
+auto-calibration = ["input-shaping", "rustfft", "accelerometers"]
+windows-ethercat = ["pcap", "winapi"]
+full-protocols = ["industrial-protocols", "protocol-discovery", "security", "klipper-can", "advanced-motion", "plugins", "sensor-fusion", "volumetric-compensation", "auto-calibration"]

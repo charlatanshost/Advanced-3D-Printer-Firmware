@@ -1,0 +1,13 @@
+# Rust build output (any crate in this workspace)
+target/
+
+# Claude Code per-machine settings
+.claude/settings.local.json
+
+# OS clutter
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local network capture (contains MAC address and hostname)
+ethercat packet.pcapng

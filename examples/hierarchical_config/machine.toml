@@ -1,0 +1,114 @@
+# Base Machine Configuration
+# This is the foundation config that defines the core printer characteristics
+
+[printer]
+name = "CoreXY Advanced Printer"
+type = "corexy"
+manufacturer = "Custom Build"
+version = "2.1"
+
+[kinematics]
+type = "corexy"
+bed_size = [300.0, 300.0, 400.0]  # X, Y, Z in mm
+homing_direction = [-1, -1, -1]   # Home to min endstops
+home_offset = [0.0, 0.0, 0.0]
+
+# Base motor configuration - can be overridden by toolhead configs
+[motors]
+# CoreXY A/B motors
+[motors.a]
+steps_per_mm = 80.0
+max_speed = 200.0      # mm/s
+max_acceleration = 3000.0  # mm/s²
+driver_current = 1.2   # A
+microsteps = 16
+motor_type = "NEMA17"
+
+[motors.b] 
+steps_per_mm = 80.0
+max_speed = 200.0
+max_acceleration = 3000.0
+driver_current = 1.2
+microsteps = 16
+motor_type = "NEMA17"
+
+# Z motor(s)
+[motors.z]
+steps_per_mm = 400.0
+max_speed = 20.0
+max_acceleration = 500.0
+driver_current = 1.4
+microsteps = 16
+motor_type = "NEMA17"
+lead_screw_pitch = 2.0  # mm per revolution
+
+# Frame and mechanical properties
+[frame]
+material = "aluminum_extrusion"
+stiffness_factor = 1.0
+thermal_expansion_coefficient = 23e-6  # /°C
+resonant_frequencies = [40.0, 85.0, 120.0]  # Hz
+
+[heated_bed]
+size = [300.0, 300.0]   # mm
+material = "aluminum"
+thickness = 6.0         # mm
+heater_power = 750      # W
+thermistor_type = "NTC_100K"
+max_temp = 120.0        # °C
+pid = { kp = 54.0, ki = 0.41, kd = 1766.0 }
+
+[chamber]
+enable_heating = true
+max_temp = 80.0         # °C
+circulation_fan = true
+air_filter = true
+
+[communication]
+protocol = "EtherCAT"
+interface = "eth0"
+node_id = 1
+cycle_time = 0.001      # 1ms
+
+[safety]
+emergency_stop = true
+software_endstops = true
+thermal_protection = true
+power_loss_recovery = true
+filament_runout_detection = true
+
+[features]
+input_shaping = true
+pressure_advance = true
+linear_advance = true
+mesh_bed_leveling = true
+exclude_objects = true
+
+# Advanced control settings
+[control]
+mode = "hybrid"          # Options: "pid", "state_space", "mpc", "hybrid"
+sample_rate = 1000.0     # Hz
+prediction_horizon = 10  # For MPC
+control_horizon = 5      # For MPC
+
+[control.state_space]
+position_weight = 100.0
+velocity_weight = 10.0
+acceleration_weight = 1.0
+jerk_weight = 0.1
+
+[control.mpc]
+prediction_steps = 10
+control_steps = 5
+position_penalty = 100.0
+velocity_penalty = 10.0
+input_penalty = 1.0
+
+# Digital twin simulation parameters
+[simulation]
+enable_physics = true
+enable_thermal = true
+update_rate = 1000.0     # Hz
+thermal_time_constant = 30.0  # seconds
+mechanical_damping = 0.1
+friction_coefficient = 0.05

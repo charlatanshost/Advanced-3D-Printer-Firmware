@@ -1,0 +1,42 @@
+# 3D Printer Configuration File
+[printer]
+name = "Test Printer"
+kinematics = "cartesian"  # or "corexy", "delta", etc.
+max_velocity = 100.0  # mm/s
+
+[kinematics]
+# Basic printer dimensions (in mm)
+bed_x = 200.0
+bed_y = 200.0
+bed_z = 200.0
+
+# Motor configuration
+[motors]
+steps_per_mm = [80.0, 80.0, 400.0, 93.0, 93.0]  # X, Y, Z, A, B
+max_speed = [100.0, 100.0, 10.0, 50.0, 50.0]    # mm/s
+acceleration = [1000.0, 1000.0, 100.0, 500.0, 500.0]  # mm/s²
+
+[communication]
+protocol = "EtherCAT"  # Options: "EtherCAT", "Serial", "CANopen", "Profibus", "ModbusTCP", "ModbusRTU", "DeviceNet", "ControlNet"
+device = "eth0"  # Network interface for EtherCAT or device path for Serial
+
+# Serial and Modbus RTU settings
+baud_rate = 115200
+serial_port = "COM3"
+
+# CANopen settings  
+canopen_node_id = 1
+canopen_baudrate = 1000000  # bps
+
+# Profibus settings
+profibus_address = 2
+profibus_baudrate = 12000000  # bps
+
+# Modbus TCP settings
+modbus_tcp_ip = "192.168.1.100"
+modbus_tcp_port = 502
+modbus_device_id = 1
+
+# DeviceNet settings
+devicenet_node_address = 63
+devicenet_baudrate = 500000  # bps

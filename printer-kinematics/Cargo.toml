@@ -1,0 +1,17 @@
+[package]
+name = "printer-kinematics"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+nalgebra = { version = "0.34", features = ["serde-serialize"] }
+libloading = { version = "0.8", optional = true }
+gcode-parser = { path = "../printer-host/gcode-parser" }
+libm = "0.2"
+
+[features]
+default = ["std"]
+std = []
+dynamic = ["libloading"]

@@ -1,0 +1,18 @@
+{
+  "total_power_losses": 2,
+  "successful_recoveries": 0,
+  "failed_recoveries": 0,
+  "average_recovery_time": {
+    "secs": 0,
+    "nanos": 0
+  },
+  "last_power_loss": {
+    "secs_since_epoch": 1757643296,
+    "nanos_since_epoch": 878746600
+  },
+  "longest_print_recovered": {
+    "secs": 0,
+    "nanos": 0
+  },
+  "recovery_success_rate": 0.0
+}

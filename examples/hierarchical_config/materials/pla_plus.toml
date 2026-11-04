@@ -1,0 +1,133 @@
+# PLA+ Material Configuration
+# Material-specific settings that override toolhead and machine defaults
+
+[material]
+name = "PLA+"
+type = "thermoplastic"
+manufacturer = "Generic"
+density = 1.24          # g/cm³
+glass_transition_temp = 60.0  # °C
+melting_temp = 150.0    # °C
+
+[temperatures]
+nozzle = 220.0          # °C - typical PLA+ temp
+nozzle_min = 200.0      # °C
+nozzle_max = 240.0      # °C
+bed = 60.0              # °C
+bed_min = 50.0          # °C
+bed_max = 80.0          # °C
+chamber = 0.0           # °C - not needed for PLA+
+
+# Temperature tower test settings
+tower_start_temp = 200.0
+tower_end_temp = 240.0
+tower_temp_step = 5.0
+
+[extrusion]
+# Override extruder settings for this material
+retract_length = 1.0    # mm - PLA+ can handle slightly longer retracts
+retract_speed = 40.0    # mm/s
+unretract_speed = 40.0  # mm/s
+retract_before_wipe = true
+wipe_length = 2.0       # mm
+
+# Flow and pressure settings
+flow_ratio = 1.0        # Material flow multiplier
+pressure_advance = 0.04 # Typical for PLA+ at standard speeds
+linear_advance = 0.0    # Use pressure advance instead
+
+# Speed limits
+max_volumetric_speed = 12.0  # mm³/s
+max_print_speed = 80.0       # mm/s
+max_travel_speed = 150.0     # mm/s
+
+[cooling]
+# Fan speeds optimized for PLA+
+min_fan_speed = 40      # % - minimum for good layer adhesion
+max_fan_speed = 100     # % - can handle full cooling
+bridge_fan_speed = 100  # % - maximum cooling for bridges
+overhang_fan_speed = 100  # %
+
+# Fan speed by layer
+fan_below_layer_time = 20   # seconds - if layer time < this, increase fan
+slowdown_below_layer_time = 10  # seconds - slow down print if layer time < this
+min_print_speed = 15.0      # mm/s - don't go slower than this
+
+# Temperature-based fan control
+disable_fan_first_layers = 2  # Don't use part cooling for first N layers
+full_fan_speed_layer = 4      # Use full fan speed from layer N onwards
+
+[mechanical]
+# Material mechanical properties affecting print settings
+shrinkage_factor = 0.003    # Linear shrinkage (0.3%)
+warping_tendency = "low"    # Options: "none", "low", "medium", "high"
+bridging_capability = "excellent"
+overhang_angle = 45.0       # degrees - maximum unsupported overhang
+
+# Layer adhesion
+layer_adhesion = "excellent"
+first_layer_temp_offset = 5.0  # °C higher for first layer
+first_layer_speed_factor = 0.5  # Slower first layer
+
+[advanced_settings]
+# Acceleration and jerk limits for this material
+max_acceleration = 3000.0   # mm/s² - PLA+ can handle high accelerations
+max_jerk = 8.0             # mm/s - moderate jerk for good quality
+corner_velocity = 1.0      # mm/s - for sharp corners
+
+# Pressure advance tuning
+pa_smooth_time = 0.04      # seconds
+pa_test_pattern = "tower"  # Options: "line", "tower", "calibration_cube"
+
+[support_settings]
+# Support material settings when printing this material
+support_interface_temp_offset = -5.0  # °C cooler for easy removal
+support_fan_speed = 100               # % - full cooling for supports
+support_flow_ratio = 0.9              # Slightly underextrude supports
+
+[post_processing]
+# Post-processing recommendations
+annealing_temp = 70.0       # °C - optional annealing temperature
+annealing_time = 60         # minutes
+recommended_infill = 20     # % - typical infill percentage
+recommended_layer_height = 0.2  # mm
+recommended_line_width = 0.4    # mm
+
+[troubleshooting]
+# Common issues and solutions for this material
+stringing_temp_reduction = 10   # °C - reduce temp if stringing occurs
+adhesion_temp_increase = 5      # °C - increase bed temp for better adhesion
+warping_chamber_temp = 30       # °C - chamber temp to reduce warping
+
+# Diagnostic print settings
+temp_tower_enabled = true
+retraction_tower_enabled = true
+flow_calibration_enabled = true
+pressure_advance_calibration_enabled = true
+
+[quality_presets]
+# Predefined quality settings for this material
+
+[quality_presets.draft]
+layer_height = 0.3
+line_width = 0.5
+speed = 80.0
+infill = 10
+
+[quality_presets.normal]
+layer_height = 0.2
+line_width = 0.4
+speed = 60.0
+infill = 20
+
+[quality_presets.fine]
+layer_height = 0.1
+line_width = 0.35
+speed = 40.0
+infill = 25
+
+[quality_presets.ultra_fine]
+layer_height = 0.05
+line_width = 0.3
+speed = 25.0
+infill = 30

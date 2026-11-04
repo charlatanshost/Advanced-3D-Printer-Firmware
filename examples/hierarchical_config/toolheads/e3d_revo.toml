@@ -1,0 +1,137 @@
+# E3D Revo Toolhead Configuration
+# Inherits from machine.toml and overrides/adds toolhead-specific settings
+
+[toolhead]
+name = "E3D Revo Six"
+type = "direct_drive"
+manufacturer = "E3D"
+weight = 180.0          # grams
+x_offset = 0.0          # mm from nozzle
+y_offset = 0.0          # mm from nozzle
+
+[extruder]
+# Override base extruder motor settings
+steps_per_mm = 690.0    # Calculated for Revo with specific gearing
+max_speed = 25.0        # mm/s
+max_acceleration = 1500.0  # mm/s²
+max_extrude_only_velocity = 50.0
+max_extrude_only_accel = 3000.0
+driver_current = 0.8    # A
+microsteps = 16
+gear_ratio = 3.5        # Gearing ratio
+filament_diameter = 1.75
+
+# Pressure advance and linear advance
+pressure_advance = 0.035
+linear_advance_factor = 0.0  # Disabled when using pressure advance
+
+# Retraction settings
+retract_length = 0.5    # mm - short for direct drive
+retract_speed = 35.0    # mm/s
+unretract_speed = 35.0  # mm/s
+retract_before_wipe = false
+retract_layer_change = true
+
+[hotend]
+name = "E3D Revo Six"
+type = "all_metal"
+thermistor_type = "PT1000"
+thermistor_pullup = 1000.0
+max_temp = 300.0        # °C
+min_temp = 10.0         # °C
+
+# Thermal characteristics specific to Revo
+thermal_mass = 35.0     # J/K
+heat_capacity = 450.0   # J/(kg⋅K)
+thermal_conductivity = 16.0  # W/(m⋅K) - aluminum
+surface_area = 0.0008   # m²
+
+# PID tuning for Revo Six
+pid = { kp = 28.5, ki = 1.65, kd = 123.0 }
+
+# Advanced thermal control
+thermal_protection = true
+runaway_timeout = 20    # seconds
+runaway_temp_delta = 5.0  # °C
+thermal_lag_compensation = true
+
+[heater]
+power_rating = 40.0     # W
+heater_pin = "PA2"
+sensor_pin = "PA3"
+pwm_frequency = 1000    # Hz
+bang_bang = false       # Use PID control
+max_power = 1.0         # 100%
+min_power = 0.0         # 0%
+
+[cooling]
+# Part cooling fan
+part_cooling_pin = "PA4"
+part_cooling_pwm_freq = 25000  # 25kHz for quiet operation
+max_part_cooling_speed = 255
+min_part_cooling_speed = 0
+kickstart_time = 0.1    # seconds
+
+# Hotend cooling fan
+hotend_cooling_pin = "PA5"
+hotend_cooling_pwm_freq = 25000
+hotend_fan_speed = 255  # Always on at 100%
+hotend_fan_min_temp = 50.0  # °C
+
+[probe]
+type = "inductive"      # Revo has optional inductive probe
+pin = "PC5"
+x_offset = 24.0         # mm
+y_offset = 5.0          # mm
+z_offset = 0.0          # To be calibrated
+speed = 5.0             # mm/s
+samples = 3
+sample_retract_dist = 2.0  # mm
+probe_with_nozzle = false
+
+[nozzle_defaults]
+# Default settings for standard brass nozzle
+diameter = 0.4          # mm
+material = "brass"
+thermal_conductivity = 400.0  # W/(m⋅K)
+max_volumetric_speed = 15.0    # mm³/s
+
+# Flow calibration
+flow_rate_multiplier = 1.0
+linear_advance_factor = 0.0
+
+[toolchange]
+# For multi-tool systems
+parking_position = [0.0, 300.0, 100.0]  # X, Y, Z
+park_speed = 50.0       # mm/s
+unpark_speed = 100.0    # mm/s
+change_sequence = [
+    "park_current_tool",
+    "move_to_toolchanger", 
+    "release_tool",
+    "pickup_new_tool",
+    "prime_nozzle"
+]
+
+[advanced_features]
+# Enable advanced motion features for this toolhead
+input_shaping = true
+pressure_advance = true
+volumetric_extrusion = false
+wipe_tower = true
+
+# Acceleration limits for this toolhead weight
+max_xy_accel_with_toolhead = 2500.0  # mm/s² (reduced due to weight)
+max_z_accel_with_toolhead = 400.0    # mm/s²
+
+[calibration]
+# Store calibration values specific to this toolhead
+e_steps_calibrated = false
+pressure_advance_calibrated = false
+flow_rate_calibrated = false
+thermal_calibrated = false
+
+# Calibration procedure settings
+e_steps_test_length = 100.0    # mm
+pa_test_speeds = [50.0, 100.0, 150.0]  # mm/s
+flow_test_speeds = [50.0, 100.0]       # mm/s

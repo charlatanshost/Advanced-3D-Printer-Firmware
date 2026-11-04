@@ -1,0 +1,15 @@
+[submodule "fieldbus-libs/p-net"]
+	path = fieldbus-libs/p-net
+	url = https://github.com/rtlabs-com/p-net.git
+[submodule "fieldbus-libs/m-bus"]
+	path = fieldbus-libs/m-bus
+	url = https://github.com/rtlabs-com/m-bus.git
+[submodule "fieldbus-libs/c-open"]
+	path = fieldbus-libs/c-open
+	url = https://github.com/rtlabs-com/c-open.git
+[submodule "fieldbus-libs/c-link"]
+	path = fieldbus-libs/c-link
+	url = https://github.com/rtlabs-com/c-link.git
+[submodule "fieldbus-libs/i-link"]
+	path = fieldbus-libs/i-link
+	url = https://github.com/rtlabs-com/i-link.git

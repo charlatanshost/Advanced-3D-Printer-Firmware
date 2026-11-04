@@ -1,0 +1,864 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Printer Control Panel</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f5f5;
+            color: #333;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .header {
+            background: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .header h1 {
+            color: #2c3e50;
+            margin-bottom: 10px;
+        }
+
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+
+        .status-card {
+            background: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+
+        .status-card h3 {
+            color: #2c3e50;
+            margin-bottom: 10px;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .status-value {
+            font-size: 2em;
+            font-weight: bold;
+            color: #3498db;
+        }
+
+        .temperature .status-value {
+            color: #e74c3c;
+        }
+
+        .progress .status-value {
+            color: #27ae60;
+        }
+
+        .tabs {
+            display: flex;
+            background: #fff;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            overflow: hidden;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .tab {
+            flex: 1;
+            padding: 15px;
+            background: #ecf0f1;
+            border: none;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background 0.3s;
+        }
+
+        .tab.active {
+            background: #3498db;
+            color: white;
+        }
+
+        .tab:hover {
+            background: #2980b9;
+            color: white;
+        }
+
+        .tab-content {
+            background: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+
+        .form-group input,
+        .form-group select {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 16px;
+        }
+
+        .form-group input:focus,
+        .form-group select:focus {
+            outline: none;
+            border-color: #3498db;
+            box-shadow: 0 0 5px rgba(52, 152, 219, 0.3);
+        }
+
+        .button {
+            background: #3498db;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background 0.3s;
+            margin-right: 10px;
+            margin-bottom: 10px;
+        }
+
+        .button:hover {
+            background: #2980b9;
+        }
+
+        .button.danger {
+            background: #e74c3c;
+        }
+
+        .button.danger:hover {
+            background: #c0392b;
+        }
+
+        .button.success {
+            background: #27ae60;
+        }
+
+        .button.success:hover {
+            background: #229954;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+        }
+
+        .object-list {
+            max-height: 400px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+
+        .object-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px;
+            border-bottom: 1px solid #eee;
+        }
+
+        .object-item:last-child {
+            border-bottom: none;
+        }
+
+        .object-status {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            text-transform: uppercase;
+            font-weight: bold;
+        }
+
+        .status-pending { background: #f39c12; color: white; }
+        .status-printing { background: #3498db; color: white; }
+        .status-completed { background: #27ae60; color: white; }
+        .status-excluded { background: #95a5a6; color: white; }
+        .status-failed { background: #e74c3c; color: white; }
+
+        .emergency-stop {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 1000;
+        }
+
+        .alert {
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 4px;
+        }
+
+        .alert-success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .alert-danger {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .alert-info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                padding: 10px;
+            }
+            
+            .tabs {
+                flex-direction: column;
+            }
+            
+            .grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <button class="button danger emergency-stop" onclick="emergencyStop()">
+        🛑 EMERGENCY STOP
+    </button>
+
+    <div class="container">
+        <div class="header">
+            <h1>3D Printer Control Panel</h1>
+            <p>Advanced firmware configuration and monitoring interface</p>
+        </div>
+
+        <div id="alerts"></div>
+
+        <div class="status-grid">
+            <div class="status-card temperature">
+                <h3>Hotend Temperature</h3>
+                <div class="status-value" id="hotend-temp">25°C</div>
+                <div>Target: <span id="hotend-target">0°C</span></div>
+            </div>
+            <div class="status-card temperature">
+                <h3>Bed Temperature</h3>
+                <div class="status-value" id="bed-temp">25°C</div>
+                <div>Target: <span id="bed-target">0°C</span></div>
+            </div>
+            <div class="status-card progress">
+                <h3>Print Progress</h3>
+                <div class="status-value" id="print-progress">0%</div>
+                <div>Layer: <span id="current-layer">0</span></div>
+            </div>
+            <div class="status-card">
+                <h3>Position</h3>
+                <div style="font-size: 14px;">
+                    X: <span id="pos-x">0</span>mm<br>
+                    Y: <span id="pos-y">0</span>mm<br>
+                    Z: <span id="pos-z">0</span>mm
+                </div>
+            </div>
+        </div>
+
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('configuration')">Configuration</button>
+            <button class="tab" onclick="switchTab('objects')">Print Objects</button>
+            <button class="tab" onclick="switchTab('recovery')">Power Recovery</button>
+            <button class="tab" onclick="switchTab('profiles')">Profiles</button>
+        </div>
+
+        <div id="configuration" class="tab-content active">
+            <h2>Printer Configuration</h2>
+            <div class="grid">
+                <div>
+                    <h3>Motion Settings</h3>
+                    <div class="form-group">
+                        <label>Max Feedrate X (mm/min)</label>
+                        <input type="number" id="max-feedrate-x" step="1" min="1" max="1000">
+                    </div>
+                    <div class="form-group">
+                        <label>Max Feedrate Y (mm/min)</label>
+                        <input type="number" id="max-feedrate-y" step="1" min="1" max="1000">
+                    </div>
+                    <div class="form-group">
+                        <label>Max Feedrate Z (mm/min)</label>
+                        <input type="number" id="max-feedrate-z" step="0.1" min="0.1" max="50">
+                    </div>
+                    <div class="form-group">
+                        <label>Steps per mm X</label>
+                        <input type="number" id="steps-per-mm-x" step="0.1" min="1" max="1000">
+                    </div>
+                </div>
+                <div>
+                    <h3>Temperature Settings</h3>
+                    <div class="form-group">
+                        <label>Max Hotend Temperature (°C)</label>
+                        <input type="number" id="hotend-max-temp" step="1" min="100" max="500">
+                    </div>
+                    <div class="form-group">
+                        <label>Max Bed Temperature (°C)</label>
+                        <input type="number" id="bed-max-temp" step="1" min="50" max="200">
+                    </div>
+                    <div class="form-group">
+                        <label>PID Hotend Kp</label>
+                        <input type="number" id="pid-hotend-kp" step="0.1">
+                    </div>
+                    <div class="form-group">
+                        <label>PID Hotend Ki</label>
+                        <input type="number" id="pid-hotend-ki" step="0.01">
+                    </div>
+                </div>
+                <div>
+                    <h3>Extruder Settings</h3>
+                    <div class="form-group">
+                        <label>Filament Diameter (mm)</label>
+                        <input type="number" id="filament-diameter" step="0.01" min="1" max="5">
+                    </div>
+                    <div class="form-group">
+                        <label>Nozzle Diameter (mm)</label>
+                        <input type="number" id="nozzle-diameter" step="0.01" min="0.1" max="2">
+                    </div>
+                    <div class="form-group">
+                        <label>Retract Length (mm)</label>
+                        <input type="number" id="retract-length" step="0.1" min="0" max="20">
+                    </div>
+                </div>
+                <div>
+                    <h3>Safety Features</h3>
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="thermal-protection"> Thermal Protection
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="power-loss-recovery"> Power Loss Recovery
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="exclude-objects"> Exclude Objects
+                        </label>
+                    </div>
+                </div>
+            </div>
+            <div style="margin-top: 20px;">
+                <button class="button success" onclick="saveConfiguration()">Save Configuration</button>
+                <button class="button" onclick="resetConfiguration()">Reset to Defaults</button>
+                <button class="button" onclick="exportConfiguration()">Export Config</button>
+                <input type="file" id="import-file" style="display: none;" onchange="importConfiguration()">
+                <button class="button" onclick="document.getElementById('import-file').click()">Import Config</button>
+            </div>
+        </div>
+
+        <div id="objects" class="tab-content">
+            <h2>Print Objects Management</h2>
+            <p>Manage individual objects in multi-part prints. You can exclude failed parts and continue printing the rest.</p>
+            
+            <div class="object-list" id="objects-list">
+                <div class="object-item">
+                    <span>No objects loaded</span>
+                </div>
+            </div>
+
+            <div style="margin-top: 20px;">
+                <button class="button" onclick="refreshObjects()">Refresh Objects</button>
+                <button class="button danger" onclick="excludeAllFailed()">Exclude Failed Objects</button>
+            </div>
+        </div>
+
+        <div id="recovery" class="tab-content">
+            <h2>Power Loss Recovery</h2>
+            <div id="recovery-info">
+                <p>No recovery data available.</p>
+            </div>
+        </div>
+
+        <div id="profiles" class="tab-content">
+            <h2>Configuration Profiles</h2>
+            <div class="form-group">
+                <label>Profile Name</label>
+                <input type="text" id="profile-name" placeholder="Enter profile name">
+                <button class="button success" onclick="saveProfile()">Save Current as Profile</button>
+            </div>
+            
+            <div class="object-list" id="profiles-list">
+                <div class="object-item">
+                    <span>No saved profiles</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let updateInterval = null;
+
+        // Initialize the interface
+        document.addEventListener('DOMContentLoaded', function() {
+            connectWebSocket();
+            loadConfiguration();
+            startStatusUpdates();
+        });
+
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.hostname}:8080`;
+            
+            ws = new WebSocket(wsUrl);
+            
+            ws.onopen = function() {
+                showAlert('Connected to printer', 'success');
+            };
+            
+            ws.onmessage = function(event) {
+                const message = JSON.parse(event.data);
+                handleWebSocketMessage(message);
+            };
+            
+            ws.onclose = function() {
+                showAlert('Disconnected from printer', 'danger');
+                setTimeout(connectWebSocket, 5000);
+            };
+        }
+
+        function handleWebSocketMessage(message) {
+            switch(message.message_type) {
+                case 'status_update':
+                    updateStatus(JSON.parse(message.data));
+                    break;
+                case 'object_update':
+                    refreshObjects();
+                    break;
+            }
+        }
+
+        function startStatusUpdates() {
+            updateInterval = setInterval(updatePrinterStatus, 2000);
+        }
+
+        async function updatePrinterStatus() {
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+                
+                if (data.success) {
+                    updateStatus(data.data);
+                }
+            } catch (error) {
+                console.error('Failed to update status:', error);
+            }
+        }
+
+        function updateStatus(status) {
+            document.getElementById('hotend-temp').textContent = `${status.current_temp_hotend}°C`;
+            document.getElementById('hotend-target').textContent = `${status.target_temp_hotend}°C`;
+            document.getElementById('bed-temp').textContent = `${status.current_temp_bed}°C`;
+            document.getElementById('bed-target').textContent = `${status.target_temp_bed}°C`;
+            document.getElementById('print-progress').textContent = `${status.print_progress}%`;
+            document.getElementById('current-layer').textContent = status.current_layer;
+            document.getElementById('pos-x').textContent = status.position[0].toFixed(1);
+            document.getElementById('pos-y').textContent = status.position[1].toFixed(1);
+            document.getElementById('pos-z').textContent = status.position[2].toFixed(2);
+        }
+
+        function switchTab(tabName) {
+            // Hide all tabs
+            const contents = document.querySelectorAll('.tab-content');
+            contents.forEach(content => content.classList.remove('active'));
+            
+            // Remove active class from all tabs
+            const tabs = document.querySelectorAll('.tab');
+            tabs.forEach(tab => tab.classList.remove('active'));
+            
+            // Show selected tab
+            document.getElementById(tabName).classList.add('active');
+            event.target.classList.add('active');
+            
+            // Load tab-specific data
+            switch(tabName) {
+                case 'objects':
+                    refreshObjects();
+                    break;
+                case 'recovery':
+                    checkRecoveryData();
+                    break;
+                case 'profiles':
+                    loadProfiles();
+                    break;
+            }
+        }
+
+        async function loadConfiguration() {
+            try {
+                const response = await fetch('/api/config');
+                const data = await response.json();
+                
+                if (data.success) {
+                    populateConfigForm(data.data);
+                }
+            } catch (error) {
+                showAlert('Failed to load configuration', 'danger');
+            }
+        }
+
+        function populateConfigForm(config) {
+            document.getElementById('max-feedrate-x').value = config.motion.max_feedrate[0];
+            document.getElementById('max-feedrate-y').value = config.motion.max_feedrate[1];
+            document.getElementById('max-feedrate-z').value = config.motion.max_feedrate[2];
+            document.getElementById('steps-per-mm-x').value = config.motion.steps_per_mm[0];
+            document.getElementById('hotend-max-temp').value = config.temperature.hotend_max_temp;
+            document.getElementById('bed-max-temp').value = config.temperature.bed_max_temp;
+            document.getElementById('pid-hotend-kp').value = config.temperature.pid_hotend.kp;
+            document.getElementById('pid-hotend-ki').value = config.temperature.pid_hotend.ki;
+            document.getElementById('filament-diameter').value = config.extruder.filament_diameter;
+            document.getElementById('nozzle-diameter').value = config.extruder.nozzle_diameter;
+            document.getElementById('retract-length').value = config.extruder.retract_length;
+            document.getElementById('thermal-protection').checked = config.safety.thermal_protection_enabled;
+            document.getElementById('power-loss-recovery').checked = config.features.power_loss_recovery;
+            document.getElementById('exclude-objects').checked = config.features.exclude_objects;
+        }
+
+        async function saveConfiguration() {
+            const config = gatherConfigFromForm();
+            
+            try {
+                const response = await fetch('/api/config', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config)
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    showAlert('Configuration saved successfully', 'success');
+                } else {
+                    showAlert(data.error || 'Failed to save configuration', 'danger');
+                }
+            } catch (error) {
+                showAlert('Failed to save configuration', 'danger');
+            }
+        }
+
+        function gatherConfigFromForm() {
+            return {
+                motion: {
+                    max_feedrate: [
+                        parseFloat(document.getElementById('max-feedrate-x').value),
+                        parseFloat(document.getElementById('max-feedrate-y').value),
+                        parseFloat(document.getElementById('max-feedrate-z').value),
+                        25.0
+                    ],
+                    steps_per_mm: [
+                        parseFloat(document.getElementById('steps-per-mm-x').value),
+                        80.0, 400.0, 93.0
+                    ]
+                },
+                temperature: {
+                    hotend_max_temp: parseFloat(document.getElementById('hotend-max-temp').value),
+                    bed_max_temp: parseFloat(document.getElementById('bed-max-temp').value),
+                    pid_hotend: {
+                        kp: parseFloat(document.getElementById('pid-hotend-kp').value),
+                        ki: parseFloat(document.getElementById('pid-hotend-ki').value),
+                        kd: 114.0,
+                        enabled: true
+                    }
+                },
+                extruder: {
+                    filament_diameter: parseFloat(document.getElementById('filament-diameter').value),
+                    nozzle_diameter: parseFloat(document.getElementById('nozzle-diameter').value),
+                    retract_length: parseFloat(document.getElementById('retract-length').value)
+                },
+                safety: {
+                    thermal_protection_enabled: document.getElementById('thermal-protection').checked
+                },
+                features: {
+                    power_loss_recovery: document.getElementById('power-loss-recovery').checked,
+                    exclude_objects: document.getElementById('exclude-objects').checked
+                }
+            };
+        }
+
+        async function resetConfiguration() {
+            if (confirm('Are you sure you want to reset to default configuration?')) {
+                try {
+                    const response = await fetch('/api/config/reset', { method: 'POST' });
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        showAlert('Configuration reset to defaults', 'success');
+                        loadConfiguration();
+                    } else {
+                        showAlert('Failed to reset configuration', 'danger');
+                    }
+                } catch (error) {
+                    showAlert('Failed to reset configuration', 'danger');
+                }
+            }
+        }
+
+        async function refreshObjects() {
+            try {
+                const response = await fetch('/api/objects');
+                const data = await response.json();
+                
+                if (data.success && data.data) {
+                    displayObjects(data.data);
+                }
+            } catch (error) {
+                console.error('Failed to refresh objects:', error);
+            }
+        }
+
+        function displayObjects(objects) {
+            const list = document.getElementById('objects-list');
+            
+            if (objects.length === 0) {
+                list.innerHTML = '<div class="object-item"><span>No objects loaded</span></div>';
+                return;
+            }
+            
+            list.innerHTML = objects.map(obj => `
+                <div class="object-item">
+                    <div>
+                        <strong>${obj.name}</strong><br>
+                        <small>Progress: ${obj.progress.toFixed(1)}%</small>
+                    </div>
+                    <div>
+                        <span class="object-status status-${obj.status.toLowerCase()}">${obj.status}</span>
+                        <button class="button" onclick="toggleObject('${obj.name}', '${obj.status}')">
+                            ${obj.status === 'Excluded' ? 'Include' : 'Exclude'}
+                        </button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        async function toggleObject(objectName, currentStatus) {
+            const action = currentStatus === 'Excluded' ? 'include' : 'exclude';
+            
+            try {
+                const response = await fetch(`/api/objects/${action}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ object_name: objectName })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    showAlert(`Object ${action}d successfully`, 'success');
+                    refreshObjects();
+                } else {
+                    showAlert(data.error || `Failed to ${action} object`, 'danger');
+                }
+            } catch (error) {
+                showAlert(`Failed to ${action} object`, 'danger');
+            }
+        }
+
+        async function checkRecoveryData() {
+            try {
+                const response = await fetch('/api/recovery');
+                const data = await response.json();
+                
+                const recoveryDiv = document.getElementById('recovery-info');
+                
+                if (data.success) {
+                    const [timestamp, progress] = data.data;
+                    recoveryDiv.innerHTML = `
+                        <div class="alert alert-info">
+                            <h3>Recovery Data Available</h3>
+                            <p>Print was interrupted at ${progress.toFixed(1)}% completion</p>
+                            <p>Last saved: ${new Date(timestamp).toLocaleString()}</p>
+                            <button class="button success" onclick="resumePrint()">Resume Print</button>
+                        </div>
+                    `;
+                } else {
+                    recoveryDiv.innerHTML = '<p>No recovery data available.</p>';
+                }
+            } catch (error) {
+                console.error('Failed to check recovery data:', error);
+            }
+        }
+
+        async function resumePrint() {
+            if (confirm('Resume print from last saved position?')) {
+                try {
+                    const response = await fetch('/api/recovery/resume', { method: 'POST' });
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        showAlert('Print resumed successfully', 'success');
+                    } else {
+                        showAlert(data.error || 'Failed to resume print', 'danger');
+                    }
+                } catch (error) {
+                    showAlert('Failed to resume print', 'danger');
+                }
+            }
+        }
+
+        async function emergencyStop() {
+            if (confirm('EMERGENCY STOP - Are you sure?')) {
+                try {
+                    const response = await fetch('/api/emergency_stop', { method: 'POST' });
+                    showAlert('Emergency stop activated', 'info');
+                } catch (error) {
+                    showAlert('Failed to send emergency stop', 'danger');
+                }
+            }
+        }
+
+        function showAlert(message, type) {
+            const alertsDiv = document.getElementById('alerts');
+            const alert = document.createElement('div');
+            alert.className = `alert alert-${type}`;
+            alert.textContent = message;
+            
+            alertsDiv.appendChild(alert);
+            
+            setTimeout(() => {
+                if (alert.parentNode) {
+                    alert.parentNode.removeChild(alert);
+                }
+            }, 5000);
+        }
+
+        async function saveProfile() {
+            const profileName = document.getElementById('profile-name').value.trim();
+            
+            if (!profileName) {
+                showAlert('Please enter a profile name', 'danger');
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/config/save', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ profile_name: profileName })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    showAlert('Profile saved successfully', 'success');
+                    document.getElementById('profile-name').value = '';
+                    loadProfiles();
+                } else {
+                    showAlert(data.error || 'Failed to save profile', 'danger');
+                }
+            } catch (error) {
+                showAlert('Failed to save profile', 'danger');
+            }
+        }
+
+        async function loadProfiles() {
+            try {
+                const response = await fetch('/api/profiles');
+                const data = await response.json();
+                
+                const profilesList = document.getElementById('profiles-list');
+                
+                if (data.success && data.data.length > 0) {
+                    profilesList.innerHTML = data.data.map(profile => `
+                        <div class="object-item">
+                            <span>${profile}</span>
+                            <div>
+                                <button class="button" onclick="loadProfile('${profile}')">Load</button>
+                                <button class="button danger" onclick="deleteProfile('${profile}')">Delete</button>
+                            </div>
+                        </div>
+                    `).join('');
+                } else {
+                    profilesList.innerHTML = '<div class="object-item"><span>No saved profiles</span></div>';
+                }
+            } catch (error) {
+                console.error('Failed to load profiles:', error);
+            }
+        }
+
+        async function loadProfile(profileName) {
+            try {
+                const response = await fetch('/api/config/load', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ profile_name: profileName })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    showAlert('Profile loaded successfully', 'success');
+                    loadConfiguration();
+                } else {
+                    showAlert(data.error || 'Failed to load profile', 'danger');
+                }
+            } catch (error) {
+                showAlert('Failed to load profile', 'danger');
+            }
+        }
+
+        async function deleteProfile(profileName) {
+            if (confirm(`Delete profile "${profileName}"?`)) {
+                try {
+                    const response = await fetch(`/api/profiles/${profileName}`, {
+                        method: 'DELETE'
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        showAlert('Profile deleted successfully', 'success');
+                        loadProfiles();
+                    } else {
+                        showAlert(data.error || 'Failed to delete profile', 'danger');
+                    }
+                } catch (error) {
+                    showAlert('Failed to delete profile', 'danger');
+                }
+            }
+        }
+    </script>
+</body>
+</html>
