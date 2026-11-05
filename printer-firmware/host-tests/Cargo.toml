@@ -1,0 +1,26 @@
+[package]
+name = "firmware-host-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Runs the firmware's logic on the PC. The firmware itself is no_std and no_main, so it
+# cannot host tests. Run with `cargo test` from this directory.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+embassy-sync = "0.7.1"
+embassy-time = { version = "0.3.2", features = ["std", "generic-queue", "tick-hz-1_000_000"] }
+heapless = { version = "0.8", features = ["serde"] }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+postcard = "1.0"
+serde-json-core = "0.6"
+critical-section = { version = "1", features = ["std"] }
+
+[dev-dependencies]
+futures = "0.3"
+serde_json = "1.0"
+
+[workspace]

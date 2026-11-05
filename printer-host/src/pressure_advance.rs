@@ -106,77 +106,41 @@ impl PressureAdvanceController {
         self.process_segments();
     }
     
-    /// Calculate pressure advance for upcoming segments
+    /// Update the advance for the newest segment. Each segment is applied exactly once.
     fn process_segments(&mut self) {
-        if self.segment_buffer.is_empty() {
+        let Some(segment) = self.segment_buffer.back().cloned() else {
+            return;
+        };
+        if segment.segment_time < self.config.min_segment_time {
             return;
         }
-        
-        let current_time = Instant::now();
-        let lookahead_time = self.config.smooth_time;
-        
-        // Process segments within lookahead window
-        let mut lookahead_segments = Vec::new();
-        let mut total_lookahead_time = 0.0;
-        
-        for segment in &self.segment_buffer {
-            if total_lookahead_time >= lookahead_time {
-                break;
-            }
-            
-            if segment.is_extrusion() && segment.segment_time >= self.config.min_segment_time {
-                lookahead_segments.push(segment.clone());
-                total_lookahead_time += segment.segment_time;
-            }
-        }
-        
-        // Calculate pressure advance adjustments
-        for (i, segment) in lookahead_segments.iter().enumerate() {
-            let pressure_adjustment = self.calculate_pressure_adjustment(segment, &lookahead_segments, i);
-            self.apply_pressure_advance(segment, pressure_adjustment);
-        }
-        
-        self.last_update_time = current_time;
+
+        let target = self.calculate_pressure_adjustment(&segment);
+        let smoothed = self.apply_smoothing(target, segment.segment_time);
+        self.apply_pressure_advance(&segment, smoothed);
+        self.last_update_time = Instant::now();
     }
-    
-    /// Calculate pressure adjustment for a specific segment
-    fn calculate_pressure_adjustment(&self, current_segment: &ExtrusionSegment, 
-                                   lookahead_segments: &[ExtrusionSegment], 
-                                   current_index: usize) -> f64 {
-        if !current_segment.is_extrusion() {
+
+    /// How far ahead the extruder should be during this segment. Nozzle pressure follows
+    /// flow rate, so the advance is proportional to the extrusion velocity itself: it holds
+    /// while cruising and bleeds off when slowing. Only forward extrusion builds pressure,
+    /// so travels and retractions have no advance.
+    fn calculate_pressure_adjustment(&self, segment: &ExtrusionSegment) -> f64 {
+        if !segment.is_extrusion() || segment.extrusion_distance() <= 0.0 {
             return 0.0;
         }
-        
-        let current_extrude_rate = current_segment.extrude_velocity;
-        
-        // Look ahead to next segment to predict velocity change
-        let next_extrude_rate = if current_index + 1 < lookahead_segments.len() {
-            lookahead_segments[current_index + 1].extrude_velocity
-        } else {
-            0.0 // Assume stop at end
-        };
-        
-        // Calculate velocity change
-        let velocity_change = next_extrude_rate - current_extrude_rate;
-        
-        // Apply pressure advance formula: 
-        // advance = pressure_advance * velocity_change
-        let pressure_adjustment = self.config.pressure_advance * velocity_change;
-        
-        // Apply smoothing to prevent abrupt changes
-        self.apply_smoothing(pressure_adjustment)
+        self.config.pressure_advance * segment.extrude_velocity
     }
-    
-    /// Apply smoothing to pressure advance to prevent jerky motion
-    fn apply_smoothing(&self, raw_adjustment: f64) -> f64 {
-        // Simple exponential smoothing
-        let alpha = 0.3; // Smoothing factor
-        
-        if let Some(&last_adjustment) = self.pressure_buffer.back() {
-            alpha * raw_adjustment + (1.0 - alpha) * last_adjustment
+
+    /// Move toward the target with a time constant of `smooth_time`
+    fn apply_smoothing(&self, target: f64, dt: f64) -> f64 {
+        let last = self.pressure_buffer.back().copied().unwrap_or(0.0);
+        let alpha = if self.config.smooth_time > 0.0 {
+            1.0 - (-dt / self.config.smooth_time).exp()
         } else {
-            raw_adjustment
-        }
+            1.0
+        };
+        last + alpha * (target - last)
     }
     
     /// Apply the calculated pressure advance to extruder motion
@@ -250,67 +214,11 @@ impl PressureAdvanceController {
         self.extruder_velocity = 0.0;
     }
     
-    /// Auto-calibrate pressure advance based on print characteristics
-    pub fn auto_calibrate(&mut self, test_segments: &[ExtrusionSegment]) -> Result<f64, String> {
-        if test_segments.is_empty() {
-            return Err("No test segments provided".to_string());
-        }
-        
-        // Analyze test segments to find optimal pressure advance
-        let mut optimal_pa = 0.0;
-        let mut min_error = f64::INFINITY;
-        
-        // Test different PA values from 0.0 to 0.1 in steps of 0.005
-        for pa_test in (0..=20).map(|i| i as f64 * 0.005) {
-            let mut test_controller = self.clone();
-            test_controller.config.pressure_advance = pa_test;
-            
-            // Simulate the test segments
-            let error = test_controller.simulate_and_measure_error(test_segments);
-            
-            if error < min_error {
-                min_error = error;
-                optimal_pa = pa_test;
-            }
-        }
-        
-        // Apply the optimal pressure advance
-        self.config.pressure_advance = optimal_pa;
-        
-        Ok(optimal_pa)
-    }
-    
-    /// Simulate segments and measure quality error
-    fn simulate_and_measure_error(&mut self, test_segments: &[ExtrusionSegment]) -> f64 {
-        self.clear_buffers();
-        
-        let mut total_error = 0.0;
-        let mut corner_count = 0;
-        
-        for segment in test_segments {
-            self.add_segment(segment.clone());
-            
-            // Measure error at corners (direction changes)
-            if self.is_corner_segment(segment, test_segments) {
-                let expected_flow = segment.extrude_velocity;
-                let actual_flow = self.get_adjusted_extruder_position();
-                let error = (expected_flow - actual_flow).abs();
-                total_error += error;
-                corner_count += 1;
-            }
-        }
-        
-        if corner_count > 0 {
-            total_error / corner_count as f64
-        } else {
-            0.0
-        }
-    }
-    
-    /// Check if a segment represents a corner (direction change)
-    fn is_corner_segment(&self, segment: &ExtrusionSegment, all_segments: &[ExtrusionSegment]) -> bool {
-        // Simple heuristic: significant velocity change indicates corner
-        (segment.end_velocity - segment.start_velocity).abs() > 10.0 // mm/s
+    /// Pressure advance cannot be found from the commanded motion alone. It needs a
+    /// measurement of what the plastic did (a test print or a pressure sensor). The old
+    /// search compared mm/s to mm and returned an arbitrary value, so this refuses instead.
+    pub fn auto_calibrate(&mut self, _test_segments: &[ExtrusionSegment]) -> Result<f64, String> {
+        Err("Pressure advance calibration needs measured data, which is not available yet. Tune it with a test print.".to_string())
     }
 }
 
@@ -337,13 +245,11 @@ pub struct MultiExtruderPressureAdvance {
 impl MultiExtruderPressureAdvance {
     pub fn new(num_extruders: usize) -> Self {
         let mut controllers = Vec::new();
-        
-        for i in 0..num_extruders {
-            let config = PressureAdvanceConfig {
-                pressure_advance: 0.05 * (i + 1) as f64 / num_extruders as f64, // Different defaults
-                ..Default::default()
-            };
-            controllers.push(PressureAdvanceController::new(config));
+
+        // Always at least one, so there is always an active controller. PA stays off
+        // until configured: a value that suits one filament can ruin prints with another.
+        for _ in 0..num_extruders.max(1) {
+            controllers.push(PressureAdvanceController::new(PressureAdvanceConfig::default()));
         }
         
         Self {

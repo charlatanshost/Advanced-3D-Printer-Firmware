@@ -373,7 +373,10 @@ impl DigitalTwin {
                 // In practice, you'd use more sophisticated integrators like Runge-Kutta
                 
                 // Calculate forces
-                let friction_force = -params.friction_coefficient * params.mass * params.gravity * axis_state.velocity.signum();
+                // No friction force at rest. signum(0.0) is 1.0, not 0, which would push a
+                // stationary axis along by itself.
+                let direction = if axis_state.velocity == 0.0 { 0.0 } else { axis_state.velocity.signum() };
+                let friction_force = -params.friction_coefficient * params.mass * params.gravity * direction;
                 let spring_force = -params.stiffness * axis_state.position * 0.001; // Convert mm to m
                 let damping_force = -params.damping * axis_state.velocity * 0.001;
                 

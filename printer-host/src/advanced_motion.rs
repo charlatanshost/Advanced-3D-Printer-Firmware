@@ -166,7 +166,15 @@ impl TrajectoryPlanner {
         }
     }
     
-    pub fn add_segment(&mut self, mut segment: MotionSegment) {
+    /// Queue a move. Returns false if the buffer is full and the move was not accepted, so
+    /// the caller must retry after taking segments. Dropping queued motion to make room would
+    /// silently skip part of the print.
+    #[must_use]
+    pub fn add_segment(&mut self, mut segment: MotionSegment) -> bool {
+        if self.segments.len() >= self.lookahead_buffer_size {
+            return false;
+        }
+
         // Apply volumetric speed limiting
         if segment.segment_type == SegmentType::Extrude {
             let volumetric_limit = self.volumetric_controller.calculate_max_speed(
@@ -177,58 +185,44 @@ impl TrajectoryPlanner {
         }
         
         self.segments.push_back(segment);
-        
-        // Maintain buffer size
-        if self.segments.len() > self.lookahead_buffer_size {
-            self.segments.pop_front();
-        }
-        
+
         // Perform lookahead planning
         self.recalculate_velocities();
+        true
     }
     
     fn recalculate_velocities(&mut self) {
-        if self.segments.len() < 2 {
+        let count = self.segments.len();
+        if count == 0 {
             return;
         }
-        
-        // Forward pass - calculate maximum entry velocities
-        for i in 1..self.segments.len() {
-            let (prev_segment, current_segment) = {
-                let (first, second) = self.segments.as_slices();
-                if i < first.len() {
-                    (&first[i-1], &first[i])
-                } else {
-                    let j = i - first.len();
-                    (&second[j-1], &second[j])
-                }
-            };
-            
-            let junction_velocity = self.calculate_junction_velocity(prev_segment, current_segment);
-            
-            // Update current segment's entry velocity
-            if let Some(segment) = self.segments.get_mut(i) {
-                segment.start_velocity = segment.start_velocity.min(junction_velocity);
-            }
+
+        // Worked out from scratch each time, so adding a move can raise a speed that was
+        // low only because the path used to end there. velocity[i] is the speed at the start
+        // of segment i. The first is fixed, and the last must be able to stop.
+        let mut velocity = vec![0.0f32; count + 1];
+        velocity[0] = self.segments[0].start_velocity;
+        for i in 1..count {
+            velocity[i] = self.calculate_junction_velocity(&self.segments[i - 1], &self.segments[i]);
         }
-        
-        // Backward pass - propagate velocity limits
-        for i in (0..self.segments.len() - 1).rev() {
-            if let (Some(current_segment), Some(next_segment)) = 
-                (self.segments.get(i), self.segments.get(i + 1)) {
-                
-                let max_entry_velocity = self.calculate_max_entry_velocity(
-                    current_segment, 
-                    next_segment.start_velocity
-                );
-                
-                if let Some(segment) = self.segments.get_mut(i) {
-                    segment.end_velocity = segment.end_velocity.min(max_entry_velocity);
-                    segment.start_velocity = segment.start_velocity.min(segment.end_velocity);
-                }
-            }
+
+        // Backward pass: slow enough to be able to brake for what comes next
+        for i in (1..count).rev() {
+            velocity[i] = velocity[i].min(self.calculate_max_entry_velocity(&self.segments[i], velocity[i + 1]));
         }
-        
+
+        // Forward pass: no faster than can be reached from what came before
+        for i in 0..count {
+            let segment = &self.segments[i];
+            let reachable = (velocity[i].powi(2) + 2.0 * segment.acceleration * segment.distance).sqrt();
+            velocity[i + 1] = velocity[i + 1].min(reachable);
+        }
+
+        for (i, segment) in self.segments.iter_mut().enumerate() {
+            segment.start_velocity = velocity[i];
+            segment.end_velocity = velocity[i + 1];
+        }
+
         // Recalculate segment durations based on new velocities
         let segments = &mut self.segments;
         for segment in segments.iter_mut() {
@@ -254,14 +248,14 @@ impl TrajectoryPlanner {
                          prev_dir[1] * current_dir[1] + 
                          prev_dir[2] * current_dir[2];
         
-        // Calculate junction deviation based velocity
-        let cos_theta = dot_product.clamp(-1.0, 1.0);
-        let sin_half_theta = ((1.0 - cos_theta) / 2.0).sqrt();
-        
-        let junction_velocity = if sin_half_theta > 0.01 {
-            (self.junction_deviation * self.max_acceleration / sin_half_theta).sqrt()
-        } else {
+        // Junction deviation. With θ the interior angle (180 degrees when going straight on,
+        // 0 for a full reversal), the fillet radius is δ·sin(θ/2) / (1 - sin(θ/2)).
+        let sin_half_interior = ((1.0 + dot_product.clamp(-1.0, 1.0)) / 2.0).sqrt();
+        let junction_velocity = if sin_half_interior > 0.9999 {
             self.max_velocity
+        } else {
+            let radius = self.junction_deviation * sin_half_interior / (1.0 - sin_half_interior);
+            (self.max_acceleration * radius).sqrt()
         };
         
         junction_velocity.min(prev.max_velocity).min(current.max_velocity)
@@ -293,14 +287,21 @@ impl TrajectoryPlanner {
     }
     
     fn calculate_segment_timing_static(segment: &mut MotionSegment) {
-        // Calculate timing for trapezoidal velocity profile
-        let _velocity_diff = segment.end_velocity - segment.start_velocity;
-        let average_velocity = (segment.start_velocity + segment.end_velocity) / 2.0;
-        
-        if average_velocity > 0.0 {
-            segment.duration = segment.distance / average_velocity;
-        } else {
+        // Timing for a trapezoidal velocity profile. Averaging only the end speeds would
+        // make a move from rest to rest take zero time.
+        let (v0, v1, a) = (segment.start_velocity, segment.end_velocity, segment.acceleration);
+        if segment.distance <= 0.0 {
             segment.duration = 0.0;
+        } else if a <= 0.0 {
+            // No acceleration figure: assume a steady move at the speed limit
+            segment.duration = segment.distance / segment.max_velocity.max(1e-6);
+        } else {
+            let peak = ((2.0 * a * segment.distance + v0 * v0 + v1 * v1) / 2.0).sqrt();
+            let cruise = peak.min(segment.max_velocity).max(v0).max(v1).max(1e-6);
+            let ramp_up = (cruise - v0) / a;
+            let ramp_down = (cruise - v1) / a;
+            let ramps = (v0 + cruise) / 2.0 * ramp_up + (cruise + v1) / 2.0 * ramp_down;
+            segment.duration = ramp_up + ramp_down + (segment.distance - ramps).max(0.0) / cruise;
         }
     }
     
@@ -389,15 +390,16 @@ impl ServoController {
     
     pub fn update_encoder_position(&mut self, axis_id: char, encoder_counts: i64) -> Result<(), String> {
         if let Some(axis) = self.axes.get_mut(&axis_id) {
-            axis.encoder_counts = encoder_counts;
-            axis.current_position = encoder_counts as f32 / axis.encoder_resolution;
-            
-            // Calculate velocity from position change
+            // Calculate velocity from position change. Only take a new sample when the
+            // velocity updates, or the position would change without its time being counted.
             let now = Instant::now();
             let dt = now.duration_since(axis.last_update).as_secs_f32();
+            let previous_position = axis.current_position;
+            let position = encoder_counts as f32 / axis.encoder_resolution;
+            axis.encoder_counts = encoder_counts;
+            axis.current_position = position;
             if dt > 0.001 { // Minimum 1ms between updates
-                let position_change = axis.current_position - axis.current_position;
-                axis.current_velocity = position_change / dt;
+                axis.current_velocity = (position - previous_position) / dt;
                 axis.last_update = now;
             }
             
@@ -418,6 +420,9 @@ impl ServoController {
     }
     
     pub fn calculate_servo_output(&mut self, axis_id: char, dt: f32) -> Result<f32, String> {
+        if !(dt > 0.0) {
+            return Err(format!("Invalid time step on axis {}: {}", axis_id, dt));
+        }
         if let Some(axis) = self.axes.get_mut(&axis_id) {
             // Calculate errors
             axis.position_error = axis.target_position - axis.current_position;
@@ -603,6 +608,7 @@ pub struct MultiToolManager {
     tool_change_retraction: f32,      // Retraction distance during tool change
     purge_volume: f32,                // mm³ - purge volume when changing materials
     wipe_sequence: Vec<[f32; 3]>,     // Wipe tower positions
+    current_z: f32,                   // Current print height, so tool changes can clear the part
     mixing_ratios: HashMap<String, Vec<f32>>, // For mixing extruders
 }
 
@@ -616,6 +622,7 @@ impl MultiToolManager {
             tool_change_retraction: 2.0,
             purge_volume: 100.0,
             wipe_sequence: Vec::new(),
+            current_z: 0.0,
             mixing_ratios: HashMap::new(),
         };
         
@@ -647,6 +654,11 @@ impl MultiToolManager {
         }
     }
     
+    /// Keep this up to date during a print. Tool changes use it to stay above the part.
+    pub fn set_current_z(&mut self, z: f32) {
+        self.current_z = z;
+    }
+
     pub fn select_tool(&mut self, tool_id: u8) -> Result<Vec<ToolChangeCommand>, String> {
         if !self.tools.contains_key(&tool_id) {
             return Err(format!("Tool {} not found", tool_id));
@@ -673,14 +685,17 @@ impl MultiToolManager {
                 // Set heater to standby
                 commands.push(ToolChangeCommand::SetTemperature {
                     heater_id: current_tool.heater_id,
-                    temperature: current_tool.material.bed_temperature + 50.0, // Standby temp
+                    temperature: (current_tool.material.nozzle_temperature - 50.0).max(0.0), // Standby temp
                 });
             }
         }
         
-        // Move to tool change position
+        // Move to tool change position, staying above the print. A fixed height would drive
+        // straight through any part taller than it.
+        const TOOL_CHANGE_CLEARANCE: f32 = 5.0;
+        let safe_z = self.tool_change_position[2].max(self.current_z + TOOL_CHANGE_CLEARANCE);
         commands.push(ToolChangeCommand::MoveTo {
-            position: self.tool_change_position,
+            position: [self.tool_change_position[0], self.tool_change_position[1], safe_z],
             feedrate: 6000.0, // 100mm/s
         });
         
@@ -699,16 +714,17 @@ impl MultiToolManager {
         if let Some(new_tool) = self.tools.get_mut(&tool_id) {
             new_tool.is_active = true;
             
-            // Heat new tool
+            // Heat new tool, within what this hotend can safely do
+            let temperature = new_tool.material.nozzle_temperature.min(new_tool.max_temp);
             commands.push(ToolChangeCommand::SetTemperature {
                 heater_id: new_tool.heater_id,
-                temperature: new_tool.material.nozzle_temperature,
+                temperature,
             });
-            
+
             // Wait for temperature
             commands.push(ToolChangeCommand::WaitForTemperature {
                 heater_id: new_tool.heater_id,
-                temperature: new_tool.material.nozzle_temperature,
+                temperature,
                 timeout: Duration::from_secs(300),
             });
             
@@ -725,9 +741,11 @@ impl MultiToolManager {
             
             // Purge if materials are different
             if needs_purge {
+                // Not below the current height either: the tower grows with the print
+                let current_z = self.current_z;
                 commands.push(ToolChangeCommand::PurgeMaterial {
                     volume: self.purge_volume,
-                    wipe_sequence: self.wipe_sequence.clone(),
+                    wipe_sequence: self.wipe_sequence.iter().map(|p| [p[0], p[1], p[2].max(current_z)]).collect(),
                 });
             }
         }

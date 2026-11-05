@@ -404,28 +404,12 @@ pub mod codesys {
         }
         
         pub fn authenticate(&mut self) -> Result<(), String> {
-            // Simplified CODESYS authentication
-            let auth_request = format!("LOGIN {} {}", self.config.username, self.config.password);
-            
-            if let Some(ref mut stream) = self.stream {
-                match stream.write_all(auth_request.as_bytes()) {
-                    Ok(_) => {
-                        self.authenticated = true;
-                        self.diagnostics.packets_sent += 1;
-                        self.diagnostics.bytes_sent += auth_request.len() as u64;
-                        println!("CODESYS authentication successful");
-                        Ok(())
-                    }
-                    Err(e) => {
-                        let error = format!("CODESYS authentication failed: {}", e);
-                        self.diagnostics.last_error = Some(error.clone());
-                        self.diagnostics.error_count += 1;
-                        Err(error)
-                    }
-                }
-            } else {
-                Err("CODESYS client not connected".to_string())
-            }
+            // The real CODESYS login protocol is not implemented. This used to send the
+            // password in plain text and report success without reading any reply.
+            self.authenticated = false;
+            let error = "CODESYS authentication is not implemented".to_string();
+            self.diagnostics.last_error = Some(error.clone());
+            Err(error)
         }
         
         pub fn get_diagnostics(&self) -> &ProtocolDiagnostics {
@@ -458,12 +442,16 @@ pub mod discovery {
             // Parse CIDR range (simplified)
             if let Some((network, prefix)) = self.discovery_config.scan_range.split_once('/') {
                 if let Ok(base_ip) = network.parse::<Ipv4Addr>() {
-                    let prefix: u8 = prefix.parse().unwrap_or(24);
-                    let num_hosts = if prefix < 32 { 1 << (32 - prefix) } else { 1 };
-                    
-                    let base_addr = u32::from(base_ip);
-                    
-                    for i in 1..std::cmp::min(num_hosts, 254) {
+                    let prefix: u32 = prefix.parse::<u32>().unwrap_or(24).min(32);
+                    let host_bits = 32 - prefix;
+                    // Host addresses exclude the network and broadcast addresses
+                    let num_hosts: u64 = if host_bits >= 2 { (1u64 << host_bits) - 2 } else { 0 };
+
+                    let mask = if prefix == 0 { 0 } else { u32::MAX << host_bits };
+                    let base_addr = u32::from(base_ip) & mask;
+
+                    // Scans at most one /24's worth, as a large range would take hours
+                    for i in 1..=num_hosts.min(254) as u32 {
                         let ip = Ipv4Addr::from(base_addr + i);
                         
                         if let Ok(device) = self.scan_host(IpAddr::V4(ip)) {
@@ -483,7 +471,13 @@ pub mod discovery {
             
             // Test common industrial protocol ports
             for &port in &self.discovery_config.scan_ports {
-                if self.test_port(ip, port, Duration::from_millis(500)) {
+                // BACnet/IP is UDP, so a TCP connection test can never find it
+                let found = if port == 47808 {
+                    self.test_bacnet(ip, Duration::from_millis(500))
+                } else {
+                    self.test_port(ip, port, Duration::from_millis(500))
+                };
+                if found {
                     // Determine protocol based on port
                     let protocol = match port {
                         47808 => Some(CommunicationMode::BACnet),
@@ -518,6 +512,21 @@ pub mod discovery {
             }
         }
         
+        /// Send a BACnet Who-Is and see if anything answers
+        fn test_bacnet(&self, ip: IpAddr, timeout: Duration) -> bool {
+            const WHO_IS: [u8; 8] = [0x81, 0x0A, 0x00, 0x08, 0x01, 0x00, 0x10, 0x08];
+            let Ok(socket) = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)) else {
+                return false;
+            };
+            if socket.set_read_timeout(Some(timeout)).is_err()
+                || socket.send_to(&WHO_IS, SocketAddr::new(ip, 47808)).is_err()
+            {
+                return false;
+            }
+            let mut reply = [0u8; 64];
+            socket.recv_from(&mut reply).is_ok()
+        }
+
         fn test_port(&self, ip: IpAddr, port: u16, timeout: Duration) -> bool {
             let addr = SocketAddr::new(ip, port);
             TcpStream::connect_timeout(&addr, timeout).is_ok()

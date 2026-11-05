@@ -99,8 +99,10 @@ pub enum LoadedPlugin {
 
 #[cfg(feature = "plugins")]
 pub struct NativePlugin {
-    library: libloading::Library,
+    // Drop order matters: fields drop top to bottom, and the interface's code lives in the
+    // library. The library must be unloaded last.
     interface: Box<dyn PluginInterface + Send + Sync>,
+    library: libloading::Library,
 }
 
 #[cfg(not(feature = "plugins"))]
@@ -287,6 +289,8 @@ pub struct PluginSecurityManager {
     allowed_paths: Vec<PathBuf>,
     banned_plugins: Vec<String>,
     permission_cache: RwLock<HashMap<String, Vec<Permission>>>,
+    /// Plugins the user has agreed may have the permissions they ask for
+    approved_plugins: RwLock<Vec<String>>,
 }
 
 impl PluginSecurityManager {
@@ -299,6 +303,7 @@ impl PluginSecurityManager {
             ],
             banned_plugins: Vec::new(),
             permission_cache: RwLock::new(HashMap::new()),
+            approved_plugins: RwLock::new(Vec::new()),
         }
     }
 
@@ -307,7 +312,12 @@ impl PluginSecurityManager {
             .map_err(|_| PluginError::SecurityViolation("Invalid plugin path".to_string()))?;
 
         for allowed_path in &self.allowed_paths {
-            if canonical_path.starts_with(allowed_path) {
+            // The plugin path is absolute after canonicalizing, so the allowed one must
+            // be too, or this comparison can never match. A missing directory allows nothing.
+            let Ok(canonical_allowed) = allowed_path.canonicalize() else {
+                continue;
+            };
+            if canonical_path.starts_with(&canonical_allowed) {
                 return Ok(());
             }
         }
@@ -329,6 +339,23 @@ impl PluginSecurityManager {
         cache.insert(plugin_name.to_string(), permissions);
     }
 
+    /// Record the user's approval for this plugin to have the permissions it requests
+    pub fn approve_plugin(&self, plugin_name: &str) {
+        self.approved_plugins.write().unwrap().push(plugin_name.to_string());
+    }
+
+    /// What a plugin actually gets. A manifest is only a request: without approval it gets
+    /// the harmless permissions, so a plugin cannot give itself motion or heater control.
+    pub fn permissions_to_grant(&self, plugin_name: &str, requested: &[Permission]) -> Vec<Permission> {
+        if self.approved_plugins.read().unwrap().iter().any(|name| name == plugin_name) {
+            return requested.to_vec();
+        }
+        requested.iter()
+            .filter(|p| matches!(p, Permission::ReadConfig | Permission::AccessUI))
+            .cloned()
+            .collect()
+    }
+
     pub fn is_plugin_banned(&self, plugin_name: &str) -> bool {
         self.banned_plugins.contains(&plugin_name.to_string())
     }
@@ -348,6 +375,11 @@ impl PluginManager {
             event_bus: Arc::new(PluginEventBus::new()),
             security_manager: PluginSecurityManager::new(),
         }
+    }
+
+    /// Allow a plugin the permissions in its manifest. Call before loading it.
+    pub fn approve_plugin(&self, plugin_name: &str) {
+        self.security_manager.approve_plugin(plugin_name);
     }
 
     /// Scan plugin directories and load all valid plugins
@@ -409,7 +441,8 @@ impl PluginManager {
         };
 
         // Grant permissions
-        self.security_manager.grant_permissions(&manifest.name, manifest.permissions.clone());
+        let granted = self.security_manager.permissions_to_grant(&manifest.name, &manifest.permissions);
+        self.security_manager.grant_permissions(&manifest.name, granted);
 
         // Store plugin info
         let plugin_info = PluginInfo {

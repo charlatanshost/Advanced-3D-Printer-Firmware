@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 // Recovery file format version for compatibility
-const RECOVERY_FILE_VERSION: u32 = 1;
+const RECOVERY_FILE_VERSION: u32 = 2;
 const RECOVERY_FILE_HEADER: &[u8] = b"PLRV"; // Power Loss Recovery Version
 
 // Power loss detection methods
@@ -81,6 +81,10 @@ pub struct PrintState {
     pub recovery_attempts: u32,       // Number of recovery attempts
     pub last_recovery_success: bool,  // Whether last recovery was successful
     pub recovery_notes: Vec<String>,  // Recovery-specific notes
+    /// How far Z is known to have been lifted at power loss, on top of position[2].
+    /// Stays 0 unless the motion system confirms the lift really happened.
+    #[serde(default)]
+    pub z_lift_applied: f64,
 }
 
 impl Default for PrintState {
@@ -111,6 +115,7 @@ impl Default for PrintState {
             recovery_attempts: 0,
             last_recovery_success: false,
             recovery_notes: Vec::new(),
+            z_lift_applied: 0.0,
         }
     }
 }
@@ -169,7 +174,13 @@ struct RecoveryFileData {
     version: u32,
     creation_time: SystemTime,
     print_state: PrintState,
-    checksum: u32,                    // Data integrity check
+}
+
+/// CRC-32 of the file's JSON bytes. It covers the bytes as written rather than a re-encoding
+/// of the parsed data, because re-encoding is not stable: HashMap order is random per
+/// process, and parsed floats can differ in the last bit.
+fn recovery_checksum(payload: &[u8]) -> u32 {
+    crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC).checksum(payload)
 }
 
 // Recovery statistics
@@ -269,11 +280,15 @@ impl PowerLossRecoveryManager {
         self.power_loss_detected = false;
         self.recovery_in_progress = false;
         
-        // Remove recovery file
-        if self.recovery_file.is_some() {
-            self.recovery_file = None;
-            if self.config.recovery_file_path.exists() {
-                std::fs::remove_file(&self.config.recovery_file_path)
+        // Remove the recovery file and its backup, or the next boot would offer to resume
+        // a print that already finished.
+        self.recovery_file = None;
+        for path in [
+            self.config.recovery_file_path.clone(),
+            self.config.recovery_file_path.with_extension("bak"),
+        ] {
+            if path.exists() {
+                std::fs::remove_file(&path)
                     .map_err(|e| format!("Failed to remove recovery file: {}", e))?;
             }
         }
@@ -284,6 +299,10 @@ impl PowerLossRecoveryManager {
     
     // Update current print state
     pub fn update_print_state(&mut self, updates: PrintStateUpdate) -> Result<(), String> {
+        // Keep what was saved at the moment of the power loss until power returns.
+        if self.power_loss_detected {
+            return Ok(());
+        }
         if let Some(ref mut state) = self.current_print_state {
             // Update fields based on the update structure
             if let Some(pos) = updates.position {
@@ -309,6 +328,18 @@ impl PowerLossRecoveryManager {
             }
             if let Some(pos) = updates.file_position {
                 state.file_position = pos;
+            }
+            if let Some(e) = updates.extruder_position {
+                state.extruder_position = e;
+            }
+            if let Some(relative) = updates.relative_extrusion {
+                state.relative_extrusion = relative;
+            }
+            if let Some(feedrate) = updates.feedrate {
+                state.feedrate = feedrate;
+            }
+            if let Some(fans) = updates.fan_speeds {
+                state.fan_speeds = fans;
             }
             
             // Check if it's time to save state
@@ -340,7 +371,7 @@ impl PowerLossRecoveryManager {
         let power_loss = match &self.config.detection_method {
             PowerLossDetectionMethod::VoltageSensor { threshold_voltage, sample_rate_hz, .. } => {
                 // Check if enough time has passed for sampling
-                let sample_interval = Duration::from_secs_f64(1.0 / *sample_rate_hz as f64);
+                let sample_interval = Duration::from_secs_f64(1.0 / (*sample_rate_hz).max(1) as f64);
                 if now.duration_since(self.last_voltage_check) >= sample_interval {
                     self.last_voltage_check = now;
                     
@@ -371,6 +402,14 @@ impl PowerLossRecoveryManager {
         // Handle power loss detection
         if power_loss && !self.power_loss_detected {
             self.handle_power_loss()?;
+        } else if !power_loss && self.power_loss_detected {
+            // A brown-out that recovered: re-arm once the average is back above threshold
+            if let PowerLossDetectionMethod::VoltageSensor { threshold_voltage, .. } = &self.config.detection_method {
+                let average = self.voltage_readings.iter().sum::<f32>() / self.voltage_readings.len().max(1) as f32;
+                if average >= *threshold_voltage {
+                    self.power_loss_detected = false;
+                }
+            }
         }
         
         Ok(power_loss)
@@ -381,37 +420,13 @@ impl PowerLossRecoveryManager {
         println!("Power loss detected! Initiating emergency save...");
         self.power_loss_detected = true;
         
-        // Create local variables to avoid borrowing conflicts
-        let z_lift = self.config.z_lift_on_power_loss;
-        let retraction = self.config.recovery_retraction;
-        
+        // What gets saved is the state needed to resume: the print position and the
+        // temperatures to reheat to. Heaters going off and the Z lift are actions for the
+        // motion system (see emergency_gcode) and must not overwrite that state.
         if let Some(ref mut state) = self.current_print_state {
-            // Update power loss time
             state.power_loss_time = SystemTime::now();
-            
-            // 2. Execute emergency G-code sequence (would be sent to motion controller)
-            println!("Executing emergency sequence:");
-            
-            // Lift Z axis to prevent nozzle drag
-            if z_lift > 0.0 {
-                println!("  - Lifting Z axis by {:.2}mm", z_lift);
-                state.position[2] += z_lift;
-            }
-            
-            // Retract filament to prevent oozing
-            if retraction > 0.0 {
-                println!("  - Retracting filament by {:.2}mm", retraction);
-                state.extruder_position -= retraction;
-            }
-            
-            // Turn off heaters to prevent thermal runaway
-            println!("  - Turning off all heaters");
-            state.hotend_temperatures.clear();
-            state.bed_temperature = 0.0;
-            state.chamber_temperature = 0.0;
         }
-        
-        // Perform saves after releasing the borrow
+
         self.save_state()?;
         
         // Update statistics
@@ -423,6 +438,32 @@ impl PowerLossRecoveryManager {
         Ok(())
     }
     
+    /// Commands the motion system should run immediately on detecting power loss.
+    pub fn emergency_gcode(&self) -> Vec<String> {
+        let mut commands = vec!["M104 S0".to_string(), "M140 S0".to_string()];
+        if self.config.recovery_retraction > 0.0 {
+            commands.push("M83".to_string());
+            commands.push(format!("G1 E{:.3} F2400", -self.config.recovery_retraction));
+        }
+        if self.config.z_lift_on_power_loss > 0.0 {
+            commands.push("G91".to_string());
+            commands.push(format!("G1 Z{:.3} F600", self.config.z_lift_on_power_loss));
+            commands.push("G90".to_string());
+        }
+        commands
+    }
+
+    /// Record that the emergency Z lift really happened, so recovery can account for it.
+    /// Without this, recovery assumes Z never moved: if that is wrong the nozzle ends up
+    /// too high, which fails safe. Assuming a lift that never happened would crash it.
+    pub fn confirm_emergency_lift(&mut self) -> Result<(), String> {
+        let lift = self.config.z_lift_on_power_loss;
+        if let Some(ref mut state) = self.current_print_state {
+            state.z_lift_applied = lift;
+        }
+        self.save_state()
+    }
+
     // Check if recovery data exists
     pub fn has_recovery_data(&self) -> bool {
         self.config.recovery_file_path.exists()
@@ -446,25 +487,31 @@ impl PowerLossRecoveryManager {
             return Err("Invalid recovery file format".to_string());
         }
         
-        // Read data
-        let mut data_string = String::new();
-        file.read_to_string(&mut data_string)
+        // Read the rest: one line with the checksum, then the JSON it covers
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)
             .map_err(|e| format!("Failed to read recovery file data: {}", e))?;
-        
-        let recovery_data: RecoveryFileData = serde_json::from_str(&data_string)
+
+        let newline = contents.iter().position(|&b| b == b'\n')
+            .ok_or_else(|| "Recovery data corruption detected".to_string())?;
+        let (checksum_line, payload) = (&contents[..newline], &contents[newline + 1..]);
+        let stored_checksum = std::str::from_utf8(checksum_line).ok()
+            .and_then(|text| u32::from_str_radix(text.trim(), 16).ok())
+            .ok_or_else(|| "Unsupported recovery file format or corrupted data".to_string())?;
+
+        // Verify data integrity
+        if recovery_checksum(payload) != stored_checksum {
+            return Err("Recovery data corruption detected".to_string());
+        }
+
+        let recovery_data: RecoveryFileData = serde_json::from_slice(payload)
             .map_err(|e| format!("Failed to deserialize recovery data: {}", e))?;
-        
+
         // Verify version compatibility
         if recovery_data.version != RECOVERY_FILE_VERSION {
             return Err(format!("Unsupported recovery file version: {}", recovery_data.version));
         }
-        
-        // Verify data integrity
-        let calculated_checksum = self.calculate_checksum(&recovery_data.print_state);
-        if calculated_checksum != recovery_data.checksum {
-            return Err("Recovery data corruption detected".to_string());
-        }
-        
+
         // Check if recovery is still valid (within timeout window)
         let recovery_age = SystemTime::now()
             .duration_since(recovery_data.creation_time)
@@ -480,13 +527,22 @@ impl PowerLossRecoveryManager {
     }
     
     // Start recovery process
-    pub fn start_recovery(&mut self, print_state: PrintState) -> Result<RecoveryPlan, String> {
+    pub fn start_recovery(&mut self, mut print_state: PrintState) -> Result<RecoveryPlan, String> {
         if self.recovery_in_progress {
             return Err("Recovery already in progress".to_string());
         }
-        
+        if print_state.recovery_attempts >= self.config.max_recovery_attempts {
+            return Err(format!(
+                "Recovery already attempted {} times (limit {})",
+                print_state.recovery_attempts, self.config.max_recovery_attempts
+            ));
+        }
+
+        print_state.recovery_attempts += 1;
         self.recovery_in_progress = true;
+        self.power_loss_detected = false;
         self.current_print_state = Some(print_state.clone());
+        self.save_state()?;
         
         // Generate recovery plan
         let recovery_plan = self.generate_recovery_plan(&print_state)?;
@@ -508,39 +564,33 @@ impl PowerLossRecoveryManager {
             critical: true,
         });
         
-        // Step 2: Home axes if required
-        if self.config.home_axes_before_recovery {
-            steps.push(RecoveryStep {
-                step_type: RecoveryStepType::HomeAxes,
-                description: "Home all axes".to_string(),
-                gcode_commands: vec!["G28".to_string()], // Home all axes
-                estimated_duration: Duration::from_secs(30),
-                critical: true,
-            });
-        }
-        
-        // Step 3: Heat up if required
+        // Step 2: Heat up first, bed before hotend, so the part stays stuck down and the
+        // nozzle is not frozen into the print when Z starts moving.
         if self.config.preheat_before_recovery {
             let mut heat_commands = Vec::new();
-            
-            // Heat hotends
-            for (hotend, temp) in &state.hotend_temperatures {
-                if *temp > 0.0 {
-                    heat_commands.push(format!("M104 S{} T{}", temp, hotend));
-                }
-            }
-            
-            // Heat bed
+
+            // Fixed order regardless of how the map happens to iterate
+            let hotends: std::collections::BTreeMap<u8, f64> = state.hotend_temperatures.iter()
+                .filter(|(_, temp)| **temp > 0.0)
+                .map(|(hotend, temp)| (*hotend, *temp))
+                .collect();
+
+            // Start everything heating together
             if state.bed_temperature > 0.0 {
                 heat_commands.push(format!("M140 S{}", state.bed_temperature));
             }
-            
-            // Wait for temperatures
-            if !heat_commands.is_empty() {
-                heat_commands.push("M109".to_string()); // Wait for hotend
-                heat_commands.push("M190".to_string()); // Wait for bed
+            for (hotend, temp) in &hotends {
+                heat_commands.push(format!("M104 S{} T{}", temp, hotend));
             }
-            
+
+            // Then wait for each
+            if state.bed_temperature > 0.0 {
+                heat_commands.push(format!("M190 S{}", state.bed_temperature));
+            }
+            for (hotend, temp) in &hotends {
+                heat_commands.push(format!("M109 S{} T{}", temp, hotend));
+            }
+
             if !heat_commands.is_empty() {
                 steps.push(RecoveryStep {
                     step_type: RecoveryStepType::Preheat,
@@ -552,30 +602,59 @@ impl PowerLossRecoveryManager {
             }
         }
         
-        // Step 4: Position recovery
+        // Step 3: Establish Z without homing it, since the print is in the way. Declare where
+        // Z is, then raise it clear. Only then is it safe to move in XY at all.
+        let print_z = state.position[2];
+        let known_z = print_z + state.z_lift_applied;
+        let safe_z = known_z + self.config.z_lift_on_power_loss.max(0.0);
+        let mut home_commands = vec![
+            "G90".to_string(),
+            format!("G92 Z{:.3}", known_z),
+            format!("G1 Z{:.3} F600", safe_z),
+        ];
+        if self.config.home_axes_before_recovery {
+            home_commands.push("G28 X Y".to_string());
+        }
         steps.push(RecoveryStep {
-            step_type: RecoveryStepType::PositionRecovery,
-            description: "Move to recovery position".to_string(),
+            step_type: RecoveryStepType::HomeAxes,
+            description: "Raise Z clear of the print and home X and Y".to_string(),
+            gcode_commands: home_commands,
+            estimated_duration: Duration::from_secs(30),
+            critical: true,
+        });
+
+        // Step 4: Prime away from the part, then restore the extruder's counter and mode.
+        // Without G92 E the next absolute E move would extrude everything since the start.
+        steps.push(RecoveryStep {
+            step_type: RecoveryStepType::PrimeExtruder,
+            description: "Prime extruder and restore its position".to_string(),
             gcode_commands: vec![
-                "G90".to_string(), // Absolute positioning
-                format!("G1 X{:.3} Y{:.3} F3000", state.position[0], state.position[1]), // Move to XY
-                format!("G1 Z{:.3} F600", state.position[2] - self.config.z_lift_on_power_loss), // Lower Z
+                "M83".to_string(), // Relative extrusion for the prime
+                format!("G1 E{:.3} F300", self.config.recovery_prime),
+                format!("G92 E{:.5}", state.extruder_position),
+                (if state.relative_extrusion { "M83" } else { "M82" }).to_string(),
             ],
             estimated_duration: Duration::from_secs(10),
             critical: true,
         });
-        
-        // Step 5: Prime extruder
+
+        // Step 5: Back over the print, XY first and only then down, with fans and feedrate restored
+        let mut position_commands = vec![
+            "G90".to_string(),
+            format!("G1 X{:.3} Y{:.3} F3000", state.position[0], state.position[1]),
+            format!("G1 Z{:.3} F600", print_z),
+        ];
+        let fans: std::collections::BTreeMap<u8, f64> = state.fan_speeds.iter().map(|(fan, speed)| (*fan, *speed)).collect();
+        for (fan, speed) in &fans {
+            position_commands.push(format!("M106 P{} S{}", fan, (speed.clamp(0.0, 1.0) * 255.0).round() as u32));
+        }
+        position_commands.push(format!("G1 F{:.1}", state.feedrate));
         steps.push(RecoveryStep {
-            step_type: RecoveryStepType::PrimeExtruder,
-            description: "Prime extruder".to_string(),
-            gcode_commands: vec![
-                "G91".to_string(), // Relative positioning
-                format!("G1 E{:.3} F300", self.config.recovery_prime), // Prime
-                "G90".to_string(), // Back to absolute
-            ],
+            step_type: RecoveryStepType::PositionRecovery,
+            description: "Move to recovery position".to_string(),
+            gcode_commands: position_commands,
             estimated_duration: Duration::from_secs(10),
-            critical: false,
+            critical: true,
         });
         
         // Step 6: Resume print
@@ -603,7 +682,7 @@ impl PowerLossRecoveryManager {
         let mut probability = 0.8; // Base 80% success rate
         
         // Adjust based on print progress (early failures are easier to recover)
-        let progress = state.file_position as f64 / state.file_size as f64;
+        let progress = if state.file_size > 0 { state.file_position as f64 / state.file_size as f64 } else { 0.0 };
         if progress < 0.1 {
             probability += 0.15; // Early in print
         } else if progress > 0.8 {
@@ -663,7 +742,6 @@ impl PowerLossRecoveryManager {
                 version: RECOVERY_FILE_VERSION,
                 creation_time: SystemTime::now(),
                 print_state: state.clone(),
-                checksum: self.calculate_checksum(state),
             };
             
             // Serialize data
@@ -679,6 +757,10 @@ impl PowerLossRecoveryManager {
                 // Write header
                 file.write_all(RECOVERY_FILE_HEADER)
                     .map_err(|e| format!("Failed to write recovery header: {}", e))?;
+
+                // Write checksum of the data that follows
+                file.write_all(format!("{:08x}\n", recovery_checksum(data_string.as_bytes())).as_bytes())
+                    .map_err(|e| format!("Failed to write recovery checksum: {}", e))?;
                 
                 // Write data
                 file.write_all(data_string.as_bytes())
@@ -707,17 +789,6 @@ impl PowerLossRecoveryManager {
         std::fs::copy(&self.config.recovery_file_path, &backup_path)
             .map_err(|e| format!("Failed to create backup: {}", e))?;
         Ok(())
-    }
-    
-    // Calculate checksum for data integrity
-    fn calculate_checksum(&self, state: &PrintState) -> u32 {
-        use std::hash::{Hash, Hasher};
-        use std::collections::hash_map::DefaultHasher;
-        
-        let serialized = serde_json::to_string(state).unwrap_or_default();
-        let mut hasher = DefaultHasher::new();
-        serialized.hash(&mut hasher);
-        hasher.finish() as u32
     }
     
     // Initialize recovery file
@@ -792,6 +863,10 @@ pub struct PrintStateUpdate {
     pub current_layer: Option<u32>,
     pub print_time: Option<Duration>,
     pub file_position: Option<u64>,
+    pub extruder_position: Option<f64>,
+    pub relative_extrusion: Option<bool>,
+    pub feedrate: Option<f64>,
+    pub fan_speeds: Option<HashMap<u8, f64>>,
 }
 
 // Recovery plan for user review
@@ -869,9 +944,12 @@ impl VoltageSensorInterface for MockVoltageSensor {
         }
         
         use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let noise: f32 = rng.gen_range(-self.noise_amplitude..self.noise_amplitude);
-        
+        let noise: f32 = if self.noise_amplitude > 0.0 {
+            rand::thread_rng().gen_range(-self.noise_amplitude..self.noise_amplitude)
+        } else {
+            0.0
+        };
+
         Ok(self.voltage + noise)
     }
     

@@ -49,27 +49,31 @@ pub struct ActiveResonanceCanceller {
     config: ResonanceCancellationConfig,
     accelerometer: Box<dyn Accelerometer + Send>,
     sample_buffer: VecDeque<(f32, f32, f32)>, // (ax, ay, az) samples
-    frequency_bins: Vec<FrequencyBin>,
+    frequency_bins: [Vec<FrequencyBin>; 3], // X, Y, Z
     correction_filters: HashMap<char, AdaptiveFilter>, // Per-axis filters
     last_update: Instant,
     fft_buffer: Vec<f32>,           // Working buffer for FFT
     cancellation_signals: HashMap<char, VecDeque<f32>>, // Generated correction signals
+    start_time: Instant,
 }
 
 impl ActiveResonanceCanceller {
     pub fn new(config: ResonanceCancellationConfig, accelerometer: Box<dyn Accelerometer + Send>) -> Self {
         let num_bins = config.window_size / 2;
-        let frequency_bins = (0..num_bins).map(|i| {
-            let frequency = (i as f32 * config.sample_rate as f32) / config.window_size as f32;
-            FrequencyBin {
-                frequency,
-                magnitude: 0.0,
-                phase: 0.0,
-                peak_history: VecDeque::with_capacity(100),
-                is_resonant: frequency >= config.frequency_range.0 && 
-                           frequency <= config.frequency_range.1,
-            }
-        }).collect();
+        let make_bins = || -> Vec<FrequencyBin> {
+            (0..num_bins).map(|i| {
+                let frequency = (i as f32 * config.sample_rate as f32) / config.window_size as f32;
+                FrequencyBin {
+                    frequency,
+                    magnitude: 0.0,
+                    phase: 0.0,
+                    peak_history: VecDeque::with_capacity(100),
+                    is_resonant: frequency >= config.frequency_range.0 &&
+                               frequency <= config.frequency_range.1,
+                }
+            }).collect()
+        };
+        let frequency_bins = [make_bins(), make_bins(), make_bins()]; // X, Y, Z
         
         let mut correction_filters = HashMap::new();
         for &axis in &['X', 'Y', 'Z', 'A', 'B'] {
@@ -91,6 +95,7 @@ impl ActiveResonanceCanceller {
             last_update: Instant::now(),
             fft_buffer: vec![0.0; window_size],
             cancellation_signals,
+            start_time: Instant::now(),
         }
     }
     
@@ -140,11 +145,15 @@ impl ActiveResonanceCanceller {
         // Perform FFT analysis
         let spectrum = self.perform_fft(&self.fft_buffer);
         
+        // Each axis has its own bins, or one axis's vibration would be attributed to another
+        let bins = &mut self.frequency_bins[axis_index];
+
         // Update frequency bins with new data
-        for (i, bin) in self.frequency_bins.iter_mut().enumerate() {
+        for (i, bin) in bins.iter_mut().enumerate() {
             if i < spectrum.len() && bin.is_resonant {
-                bin.magnitude = spectrum[i].0; // Real part as magnitude
-                bin.phase = spectrum[i].1;     // Imaginary part as phase
+                let (re, im) = spectrum[i];
+                bin.magnitude = re.hypot(im);
+                bin.phase = im.atan2(re);
                 
                 // Update peak history
                 bin.peak_history.push_back(bin.magnitude);
@@ -155,7 +164,7 @@ impl ActiveResonanceCanceller {
         }
         
         // Identify problematic frequencies
-        let problematic_frequencies = self.identify_resonances();
+        let problematic_frequencies = self.identify_resonances(axis_index);
         
         // Generate correction signal
         let axis_char = match axis_index {
@@ -210,11 +219,11 @@ impl ActiveResonanceCanceller {
         result
     }
     
-    fn identify_resonances(&self) -> Vec<(f32, f32)> {
+    fn identify_resonances(&self, axis_index: usize) -> Vec<(f32, f32)> {
         // Identify frequencies that exceed threshold and show resonant behavior
         let mut resonances = Vec::new();
-        
-        for bin in &self.frequency_bins {
+
+        for bin in &self.frequency_bins[axis_index] {
             if bin.magnitude > self.config.threshold_amplitude {
                 // Check if this frequency has consistent peaks (resonance indicator)
                 if bin.peak_history.len() > 10 {
@@ -239,7 +248,9 @@ impl ActiveResonanceCanceller {
             return 0.0;
         }
         
-        let now_secs = Instant::now().elapsed().as_secs_f32();
+        // Time since this canceller started. (Instant::now().elapsed() is always about zero,
+        // which made every correction sin(0) = 0.)
+        let now_secs = self.start_time.elapsed().as_secs_f32();
         let mut correction = 0.0;
         
         // Generate anti-phase signals for each identified resonance
@@ -269,8 +280,8 @@ impl ActiveResonanceCanceller {
     }
     
     pub fn get_vibration_spectrum(&self) -> Vec<(f32, f32)> {
-        // Return current frequency spectrum for visualization
-        self.frequency_bins.iter()
+        // Return current frequency spectrum for visualization (X axis)
+        self.frequency_bins[0].iter()
             .filter(|bin| bin.is_resonant)
             .map(|bin| (bin.frequency, bin.magnitude))
             .collect()

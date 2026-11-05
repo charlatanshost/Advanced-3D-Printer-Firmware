@@ -92,6 +92,11 @@ pub struct InputShaper {
     max_buffer_time: f64,       // Maximum buffering time
     last_update_time: f64,
     stats: ShaperStatistics,
+    /// Commands still inside the shaper's delay window: (time, position, velocity, acceleration)
+    history: VecDeque<(f64, f64, f64, f64)>,
+    /// Smoothing filter state: (time, position)
+    smoothing_state: Option<(f64, f64)>,
+    start_time: Instant,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -113,6 +118,9 @@ impl InputShaper {
             max_buffer_time: 1.0, // 1 second max buffer
             last_update_time: 0.0,
             stats: ShaperStatistics::default(),
+            history: VecDeque::new(),
+            smoothing_state: None,
+            start_time: Instant::now(),
         };
         shaper.calculate_impulses();
         shaper
@@ -131,7 +139,17 @@ impl InputShaper {
     pub fn get_stats(&self) -> &ShaperStatistics {
         &self.stats
     }
-    
+
+    /// The impulse train in use, as (weight, delay in seconds). Weights sum to 1.
+    pub fn impulses(&self) -> Vec<(f64, f64)> {
+        self.impulses.iter().map(|i| (i.weight, i.time)).collect()
+    }
+
+    /// Seconds since this shaper was created, for callers without their own motion clock.
+    pub fn elapsed_seconds(&self) -> f64 {
+        self.start_time.elapsed().as_secs_f64()
+    }
+
     // Calculate impulse weights and timing for the selected shaper type
     fn calculate_impulses(&mut self) {
         self.impulses.clear();
@@ -144,91 +162,68 @@ impl InputShaper {
         
         let freq = self.config.frequency;
         let zeta = self.config.damping_ratio;
-        let period = 1.0 / freq;
-        
-        match self.config.shaper_type {
-            ShaperType::None => {
-                self.impulses.push(ShaperImpulse { weight: 1.0, time: 0.0 });
-            }
-            
-            ShaperType::ZV => {
-                // Zero Vibration: 2 impulses
-                let k = (-zeta * PI / (1.0 - zeta * zeta).sqrt()).exp();
-                let weight1 = 1.0 / (1.0 + k);
-                let weight2 = k / (1.0 + k);
-                let delay = period / 2.0;
-                
-                self.impulses.push(ShaperImpulse { weight: weight1, time: 0.0 });
-                self.impulses.push(ShaperImpulse { weight: weight2, time: delay });
-            }
-            
-            ShaperType::MZV => {
-                // Modified Zero Vibration: 3 impulses
-                let k = (-zeta * PI / (1.0 - zeta * zeta).sqrt()).exp();
-                let weight1 = 1.0 / (1.0 + 2.0 * k + k * k);
-                let weight2 = 2.0 * k / (1.0 + 2.0 * k + k * k);
-                let weight3 = k * k / (1.0 + 2.0 * k + k * k);
-                let delay = period / 4.0;
-                
-                self.impulses.push(ShaperImpulse { weight: weight1, time: 0.0 });
-                self.impulses.push(ShaperImpulse { weight: weight2, time: delay });
-                self.impulses.push(ShaperImpulse { weight: weight3, time: 2.0 * delay });
-            }
-            
-            ShaperType::ZVD => {
-                // Zero Vibration Derivative: 3 impulses
-                let k = (-zeta * PI / (1.0 - zeta * zeta).sqrt()).exp();
-                let weight1 = 1.0 / (1.0 + 2.0 * k);
-                let weight2 = k / (1.0 + 2.0 * k);
-                let weight3 = k / (1.0 + 2.0 * k);
-                let delay = period / 2.0;
-                
-                self.impulses.push(ShaperImpulse { weight: weight1, time: 0.0 });
-                self.impulses.push(ShaperImpulse { weight: weight2, time: delay });
-                self.impulses.push(ShaperImpulse { weight: weight3, time: delay });
-            }
-            
-            ShaperType::EI => {
-                // Extra Insensitive: 2-3 impulses depending on damping
-                let k = (-zeta * PI / (1.0 - zeta * zeta).sqrt()).exp();
-                let a = 0.25 * (1.0 + k).powi(2);
-                let weight1 = a / (a + 2.0 * k);
-                let weight2 = 2.0 * k / (a + 2.0 * k);
-                let weight3 = a / (a + 2.0 * k);
-                let delay = period / 2.0;
-                
-                self.impulses.push(ShaperImpulse { weight: weight1, time: 0.0 });
-                self.impulses.push(ShaperImpulse { weight: weight2, time: delay });
-                self.impulses.push(ShaperImpulse { weight: weight3, time: period });
-            }
-            
-            ShaperType::TwoHumpEI => {
-                // 2-Hump Extra Insensitive: 4 impulses
-                let k = (-zeta * PI / (1.0 - zeta * zeta).sqrt()).exp();
-                let a = (1.0 + k) / 4.0;
-                let delay = period / 4.0;
-                
-                self.impulses.push(ShaperImpulse { weight: a, time: 0.0 });
-                self.impulses.push(ShaperImpulse { weight: (1.0 - a) / 2.0, time: delay });
-                self.impulses.push(ShaperImpulse { weight: (1.0 - a) / 2.0, time: 3.0 * delay });
-                self.impulses.push(ShaperImpulse { weight: a, time: period });
-            }
-            
-            ShaperType::Smoothing => {
-                // Simple exponential smoothing - single impulse with time constant
-                self.impulses.push(ShaperImpulse { weight: 1.0, time: 0.0 });
-            }
-            
-            _ => {
-                // Default to ZV for unimplemented types
-                warn!("Shaper type {:?} not fully implemented, using ZV", self.config.shaper_type);
-                self.config.shaper_type = ShaperType::ZV;
-                self.calculate_impulses();
-                return;
-            }
+        if !(freq > 0.0) || !freq.is_finite() || !(0.0..1.0).contains(&zeta) {
+            warn!("Invalid shaper settings (frequency {} Hz, damping {}), shaping disabled", freq, zeta);
+            self.impulses.push(ShaperImpulse { weight: 1.0, time: 0.0 });
+            return;
         }
-        
-        debug!("Calculated {} impulses for {:?} at {:.1} Hz", 
+
+        // Standard impulse trains, tuned to the damped period of the resonance.
+        const VIBRATION_TOLERANCE: f64 = 0.05;
+        let v = VIBRATION_TOLERANCE;
+        let df = (1.0 - zeta * zeta).sqrt();
+        let td = 1.0 / (freq * df);
+        let k = (-zeta * PI / df).exp();
+
+        let (amplitudes, times): (Vec<f64>, Vec<f64>) = match self.config.shaper_type {
+            ShaperType::None | ShaperType::Smoothing => (vec![1.0], vec![0.0]),
+
+            ShaperType::ZV => (vec![1.0, k], vec![0.0, 0.5 * td]),
+
+            ShaperType::MZV => {
+                let k = (-0.75 * zeta * PI / df).exp();
+                let a1 = 1.0 - std::f64::consts::FRAC_1_SQRT_2;
+                let a2 = (2.0f64.sqrt() - 1.0) * k;
+                let a3 = a1 * k * k;
+                (vec![a1, a2, a3], vec![0.0, 0.375 * td, 0.75 * td])
+            }
+
+            ShaperType::ZVD => (vec![1.0, 2.0 * k, k * k], vec![0.0, 0.5 * td, td]),
+
+            ShaperType::EI => {
+                let a1 = 0.25 * (1.0 + v);
+                let a2 = 0.5 * (1.0 - v) * k;
+                let a3 = a1 * k * k;
+                (vec![a1, a2, a3], vec![0.0, 0.5 * td, td])
+            }
+
+            ShaperType::EI2 | ShaperType::TwoHumpEI => {
+                let x = (v * v * ((1.0 - v * v).sqrt() + 1.0)).powf(1.0 / 3.0);
+                let a1 = (3.0 * x * x + 2.0 * x + 3.0 * v * v) / (16.0 * x);
+                let a2 = (0.5 - a1) * k;
+                let a3 = a2 * k;
+                let a4 = a1 * k * k * k;
+                (vec![a1, a2, a3, a4], vec![0.0, 0.5 * td, td, 1.5 * td])
+            }
+
+            ShaperType::EI3 | ShaperType::ThreeHumpEI => {
+                let k2 = k * k;
+                let a1 = 0.0625 * (1.0 + 3.0 * v + 2.0 * (2.0 * (v + 1.0) * v).sqrt());
+                let a2 = 0.25 * (1.0 - v) * k;
+                let a3 = (0.5 * (1.0 + v) - 2.0 * a1) * k2;
+                let a4 = a2 * k2;
+                let a5 = a1 * k2 * k2;
+                (vec![a1, a2, a3, a4, a5], vec![0.0, 0.5 * td, td, 1.5 * td, 2.0 * td])
+            }
+        };
+
+        // Weights must sum to 1, or the axis would not end up where it was commanded.
+        let total: f64 = amplitudes.iter().sum();
+        for (a, t) in amplitudes.iter().zip(times.iter()) {
+            self.impulses.push(ShaperImpulse { weight: a / total, time: *t });
+        }
+
+        debug!("Calculated {} impulses for {:?} at {:.1} Hz",
                self.impulses.len(), self.config.shaper_type, freq);
     }
     
@@ -241,29 +236,50 @@ impl InputShaper {
             return vec![command];
         }
         
-        let mut shaped_commands = Vec::new();
-        
         // Special handling for smoothing filter
         if self.config.shaper_type == ShaperType::Smoothing {
             return self.apply_smoothing_filter(command);
         }
-        
-        // Apply impulse-based shaping
-        for impulse in &self.impulses {
-            let mut shaped_cmd = command;
-            shaped_cmd.timestamp += impulse.time;
-            shaped_cmd.position *= impulse.weight;
-            shaped_cmd.velocity *= impulse.weight;
-            shaped_cmd.acceleration *= impulse.weight;
-            
-            // Clamp acceleration to configured maximum
-            if shaped_cmd.acceleration.abs() > self.config.max_acceleration {
-                shaped_cmd.acceleration = self.config.max_acceleration * shaped_cmd.acceleration.signum();
-            }
-            
-            shaped_commands.push(shaped_cmd);
+
+        // Input shaping is a convolution: the output at time t is the weighted sum of
+        // what was commanded at t minus each impulse delay. It is one command, not one
+        // per impulse, and it settles on the commanded position because weights sum to 1.
+        let t = command.timestamp;
+        if self.history.back().map_or(false, |h| t < h.0) {
+            self.history.clear(); // The clock restarted
         }
-        
+        self.history.push_back((t, command.position, command.velocity, command.acceleration));
+
+        // Keep one sample older than the longest delay, to hold the value before it.
+        let max_delay = self.get_shaper_delay();
+        while self.history.len() > 1 && self.history[1].0 <= t - max_delay {
+            self.history.pop_front();
+        }
+
+        let mut shaped_cmd = command;
+        shaped_cmd.position = 0.0;
+        shaped_cmd.velocity = 0.0;
+        shaped_cmd.acceleration = 0.0;
+        for impulse in &self.impulses {
+            let sample_time = t - impulse.time;
+            // Newest sample at or before sample_time; before any history, hold the oldest.
+            let sample = self.history.iter().rev()
+                .find(|h| h.0 <= sample_time)
+                .or_else(|| self.history.front())
+                .copied()
+                .unwrap_or((t, command.position, command.velocity, command.acceleration));
+            shaped_cmd.position += impulse.weight * sample.1;
+            shaped_cmd.velocity += impulse.weight * sample.2;
+            shaped_cmd.acceleration += impulse.weight * sample.3;
+        }
+
+        // Clamp acceleration to configured maximum
+        if shaped_cmd.acceleration.abs() > self.config.max_acceleration {
+            shaped_cmd.acceleration = self.config.max_acceleration * shaped_cmd.acceleration.signum();
+        }
+
+        let shaped_commands = vec![shaped_cmd];
+
         self.stats.commands_shaped += 1;
         
         // Update processing time statistics
@@ -279,14 +295,18 @@ impl InputShaper {
     
     // Apply exponential smoothing filter
     fn apply_smoothing_filter(&mut self, command: MotionCommand) -> Vec<MotionCommand> {
-        // Simple first-order low-pass filter
-        let alpha = 1.0 - (-1.0 / (self.config.smoothing_time * self.config.frequency)).exp();
-        
+        // First-order low-pass filter on position
+        let tau = self.config.smoothing_time.max(1e-6);
         let mut smoothed_cmd = command;
-        // Apply smoothing to velocity and acceleration
-        smoothed_cmd.velocity *= alpha;
-        smoothed_cmd.acceleration *= alpha;
-        
+        smoothed_cmd.position = match self.smoothing_state {
+            Some((last_t, last_pos)) if command.timestamp >= last_t => {
+                let alpha = 1.0 - (-(command.timestamp - last_t) / tau).exp();
+                last_pos + alpha * (command.position - last_pos)
+            }
+            _ => command.position,
+        };
+        self.smoothing_state = Some((command.timestamp, smoothed_cmd.position));
+
         vec![smoothed_cmd]
     }
     
@@ -469,7 +489,7 @@ impl ResonanceTester {
         }
         
         // Sort by amplitude (highest first)
-        peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        peaks.sort_by(|a, b| b.1.total_cmp(&a.1));
         
         info!("Found {} resonance peaks", peaks.len());
         peaks
@@ -567,7 +587,7 @@ impl InputShaperManager {
                 position: position as f64,
                 velocity: 0.0,
                 acceleration: 0.0,
-                timestamp: 0.0, // Use 0.0 for immediate processing
+                timestamp: shaper.elapsed_seconds(),
             };
             
             let shaped_commands = shaper.shape_command(command);

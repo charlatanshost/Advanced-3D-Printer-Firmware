@@ -330,10 +330,12 @@ impl ConfigManager {
         let config_str = fs::read_to_string(&self.config_path)
             .map_err(|e| ConfigError::IoError(e.to_string()))?;
 
-        self.current_config = toml::from_str(&config_str)
+        let new_config: PrinterConfig = toml::from_str(&config_str)
             .map_err(|e| ConfigError::ParseError(e.to_string()))?;
 
-        self.validate_config()?;
+        // Only take it once it is known to be good
+        Self::validate(&new_config)?;
+        self.current_config = new_config;
         Ok(())
     }
 
@@ -349,42 +351,63 @@ impl ConfigManager {
         let config_str = toml::to_string_pretty(&self.current_config)
             .map_err(|e| ConfigError::SerializeError(e.to_string()))?;
 
-        fs::write(&self.config_path, config_str)
+        // Write a temporary file and rename it over the real one, so a crash or power cut
+        // part way through cannot leave a damaged config.
+        let temp_path = self.config_path.with_extension("toml.tmp");
+        fs::write(&temp_path, config_str)
+            .map_err(|e| ConfigError::IoError(e.to_string()))?;
+        fs::rename(&temp_path, &self.config_path)
             .map_err(|e| ConfigError::IoError(e.to_string()))?;
 
         Ok(())
     }
 
-    /// Validate the loaded configuration
-    fn validate_config(&self) -> Result<(), ConfigError> {
+    /// Validate a configuration. Comparisons are written as "must be in range" so that NaN fails.
+    fn validate(config: &PrinterConfig) -> Result<(), ConfigError> {
         // Check for required motors
-        if self.current_config.motors.is_empty() {
+        if config.motors.is_empty() {
             return Err(ConfigError::ValidationError("No motors configured".to_string()));
         }
 
         // Check for required extruders
-        if self.current_config.extruders.is_empty() {
+        if config.extruders.is_empty() {
             return Err(ConfigError::ValidationError("No extruders configured".to_string()));
         }
 
         // Validate temperature limits
-        for (name, extruder) in &self.current_config.extruders {
-            if extruder.max_temp <= extruder.min_temp {
+        for (name, extruder) in &config.extruders {
+            if !(extruder.max_temp > extruder.min_temp) {
                 return Err(ConfigError::ValidationError(
                     format!("Invalid temperature range for extruder {}", name)
                 ));
             }
+            if !(extruder.max_temp <= config.safety.max_hotend_temp) {
+                return Err(ConfigError::ValidationError(
+                    format!("Extruder {} allows {}°C, above the safety limit of {}°C", name, extruder.max_temp, config.safety.max_hotend_temp)
+                ));
+            }
+        }
+
+        // Validate motor parameters
+        for (name, motor) in &config.motors {
+            if !(motor.steps_per_mm > 0.0) || !(motor.max_velocity > 0.0) || !(motor.max_acceleration > 0.0) {
+                return Err(ConfigError::ValidationError(format!("Invalid parameters for motor {}", name)));
+            }
         }
 
         // Validate motion parameters
-        let motion = &self.current_config.motion;
-        if motion.max_velocity <= 0.0 || motion.max_accel <= 0.0 {
+        let motion = &config.motion;
+        if !(motion.max_velocity > 0.0) || !(motion.max_accel > 0.0) {
             return Err(ConfigError::ValidationError(
                 "Invalid motion parameters".to_string()
             ));
         }
 
         Ok(())
+    }
+
+    fn validate_config(&self) -> Result<(), ConfigError> {
+        Self::validate(&self.current_config)
     }
 
     /// Get current configuration
@@ -444,8 +467,9 @@ impl ConfigManager {
                 .map_err(|e| ConfigError::ParseError(e.to_string()))?,
         };
 
+        // Only take it once it is known to be good
+        Self::validate(&new_config)?;
         self.current_config = new_config;
-        self.validate_config()?;
         Ok(())
     }
 
@@ -465,8 +489,8 @@ impl ConfigManager {
             }
             PrinterType::CoreXY => {
                 config.kinematics.kinematics_type = "corexy".to_string();
-                // Update motors for CoreXY
-                config.motors.clear();
+                // Update motors for CoreXY. Only X and Y change: Z and the rest stay.
+                config.motors.retain(|_, motor| !matches!(motor.function, MotorFunction::XAxis(_) | MotorFunction::YAxis(_)));
                 config.motors.insert("stepper_a".to_string(), MotorConfig {
                     function: MotorFunction::CoreXY_A(0),
                     motor_type: MotorType::Stepper,

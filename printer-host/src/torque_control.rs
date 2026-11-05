@@ -112,8 +112,9 @@ impl ServoMotorWithTorque {
     fn detect_torque_events(&mut self, config: &TorqueControlConfig) -> Result<TorqueEvent, String> {
         let torque_abs = self.current_torque.abs();
         
-        // Check for immediate safety conditions
-        if torque_abs > config.max_torque {
+        // Check for immediate safety conditions. A NaN reading compares false to everything,
+        // so it has to count as over-torque or a broken sensor would look perfectly calm.
+        if !torque_abs.is_finite() || torque_abs > config.max_torque {
             return Ok(TorqueEvent::OverTorque {
                 motor_id: self.motor_id,
                 torque: self.current_torque,
@@ -137,8 +138,8 @@ impl ServoMotorWithTorque {
             self.collision_detected = false;
         }
         
-        // Stall detection - sustained high torque with low movement
-        if self.average_torque > config.collision_threshold * 0.8 {
+        // Stall detection - sustained high torque with low movement, in either direction
+        if self.average_torque.abs() > config.collision_threshold * 0.8 {
             if !self.is_stalled {
                 self.is_stalled = true;
                 return Ok(TorqueEvent::MotorStall {
@@ -165,7 +166,7 @@ impl ServoMotorWithTorque {
                 .map(|(_, torque)| torque.abs())
                 .collect();
             
-            baseline_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            baseline_samples.sort_by(|a, b| a.total_cmp(b));
             // Use median as baseline to avoid outliers
             let median_index = baseline_samples.len() / 2;
             self.baseline_torque = baseline_samples[median_index];
@@ -201,6 +202,9 @@ impl ServoMotorWithTorque {
         }
     }
 }
+
+/// The unclog sequence raises the temperature, but never above this
+const MAX_UNCLOG_TEMPERATURE: f32 = 280.0;
 
 // Extruder with clog detection
 pub struct AdaptiveExtruder {
@@ -241,11 +245,11 @@ impl AdaptiveExtruder {
         // Update motor torque
         let torque_event = self.motor.update_torque(config)?;
         
-        // Estimate actual flow rate from motor torque and speed
-        self.estimate_flow_rate();
-        
         // Detect clogs and adjust
         let clog_event = self.detect_clog(config)?;
+
+        // Estimate actual flow rate from how blocked the nozzle looks
+        self.estimate_flow_rate();
         
         // Update adaptive multiplier
         self.update_adaptive_multiplier();
@@ -273,11 +277,10 @@ impl AdaptiveExtruder {
     }
     
     fn estimate_flow_rate(&mut self) {
-        // Estimate flow rate based on motor torque and theoretical relationship
-        let torque_flow_coefficient = 0.5; // mm³/s per N⋅m (material dependent)
-        let temperature_factor = 1.0 + (self.temperature - 200.0) * 0.001; // Flow increases with temp
-        
-        self.actual_flow_rate = self.motor.current_torque * torque_flow_coefficient * temperature_factor;
+        // Rising torque means rising back-pressure, so less flow than commanded. (Treating
+        // torque as proportional to flow made a blocked nozzle look like a high flow rate.)
+        // This is an estimate: nothing here measures the filament directly.
+        self.actual_flow_rate = self.target_flow_rate * (1.0 - self.clog_probability);
         
         // Store flow history
         let now = Instant::now();
@@ -296,17 +299,16 @@ impl AdaptiveExtruder {
     
     fn detect_clog(&mut self, config: &TorqueControlConfig) -> Result<ExtrusionEvent, String> {
         // Check if torque is too high for expected flow rate
-        if self.motor.current_torque.abs() > config.extrusion_threshold {
-            let flow_efficiency = if self.target_flow_rate > 0.1 {
-                self.actual_flow_rate / self.target_flow_rate
-            } else {
-                1.0
-            };
-            
-            // Clog probability based on torque vs flow efficiency
-            self.clog_probability = (1.0 - flow_efficiency).clamp(0.0, 1.0);
-            
+        let torque = self.motor.current_torque.abs();
+        if torque > config.extrusion_threshold && self.target_flow_rate > 0.1 {
+            // 0 at the clog threshold, certain by the collision threshold. Beyond that it is
+            // an emergency stop, so a clog has to be recognised before getting there.
+            let range = (config.collision_threshold - config.extrusion_threshold).max(1e-6);
+            let excess = (torque - config.extrusion_threshold) / range;
+            self.clog_probability = excess.clamp(0.0, 1.0);
+
             if self.clog_probability > 0.8 {
+                let flow_efficiency = 1.0 - self.clog_probability;
                 self.last_clog_detection = Some(Instant::now());
                 return Ok(ExtrusionEvent::ClogDetected {
                     extruder_id: self.extruder_id,
@@ -336,13 +338,14 @@ impl AdaptiveExtruder {
         if self.clog_probability > 0.5 {
             // Reduce flow when clog is detected
             self.adaptive_multiplier *= 0.95;
-        } else if self.clog_probability < 0.1 && self.motor.current_torque.abs() < 0.5 {
-            // Increase flow when everything is working well
-            self.adaptive_multiplier *= 1.005;
+        } else if self.clog_probability < 0.1 {
+            // Recover toward normal. Never above it: a healthy extruder is already right, and
+            // growing here would reach 50% over-extrusion within a hundred updates.
+            self.adaptive_multiplier = (self.adaptive_multiplier * 1.005).min(1.0);
         }
-        
+
         // Keep multiplier within reasonable bounds
-        self.adaptive_multiplier = self.adaptive_multiplier.clamp(0.5, 1.5);
+        self.adaptive_multiplier = self.adaptive_multiplier.clamp(0.5, 1.0);
     }
     
     pub fn force_unclog_sequence(&mut self) -> Vec<UnclogCommand> {
@@ -356,7 +359,7 @@ impl AdaptiveExtruder {
         
         // Increase temperature
         commands.push(UnclogCommand::SetTemperature {
-            temperature: self.temperature + 10.0,
+            temperature: (self.temperature + 10.0).min(MAX_UNCLOG_TEMPERATURE),
             wait: true,
         });
         
@@ -385,6 +388,8 @@ pub struct DynamicForceController {
     safety_enabled: bool,
     last_update: Instant,
     event_history: VecDeque<(Instant, SystemEvent)>,
+    /// Commanded flow (mm³/s) and temperature per extruder, from the planner and heaters
+    extruder_targets: HashMap<u8, (f32, f32)>,
 }
 
 impl DynamicForceController {
@@ -396,9 +401,16 @@ impl DynamicForceController {
             safety_enabled: true,
             last_update: Instant::now(),
             event_history: VecDeque::with_capacity(1000),
+            extruder_targets: HashMap::new(),
         }
     }
-    
+
+    /// Tell the controller what an extruder is meant to be doing. Until then it is treated
+    /// as idle, so clog detection does not act on made-up values.
+    pub fn set_extruder_target(&mut self, extruder_id: u8, flow_rate: f32, temperature: f32) {
+        self.extruder_targets.insert(extruder_id, (flow_rate, temperature));
+    }
+
     pub fn add_motor(&mut self, motor_id: char, torque_sensor: Box<dyn TorqueSensor>) {
         let motor = ServoMotorWithTorque::new(motor_id, torque_sensor);
         self.motors.insert(motor_id, motor);
@@ -415,6 +427,15 @@ impl DynamicForceController {
         }
         
         let now = Instant::now();
+
+        // A stop stays in force until reset_safety
+        if !self.safety_enabled {
+            return Ok(SystemEvent::EmergencyStop {
+                reasons: vec!["Emergency stop is latched".to_string()],
+                timestamp: now,
+            });
+        }
+
         let mut critical_events = Vec::new();
         let mut warnings = Vec::new();
         
@@ -429,16 +450,15 @@ impl DynamicForceController {
                     warnings.push(format!("Motor {} stalled", motor_id));
                 },
                 Ok(_) => {},
-                Err(e) => warnings.push(format!("Motor {} error: {}", motor_id, e)),
+                // Without this sensor there is no collision protection, so it cannot just be a warning
+                Err(e) => critical_events.push(format!("Motor {} torque sensor failed: {}", motor_id, e)),
             }
         }
         
         // Update all extruders
         for (extruder_id, extruder) in &mut self.extruders {
-            // Get target flow from motion planner (would be passed as parameter)
-            let target_flow = 5.0; // mm³/s - example value
-            let temperature = 200.0; // °C - would come from temperature controller
-            
+            let (target_flow, temperature) = self.extruder_targets.get(extruder_id).copied().unwrap_or((0.0, extruder.temperature));
+
             match extruder.update(&self.config, target_flow, temperature) {
                 Ok(ExtrusionEvent::EmergencyStop { .. }) => {
                     critical_events.push(format!("Emergency stop on extruder {}", extruder_id));
@@ -447,7 +467,7 @@ impl DynamicForceController {
                     warnings.push(format!("Clog detected on extruder {}", extruder_id));
                 },
                 Ok(_) => {},
-                Err(e) => warnings.push(format!("Extruder {} error: {}", extruder_id, e)),
+                Err(e) => critical_events.push(format!("Extruder {} torque sensor failed: {}", extruder_id, e)),
             }
         }
         
@@ -455,6 +475,7 @@ impl DynamicForceController {
         
         // Generate system event based on collected information
         let event = if !critical_events.is_empty() {
+            self.safety_enabled = false;
             SystemEvent::EmergencyStop {
                 reasons: critical_events,
                 timestamp: now,

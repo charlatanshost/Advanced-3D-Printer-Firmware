@@ -268,8 +268,13 @@ pub struct SensorFusionManager {
     sensor_buffers: HashMap<char, VecDeque<SensorData>>,
     calibration_data: HashMap<char, SensorCalibration>,
     fusion_stats: FusionStatistics,
-    last_fusion_time: Instant,
+    /// Time of the last sample per axis. Sharing one across axes would give each
+    /// axis the gap since whichever axis happened to go before it.
+    last_sample_times: HashMap<char, Instant>,
     outlier_detector: OutlierDetector,
+    accel_outlier_detector: OutlierDetector,
+    /// Rejections in a row per axis, so a filter that has lost track can recover
+    consecutive_rejections: HashMap<char, u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -331,6 +336,10 @@ impl OutlierDetector {
 
     /// Detect outliers using Mahalanobis distance
     pub fn is_outlier(&mut self, axis: char, measurement: f32, predicted: f32, covariance: f32) -> bool {
+        // With no uncertainty at all, this cannot be judged
+        if !(covariance > 0.0) {
+            return false;
+        }
         let residual = measurement - predicted;
         let mahalanobis_dist = (residual * residual / covariance).sqrt();
 
@@ -365,8 +374,10 @@ impl SensorFusionManager {
             sensor_buffers: HashMap::new(),
             calibration_data: HashMap::new(),
             fusion_stats: FusionStatistics::default(),
-            last_fusion_time: Instant::now(),
+            last_sample_times: HashMap::new(),
             outlier_detector: OutlierDetector::new(),
+            accel_outlier_detector: OutlierDetector::new(),
+            consecutive_rejections: HashMap::new(),
         }
     }
 
@@ -425,39 +436,54 @@ impl SensorFusionManager {
             .ok_or(FusionError::AxisNotInitialized(axis))?;
 
         // Calculate time step
-        let dt = calibrated_data.timestamp.duration_since(self.last_fusion_time).as_secs_f32();
+        let dt = match self.last_sample_times.get(&axis) {
+            Some(last) => calibrated_data.timestamp.saturating_duration_since(*last).as_secs_f32(),
+            None => 0.0,
+        };
+        self.last_sample_times.insert(axis, calibrated_data.timestamp);
+
         if dt > 0.0 && dt < 1.0 { // Sanity check
             // Prediction step
             filter.predict(dt);
 
-            // Update with encoder data (if available and valid)
-            if !self.outlier_detector.is_outlier(axis, calibrated_data.encoder_position,
-                                                filter.get_state()[0], filter.get_uncertainty()[0]) {
+            // Update with encoder data (if available and valid). The test needs the variance of
+            // the difference: the filter's own variance plus the sensor's noise.
+            let encoder_noise_variance = self.sensor_configs[&axis].noise_variance.encoder_noise.powi(2);
+            let position_uncertainty = filter.get_uncertainty()[0];
+            let encoder_rejected = self.outlier_detector.is_outlier(axis, calibrated_data.encoder_position,
+                                                filter.get_state()[0], position_uncertainty * position_uncertainty + encoder_noise_variance);
+
+            // The encoder is the reference. If it disagrees for this long, it is the filter
+            // that is wrong, and refusing it forever would leave the estimate stuck.
+            const MAX_CONSECUTIVE_REJECTIONS: u32 = 20;
+            let rejections = self.consecutive_rejections.entry(axis).or_insert(0);
+            if !encoder_rejected || *rejections >= MAX_CONSECUTIVE_REJECTIONS {
+                *rejections = 0;
                 let encoder_noise = Matrix2::new(
                     self.sensor_configs[&axis].noise_variance.encoder_noise.powi(2), 0.0,
                     0.0, (self.sensor_configs[&axis].noise_variance.encoder_noise * 10.0).powi(2)
                 );
                 filter.update_encoder(calibrated_data.encoder_position, calibrated_data.encoder_velocity, encoder_noise);
             } else {
+                *rejections += 1;
                 self.fusion_stats.outliers_rejected += 1;
             }
 
-            // Update with accelerometer data
-            let accel_magnitude = (calibrated_data.accelerometer[0].powi(2) +
-                                 calibrated_data.accelerometer[1].powi(2) +
-                                 calibrated_data.accelerometer[2].powi(2)).sqrt();
-
-            // Choose the axis that corresponds to the motion axis (simplified)
-            let axis_accel = match axis {
+            // Choose the axis that corresponds to the motion axis (simplified). The accelerometer
+            // reports m/s² but the filter's states are in mm, so it is converted to mm/s².
+            const MM_PER_M: f32 = 1000.0;
+            let axis_accel = MM_PER_M * match axis {
                 'X' => calibrated_data.accelerometer[0],
                 'Y' => calibrated_data.accelerometer[1],
                 'Z' => calibrated_data.accelerometer[2],
                 _ => calibrated_data.accelerometer[0],
             };
 
-            if !self.outlier_detector.is_outlier(axis, axis_accel,
-                                                filter.get_state()[2], filter.get_uncertainty()[2]) {
-                let accel_noise = self.sensor_configs[&axis].noise_variance.accelerometer_noise.powi(2);
+            // A separate detector: its history of mm/s² must not be mixed with mm
+            let accel_noise = (self.sensor_configs[&axis].noise_variance.accelerometer_noise * MM_PER_M).powi(2);
+            let accel_uncertainty = filter.get_uncertainty()[2];
+            if !self.accel_outlier_detector.is_outlier(axis, axis_accel,
+                                                filter.get_state()[2], accel_uncertainty * accel_uncertainty + accel_noise) {
                 filter.update_accelerometer(axis_accel, accel_noise);
             } else {
                 self.fusion_stats.outliers_rejected += 1;
@@ -484,7 +510,6 @@ impl SensorFusionManager {
 
         // Update statistics
         self.update_statistics(axis, start_time.elapsed());
-        self.last_fusion_time = Instant::now();
 
         Ok(fused_state)
     }

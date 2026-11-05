@@ -1,9 +1,15 @@
 // Smooth Trajectory Planning System to Eliminate VFAs
 // This module implements advanced trajectory planning techniques inspired by LinuxCNC
 // to provide smooth, continuous motion that eliminates vertical fine artifacts (VFAs)
+//
+// How it works:
+// - Moves wait in a queue. Each new move re-plans the junction speeds of the queue.
+// - Points are generated one segment at a time, only when the previous segment has been
+//   consumed. Anything already handed out is never planned again.
+// - Each segment follows a real speed profile that respects the velocity, acceleration
+//   and junction limits, and position is the integral of that speed.
 
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
 use serde::{Serialize, Deserialize};
 
 // Advanced motion profile types
@@ -11,9 +17,15 @@ use serde::{Serialize, Deserialize};
 pub enum MotionProfile {
     Trapezoidal,     // Traditional trapezoidal velocity profile
     SCurve,          // S-curve profile with jerk limiting
-    Bezier,          // Bezier curve smoothing
-    BSpline,         // B-spline trajectory
-    NURBS,           // Non-uniform rational B-splines
+    Bezier,          // Currently uses the same smooth speed ramps as SCurve
+    BSpline,         // Currently uses the same smooth speed ramps as SCurve
+    NURBS,           // Currently uses the same smooth speed ramps as SCurve
+}
+
+impl MotionProfile {
+    fn is_smooth(&self) -> bool {
+        !matches!(self, MotionProfile::Trapezoidal)
+    }
 }
 
 // Motion constraints for smooth planning
@@ -70,6 +82,18 @@ impl Default for MotionPoint {
     }
 }
 
+/// Exact geometry of an arc in the XY plane (Z may change, giving a helix)
+#[derive(Debug, Clone)]
+struct ArcGeometry {
+    center: [f64; 2],
+    radius: f64,
+    start_angle: f64,
+    /// Signed angle swept, in radians. Positive is counter-clockwise.
+    sweep: f64,
+    start_z: f64,
+    end_z: f64,
+}
+
 // Smooth trajectory segment
 #[derive(Debug, Clone)]
 pub struct SmoothSegment {
@@ -80,6 +104,107 @@ pub struct SmoothSegment {
     pub segment_time: f64,
     pub arc_length: f64,
     pub max_deviation: f64,
+    arc: Option<ArcGeometry>,
+}
+
+impl SmoothSegment {
+    /// Position after travelling `s` mm along this segment
+    fn position_at(&self, s: f64) -> [f64; 3] {
+        let t = if self.arc_length > 0.0 { (s / self.arc_length).clamp(0.0, 1.0) } else { 1.0 };
+        match &self.arc {
+            Some(arc) => {
+                let angle = arc.start_angle + arc.sweep * t;
+                [
+                    arc.center[0] + arc.radius * angle.cos(),
+                    arc.center[1] + arc.radius * angle.sin(),
+                    arc.start_z + (arc.end_z - arc.start_z) * t,
+                ]
+            }
+            None => SmoothTrajectoryPlanner::interpolate_3d(&self.start_point.position, &self.end_point.position, t),
+        }
+    }
+
+    /// Unit direction of travel after `s` mm along this segment
+    fn direction_at(&self, s: f64) -> [f64; 3] {
+        match &self.arc {
+            Some(arc) => {
+                let t = if self.arc_length > 0.0 { (s / self.arc_length).clamp(0.0, 1.0) } else { 1.0 };
+                let angle = arc.start_angle + arc.sweep * t;
+                let turning = arc.sweep.signum() * arc.radius * arc.sweep.abs();
+                SmoothTrajectoryPlanner::normalize(&[-angle.sin() * turning, angle.cos() * turning, arc.end_z - arc.start_z])
+            }
+            None => SmoothTrajectoryPlanner::normalize(&SmoothTrajectoryPlanner::subtract_3d(
+                &self.end_point.position,
+                &self.start_point.position,
+            )),
+        }
+    }
+
+    fn curvature(&self) -> f64 {
+        self.arc.as_ref().map_or(0.0, |arc| 1.0 / arc.radius)
+    }
+
+    /// Speed limit for this segment: its feedrate, the machine's, and for arcs the
+    /// speed at which cornering stays inside the acceleration limit.
+    fn speed_limit(&self, constraints: &MotionConstraints) -> f64 {
+        let mut limit = self.start_point.feedrate.min(constraints.max_velocity);
+        if let Some(arc) = &self.arc {
+            limit = limit.min((constraints.max_acceleration * arc.radius).sqrt());
+        }
+        limit
+    }
+}
+
+/// Speed over time for one segment: ramp from entry to cruise, hold, ramp to exit.
+#[derive(Debug, Clone, Copy)]
+struct SpeedProfile {
+    entry: f64,
+    cruise: f64,
+    exit: f64,
+    accel_time: f64,
+    cruise_time: f64,
+    decel_time: f64,
+    smooth: bool,
+}
+
+impl SpeedProfile {
+    fn total_time(&self) -> f64 {
+        self.accel_time + self.cruise_time + self.decel_time
+    }
+
+    /// One ramp from v0 to v1 lasting `duration`: (distance so far, speed, acceleration) at time t
+    fn ramp(v0: f64, v1: f64, duration: f64, t: f64, smooth: bool) -> (f64, f64, f64) {
+        if duration <= 0.0 {
+            return (0.0, v1, 0.0);
+        }
+        let u = (t / duration).clamp(0.0, 1.0);
+        let dv = v1 - v0;
+        if smooth {
+            // Smoothstep: speed eases in and out, peak acceleration is 1.5x the average
+            let speed = v0 + dv * (3.0 * u * u - 2.0 * u * u * u);
+            let distance = duration * (v0 * u + dv * (u * u * u - 0.5 * u * u * u * u));
+            let accel = dv * 6.0 * u * (1.0 - u) / duration;
+            (distance, speed, accel)
+        } else {
+            (duration * (v0 * u + 0.5 * dv * u * u), v0 + dv * u, dv / duration)
+        }
+    }
+
+    /// (distance, speed, acceleration) at time t
+    fn sample(&self, t: f64) -> (f64, f64, f64) {
+        if t < self.accel_time {
+            return Self::ramp(self.entry, self.cruise, self.accel_time, t, self.smooth);
+        }
+        let accel_distance = (self.entry + self.cruise) / 2.0 * self.accel_time;
+        let t = t - self.accel_time;
+        if t < self.cruise_time {
+            return (accel_distance + self.cruise * t, self.cruise, 0.0);
+        }
+        let cruise_distance = self.cruise * self.cruise_time;
+        let t = t - self.cruise_time;
+        let (d, v, a) = Self::ramp(self.cruise, self.exit, self.decel_time, t, self.smooth);
+        (accel_distance + cruise_distance + d, v, a)
+    }
 }
 
 // Advanced lookahead buffer for smooth motion planning
@@ -87,19 +212,11 @@ pub struct SmoothTrajectoryPlanner {
     segments: VecDeque<SmoothSegment>,
     planned_points: VecDeque<MotionPoint>,
     constraints: MotionConstraints,
-    lookahead_time: f64,          // How far ahead to plan (seconds)
     interpolation_rate: f64,      // Points per second for interpolation
     current_time: f64,
     profile_type: MotionProfile,
-    cornering_algorithm: CorneringAlgorithm,
-}
-
-#[derive(Debug, Clone)]
-pub enum CorneringAlgorithm {
-    ConstantAcceleration,   // Traditional approach
-    CornerBlending,         // Blend corners with curves
-    AdaptiveLookahead,      // Adaptive lookahead based on geometry
-    PredictiveSmoothing,    // Predictive smoothing based on upcoming moves
+    /// Speed at the end of the last segment handed out, which the next must start from
+    current_speed: f64,
 }
 
 impl SmoothTrajectoryPlanner {
@@ -108,35 +225,38 @@ impl SmoothTrajectoryPlanner {
             segments: VecDeque::with_capacity(256),
             planned_points: VecDeque::with_capacity(1000),
             constraints,
-            lookahead_time: 1.0,        // 1 second lookahead
             interpolation_rate: 1000.0, // 1000 Hz interpolation
             current_time: 0.0,
             profile_type,
-            cornering_algorithm: CorneringAlgorithm::PredictiveSmoothing,
+            current_speed: 0.0,
         }
     }
-    
+
     pub fn add_linear_move(&mut self, start: [f64; 3], end: [f64; 3], feedrate: f64) {
         let distance = Self::distance_3d(&start, &end);
         if distance < 1e-6 {
             return; // Skip zero-length moves
         }
-        
+        if !(feedrate > 0.0) || !feedrate.is_finite() {
+            log::warn!("Ignoring move with invalid feedrate {}", feedrate);
+            return;
+        }
+
         let segment_time = distance / feedrate.min(self.constraints.max_velocity);
-        
+
         let start_point = MotionPoint {
             position: start,
             feedrate,
             ..Default::default()
         };
-        
+
         let end_point = MotionPoint {
             position: end,
             feedrate,
             time: segment_time,
             ..Default::default()
         };
-        
+
         let segment = SmoothSegment {
             start_point,
             end_point,
@@ -145,366 +265,261 @@ impl SmoothTrajectoryPlanner {
             segment_time,
             arc_length: distance,
             max_deviation: 0.0,
+            arc: None,
         };
-        
+
         self.segments.push_back(segment);
         self.replan_velocities();
     }
-    
-    pub fn add_arc_move(&mut self, start: [f64; 3], end: [f64; 3], center: [f64; 3], 
+
+    /// Add an arc in the XY plane. If `start` and `end` are the same point this is a full circle.
+    pub fn add_arc_move(&mut self, start: [f64; 3], end: [f64; 3], center: [f64; 3],
                        clockwise: bool, feedrate: f64) {
-        // Calculate arc parameters
-        let start_radius = Self::distance_3d(&start, &center);
-        let end_radius = Self::distance_3d(&end, &center);
-        
-        if (start_radius - end_radius).abs() > 1e-6 {
-            // Radii don't match, fall back to linear move
+        if !(feedrate > 0.0) || !feedrate.is_finite() {
+            log::warn!("Ignoring arc with invalid feedrate {}", feedrate);
+            return;
+        }
+
+        let start_radius = (start[0] - center[0]).hypot(start[1] - center[1]);
+        let end_radius = (end[0] - center[0]).hypot(end[1] - center[1]);
+
+        // G-code coordinates are rounded (usually to 0.001mm), so the two radii never match
+        // exactly. Only treat them as inconsistent if they differ by more than rounding could.
+        let tolerance = (start_radius * 0.001).max(0.05);
+        if start_radius < 1e-6 || (start_radius - end_radius).abs() > tolerance {
+            log::warn!("Inconsistent arc (radius {} vs {}), using a straight line", start_radius, end_radius);
             self.add_linear_move(start, end, feedrate);
             return;
         }
-        
-        let arc_angle = Self::calculate_arc_angle(&start, &end, &center);
-        let arc_length = start_radius * arc_angle;
+
+        let sweep = Self::calculate_arc_sweep(&start, &end, &center, clockwise);
+        let planar_length = start_radius * sweep.abs();
+        let arc_length = planar_length.hypot(end[2] - start[2]);
         let segment_time = arc_length / feedrate.min(self.constraints.max_velocity);
-        
-        // Generate control points for smooth arc
-        let num_points = (arc_length / 1.0).ceil() as usize; // 1mm resolution
-        let mut control_points = Vec::with_capacity(num_points);
-        
-        for i in 0..=num_points {
-            let t = i as f64 / num_points as f64;
-            let angle = if clockwise { -arc_angle * t } else { arc_angle * t };
-            let point = Self::rotate_point_around_center(&start, &center, angle);
-            
-            control_points.push(MotionPoint {
-                position: point,
-                time: segment_time * t,
-                feedrate,
-                curvature: 1.0 / start_radius, // Curvature is 1/radius
-                ..Default::default()
-            });
-        }
-        
+        let curvature = 1.0 / start_radius;
+
         let segment = SmoothSegment {
             start_point: MotionPoint {
                 position: start,
                 feedrate,
-                curvature: 1.0 / start_radius,
+                curvature,
                 ..Default::default()
             },
             end_point: MotionPoint {
                 position: end,
                 feedrate,
                 time: segment_time,
-                curvature: 1.0 / start_radius,
+                curvature,
                 ..Default::default()
             },
-            control_points,
-            profile_type: MotionProfile::Bezier,
+            control_points: Vec::new(),
+            profile_type: self.profile_type.clone(),
             segment_time,
             arc_length,
             max_deviation: 0.0,
+            arc: Some(ArcGeometry {
+                center: [center[0], center[1]],
+                radius: start_radius,
+                start_angle: (start[1] - center[1]).atan2(start[0] - center[0]),
+                sweep,
+                start_z: start[2],
+                end_z: end[2],
+            }),
         };
-        
+
         self.segments.push_back(segment);
         self.replan_velocities();
     }
-    
+
+    /// The acceleration planning may assume. A smooth ramp peaks at 1.5x its average,
+    /// so its average has to be lower for the peak to stay inside the limit.
+    fn planning_acceleration(&self, profile: &MotionProfile) -> f64 {
+        if profile.is_smooth() {
+            self.constraints.max_acceleration / 1.5
+        } else {
+            self.constraints.max_acceleration
+        }
+    }
+
+    /// Set the entry and exit speed of every waiting segment
     fn replan_velocities(&mut self) {
-        if self.segments.len() < 2 {
+        let count = self.segments.len();
+        if count == 0 {
             return;
         }
-        
-        // Forward pass: calculate maximum entry velocities based on cornering
-        for i in 1..self.segments.len() {
-            let (prev_seg, curr_seg) = self.get_adjacent_segments(i);
-            let corner_velocity = self.calculate_corner_velocity(prev_seg, curr_seg);
-            
-            // Update entry velocity of current segment
-            if let Some(segment) = self.segments.get_mut(i) {
-                let prev_feedrate = segment.start_point.feedrate;
-                segment.start_point.actual_feedrate = prev_feedrate.min(corner_velocity);
+
+        // Upper limit on the speed at each junction. junction[i] is the start of segment i.
+        // The last move must be able to stop, as nothing is known to follow it.
+        let mut junction = vec![0.0f64; count + 1];
+        junction[0] = self.current_speed;
+        for i in 1..count {
+            let (previous, current) = (&self.segments[i - 1], &self.segments[i]);
+            let corner = self.calculate_corner_velocity(previous, current);
+            junction[i] = corner
+                .min(previous.speed_limit(&self.constraints))
+                .min(current.speed_limit(&self.constraints));
+        }
+
+        // Backward pass: slow enough to be able to brake for what comes next
+        for i in (0..count).rev() {
+            let segment = &self.segments[i];
+            let accel = self.planning_acceleration(&segment.profile_type);
+            let reachable = (junction[i + 1].powi(2) + 2.0 * accel * segment.arc_length).sqrt();
+            if i > 0 {
+                junction[i] = junction[i].min(reachable);
             }
         }
-        
-        // Backward pass: propagate velocity constraints
-        for i in (0..self.segments.len() - 1).rev() {
-            if let (Some(current), Some(next)) = 
-                (self.segments.get(i), self.segments.get(i + 1)) {
-                
-                let max_entry_vel = self.calculate_max_entry_velocity(
-                    current, 
-                    next.start_point.actual_feedrate
-                );
-                
-                if let Some(segment) = self.segments.get_mut(i) {
-                    segment.end_point.actual_feedrate = 
-                        segment.end_point.feedrate.min(max_entry_vel);
-                }
-            }
+
+        // Forward pass: no faster than can be reached from what came before
+        for i in 0..count {
+            let segment = &self.segments[i];
+            let accel = self.planning_acceleration(&segment.profile_type);
+            let reachable = (junction[i].powi(2) + 2.0 * accel * segment.arc_length).sqrt();
+            junction[i + 1] = junction[i + 1].min(reachable);
         }
-        
-        // Generate interpolated points for smooth execution
-        self.generate_interpolated_points();
+
+        for (i, segment) in self.segments.iter_mut().enumerate() {
+            segment.start_point.actual_feedrate = junction[i];
+            segment.end_point.actual_feedrate = junction[i + 1];
+        }
     }
-    
+
+    /// Fastest speed through the corner that stays within `deviation_tolerance` of the path
     fn calculate_corner_velocity(&self, prev_seg: &SmoothSegment, curr_seg: &SmoothSegment) -> f64 {
-        // Calculate the angle between segments
-        let prev_dir = Self::normalize(&Self::subtract_3d(
-            &prev_seg.end_point.position, 
-            &prev_seg.start_point.position
-        ));
-        
-        let curr_dir = Self::normalize(&Self::subtract_3d(
-            &curr_seg.end_point.position, 
-            &curr_seg.start_point.position
-        ));
-        
-        let dot_product = Self::dot_product_3d(&prev_dir, &curr_dir);
-        let angle = dot_product.clamp(-1.0, 1.0).acos();
-        
-        if angle < 0.1 { // Small angle, maintain high velocity
+        let prev_dir = prev_seg.direction_at(prev_seg.arc_length);
+        let curr_dir = curr_seg.direction_at(0.0);
+
+        let dot_product = Self::dot_product_3d(&prev_dir, &curr_dir).clamp(-1.0, 1.0);
+        let angle = dot_product.acos();
+
+        if angle < 0.1 { // Nearly straight, maintain high velocity
             return self.constraints.max_velocity;
         }
-        
-        // Calculate corner velocity based on deviation tolerance
-        let radius = self.constraints.deviation_tolerance / (1.0 - (angle / 2.0).cos());
+
+        // Junction deviation. The fillet radius is δ·sin(θ/2) / (1 - sin(θ/2)), where θ is the
+        // interior angle: 180 degrees when going straight on, 0 for a full reversal.
+        let sin_half_interior = ((1.0 + dot_product) / 2.0).clamp(0.0, 1.0).sqrt();
+        if sin_half_interior <= 0.0 {
+            return 0.0; // Full reversal: must stop
+        }
+        let radius = self.constraints.deviation_tolerance * sin_half_interior / (1.0 - sin_half_interior).max(1e-9);
         let centripetal_velocity = (self.constraints.max_acceleration * radius).sqrt();
-        
+
         centripetal_velocity.min(self.constraints.corner_velocity)
     }
-    
-    fn calculate_max_entry_velocity(&self, current: &SmoothSegment, exit_velocity: f64) -> f64 {
-        let distance = current.arc_length;
-        let max_accel = self.constraints.max_acceleration;
-        
-        // v² = u² + 2as, solving for u (entry velocity)
-        let max_velocity_squared = exit_velocity.powi(2) + 2.0 * max_accel * distance;
-        max_velocity_squared.sqrt().min(current.start_point.feedrate)
-    }
-    
-    fn generate_interpolated_points(&mut self) {
-        self.planned_points.clear();
-        
-        // Clone segments to avoid borrowing conflicts
-        let segments_to_process: Vec<SmoothSegment> = self.segments.iter().cloned().collect();
-        
-        for segment in segments_to_process {
-            match segment.profile_type {
-                MotionProfile::SCurve => {
-                    self.generate_s_curve_points(&segment);
-                },
-                MotionProfile::Bezier => {
-                    self.generate_bezier_points(&segment);
-                },
-                MotionProfile::BSpline => {
-                    self.generate_bspline_points(&segment);
-                },
-                _ => {
-                    self.generate_trapezoidal_points(&segment);
-                }
+
+    /// Work out the speed profile for a segment going from `entry` to `exit`
+    fn build_profile(&self, segment: &SmoothSegment, entry: f64, exit: f64) -> SpeedProfile {
+        let smooth = segment.profile_type.is_smooth();
+        let accel = self.constraints.max_acceleration;
+        let jerk = self.constraints.max_jerk;
+        let distance = segment.arc_length;
+        let limit = segment.speed_limit(&self.constraints).max(entry).max(exit);
+
+        // How long a ramp between two speeds takes
+        let ramp_time = |from: f64, to: f64| -> f64 {
+            let dv = (to - from).abs();
+            if smooth {
+                // Smoothstep: peak acceleration 1.5 dv/T, peak jerk 6 dv/T²
+                (1.5 * dv / accel).max((6.0 * dv / jerk).sqrt())
+            } else {
+                dv / accel
             }
-        }
+        };
+        let ramps_distance = |cruise: f64| -> f64 {
+            (entry + cruise) / 2.0 * ramp_time(entry, cruise) + (cruise + exit) / 2.0 * ramp_time(cruise, exit)
+        };
+
+        // Highest cruise speed whose two ramps fit in this segment
+        let floor = entry.max(exit);
+        let cruise = if ramps_distance(limit) <= distance {
+            limit
+        } else {
+            let (mut low, mut high) = (floor, limit);
+            for _ in 0..40 {
+                let mid = (low + high) / 2.0;
+                if ramps_distance(mid) <= distance { low = mid; } else { high = mid; }
+            }
+            low
+        };
+
+        let mut accel_time = ramp_time(entry, cruise);
+        let mut decel_time = ramp_time(cruise, exit);
+        let used = (entry + cruise) / 2.0 * accel_time + (cruise + exit) / 2.0 * decel_time;
+
+        let cruise_time = if used <= distance {
+            if cruise > 1e-9 { (distance - used) / cruise } else { 0.0 }
+        } else {
+            // Only the jerk limit can get here, as planning already allowed for the acceleration
+            // limit. Stretch to the exact fit: slower ramps can only reduce acceleration.
+            let scale = distance / used.max(1e-12);
+            accel_time *= scale;
+            decel_time *= scale;
+            0.0
+        };
+
+        SpeedProfile { entry, cruise, exit, accel_time, cruise_time, decel_time, smooth }
     }
-    
-    fn generate_s_curve_points(&mut self, segment: &SmoothSegment) {
-        let num_points = (segment.segment_time * self.interpolation_rate).ceil() as usize;
-        let dt = segment.segment_time / num_points as f64;
-        
-        for i in 0..=num_points {
+
+    /// Turn the next waiting segment into points
+    fn generate_next_segment(&mut self) -> bool {
+        let Some(mut segment) = self.segments.pop_front() else {
+            return false;
+        };
+
+        let entry = self.current_speed;
+        let exit = segment.end_point.actual_feedrate;
+        let mut profile = self.build_profile(&segment, entry, exit);
+
+        // A move starting and ending stopped with no time would never get anywhere
+        if profile.total_time() <= 0.0 {
+            profile.cruise = segment.speed_limit(&self.constraints);
+            profile.cruise_time = segment.arc_length / profile.cruise.max(1e-9);
+        }
+
+        let total_time = profile.total_time();
+        segment.segment_time = total_time;
+        let steps = ((total_time * self.interpolation_rate).ceil() as usize).max(1);
+        let dt = total_time / steps as f64;
+        let feedrate = segment.start_point.feedrate;
+        let curvature = segment.curvature();
+
+        for i in 1..=steps {
             let t = i as f64 * dt;
-            let s = self.s_curve_profile(t / segment.segment_time);
-            
-            // Interpolate position along segment
-            let position = Self::interpolate_3d(
-                &segment.start_point.position,
-                &segment.end_point.position,
-                s
-            );
-            
-            // Calculate derivatives for velocity and acceleration
-            let ds_dt = self.s_curve_velocity(t / segment.segment_time) / segment.segment_time;
-            let d2s_dt2 = self.s_curve_acceleration(t / segment.segment_time) / segment.segment_time.powi(2);
-            
-            let direction = Self::normalize(&Self::subtract_3d(
-                &segment.end_point.position,
-                &segment.start_point.position
-            ));
-            
-            let velocity = Self::scale_3d(&direction, ds_dt * segment.arc_length);
-            let acceleration = Self::scale_3d(&direction, d2s_dt2 * segment.arc_length);
-            
-            let point = MotionPoint {
-                position,
-                velocity,
-                acceleration,
-                jerk: [0.0; 3], // Calculate if needed
-                time: self.current_time + t,
-                feedrate: segment.start_point.feedrate,
-                actual_feedrate: Self::magnitude_3d(&velocity),
-                curvature: 0.0, // Linear segment
-            };
-            
-            self.planned_points.push_back(point);
-        }
-        
-        self.current_time += segment.segment_time;
-    }
-    
-    fn generate_bezier_points(&mut self, segment: &SmoothSegment) {
-        let num_points = (segment.segment_time * self.interpolation_rate).ceil() as usize;
-        
-        if segment.control_points.is_empty() {
-            // Simple linear Bezier
-            self.generate_s_curve_points(segment);
-            return;
-        }
-        
-        // Cubic Bezier curve
-        for i in 0..=num_points {
-            let t = i as f64 / num_points as f64;
-            
-            // Cubic Bezier interpolation
-            let point = if segment.control_points.len() >= 2 {
-                let p0 = &segment.start_point.position;
-                let p1 = &segment.control_points[0].position;
-                let p2 = &segment.control_points[segment.control_points.len() - 1].position;
-                let p3 = &segment.end_point.position;
-                
-                Self::cubic_bezier(p0, p1, p2, p3, t)
-            } else {
-                Self::interpolate_3d(
-                    &segment.start_point.position,
-                    &segment.end_point.position,
-                    t
-                )
-            };
-            
-            // Calculate velocity from position derivative
-            let velocity = if i > 0 && i < num_points {
-                let dt = segment.segment_time / num_points as f64;
-                let prev_pos = self.planned_points.back().unwrap().position;
-                let vel = Self::scale_3d(&Self::subtract_3d(&point, &prev_pos), 1.0 / dt);
-                vel
-            } else {
-                [0.0; 3]
-            };
-            
-            let motion_point = MotionPoint {
-                position: point,
-                velocity,
-                acceleration: [0.0; 3], // Would need second derivative
-                jerk: [0.0; 3],
-                time: self.current_time + t * segment.segment_time,
-                feedrate: segment.start_point.feedrate,
-                actual_feedrate: Self::magnitude_3d(&velocity),
-                curvature: 0.0, // Would need curvature calculation
-            };
-            
-            self.planned_points.push_back(motion_point);
-        }
-        
-        self.current_time += segment.segment_time;
-    }
-    
-    fn generate_trapezoidal_points(&mut self, segment: &SmoothSegment) {
-        // Simple trapezoidal velocity profile
-        let num_points = (segment.segment_time * self.interpolation_rate).ceil() as usize;
-        let dt = segment.segment_time / num_points as f64;
-        
-        let start_vel = segment.start_point.actual_feedrate;
-        let end_vel = segment.end_point.actual_feedrate;
-        let max_vel = segment.start_point.feedrate.min(self.constraints.max_velocity);
-        
-        for i in 0..=num_points {
-            let t = i as f64 * dt;
-            let progress = t / segment.segment_time;
-            
-            // Trapezoidal velocity profile
-            let velocity_magnitude = if progress < 0.5 {
-                start_vel + (max_vel - start_vel) * (progress * 2.0).min(1.0)
-            } else {
-                max_vel - (max_vel - end_vel) * ((progress - 0.5) * 2.0).min(1.0)
-            };
-            
-            let position = Self::interpolate_3d(
-                &segment.start_point.position,
-                &segment.end_point.position,
-                progress
-            );
-            
-            let direction = Self::normalize(&Self::subtract_3d(
-                &segment.end_point.position,
-                &segment.start_point.position
-            ));
-            
-            let velocity = Self::scale_3d(&direction, velocity_magnitude);
-            
-            let point = MotionPoint {
-                position,
-                velocity,
-                acceleration: [0.0; 3],
+            let (mut distance, mut speed, mut accel) = profile.sample(t);
+            if i == steps {
+                // Finish exactly on the end point despite rounding
+                distance = segment.arc_length;
+                speed = exit;
+                accel = 0.0;
+            }
+            let direction = segment.direction_at(distance);
+            self.planned_points.push_back(MotionPoint {
+                position: if i == steps { segment.end_point.position } else { segment.position_at(distance) },
+                velocity: Self::scale_3d(&direction, speed),
+                acceleration: Self::scale_3d(&direction, accel),
                 jerk: [0.0; 3],
                 time: self.current_time + t,
-                feedrate: segment.start_point.feedrate,
-                actual_feedrate: velocity_magnitude,
-                curvature: 0.0,
-            };
-            
-            self.planned_points.push_back(point);
+                feedrate,
+                actual_feedrate: speed,
+                curvature,
+            });
         }
-        
-        self.current_time += segment.segment_time;
+
+        self.current_time += total_time;
+        self.current_speed = exit;
+        true
     }
-    
-    fn generate_bspline_points(&mut self, _segment: &SmoothSegment) {
-        // B-spline implementation would go here
-        // For now, fall back to S-curve
-        // self.generate_s_curve_points(segment);
-    }
-    
-    // S-curve profile functions
-    fn s_curve_profile(&self, t: f64) -> f64 {
-        if t <= 0.0 { 0.0 }
-        else if t >= 1.0 { 1.0 }
-        else if t < 0.5 {
-            2.0 * t * t
-        } else {
-            1.0 - 2.0 * (1.0 - t) * (1.0 - t)
-        }
-    }
-    
-    fn s_curve_velocity(&self, t: f64) -> f64 {
-        if t <= 0.0 || t >= 1.0 { 0.0 }
-        else if t < 0.5 {
-            4.0 * t
-        } else {
-            4.0 * (1.0 - t)
-        }
-    }
-    
-    fn s_curve_acceleration(&self, t: f64) -> f64 {
-        if t <= 0.0 || t >= 1.0 { 0.0 }
-        else if t < 0.5 {
-            4.0
-        } else {
-            -4.0
-        }
-    }
-    
+
     // Utility functions
-    fn get_adjacent_segments(&self, index: usize) -> (&SmoothSegment, &SmoothSegment) {
-        (&self.segments[index - 1], &self.segments[index])
-    }
-    
     fn distance_3d(a: &[f64; 3], b: &[f64; 3]) -> f64 {
         ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2) + (b[2] - a[2]).powi(2)).sqrt()
     }
-    
+
     fn subtract_3d(a: &[f64; 3], b: &[f64; 3]) -> [f64; 3] {
         [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
     }
-    
+
     fn normalize(v: &[f64; 3]) -> [f64; 3] {
         let mag = Self::magnitude_3d(v);
         if mag > 1e-10 {
@@ -513,19 +528,19 @@ impl SmoothTrajectoryPlanner {
             [0.0, 0.0, 0.0]
         }
     }
-    
+
     fn magnitude_3d(v: &[f64; 3]) -> f64 {
         (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
     }
-    
+
     fn dot_product_3d(a: &[f64; 3], b: &[f64; 3]) -> f64 {
         a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
     }
-    
+
     fn scale_3d(v: &[f64; 3], scale: f64) -> [f64; 3] {
         [v[0] * scale, v[1] * scale, v[2] * scale]
     }
-    
+
     fn interpolate_3d(start: &[f64; 3], end: &[f64; 3], t: f64) -> [f64; 3] {
         [
             start[0] + (end[0] - start[0]) * t,
@@ -533,77 +548,52 @@ impl SmoothTrajectoryPlanner {
             start[2] + (end[2] - start[2]) * t,
         ]
     }
-    
-    fn cubic_bezier(p0: &[f64; 3], p1: &[f64; 3], p2: &[f64; 3], p3: &[f64; 3], t: f64) -> [f64; 3] {
-        let u = 1.0 - t;
-        let tt = t * t;
-        let uu = u * u;
-        let uuu = uu * u;
-        let ttt = tt * t;
-        
-        [
-            uuu * p0[0] + 3.0 * uu * t * p1[0] + 3.0 * u * tt * p2[0] + ttt * p3[0],
-            uuu * p0[1] + 3.0 * uu * t * p1[1] + 3.0 * u * tt * p2[1] + ttt * p3[1],
-            uuu * p0[2] + 3.0 * uu * t * p1[2] + 3.0 * u * tt * p2[2] + ttt * p3[2],
-        ]
-    }
-    
-    fn calculate_arc_angle(start: &[f64; 3], end: &[f64; 3], center: &[f64; 3]) -> f64 {
-        let start_vec = Self::subtract_3d(start, center);
-        let end_vec = Self::subtract_3d(end, center);
-        
-        let dot = Self::dot_product_3d(&start_vec, &end_vec);
-        let mag_start = Self::magnitude_3d(&start_vec);
-        let mag_end = Self::magnitude_3d(&end_vec);
-        
-        if mag_start > 1e-10 && mag_end > 1e-10 {
-            (dot / (mag_start * mag_end)).clamp(-1.0, 1.0).acos()
+
+    /// Signed angle from start to end around center. The same point twice is a full circle.
+    fn calculate_arc_sweep(start: &[f64; 3], end: &[f64; 3], center: &[f64; 3], clockwise: bool) -> f64 {
+        use std::f64::consts::TAU;
+        let start_angle = (start[1] - center[1]).atan2(start[0] - center[0]);
+        let end_angle = (end[1] - center[1]).atan2(end[0] - center[0]);
+        let same_point = (start[0] - end[0]).hypot(start[1] - end[1]) < 1e-6;
+        let ccw = if same_point { TAU } else { (end_angle - start_angle).rem_euclid(TAU) };
+        if clockwise {
+            if same_point { -TAU } else { ccw - TAU }
         } else {
-            0.0
+            ccw
         }
     }
-    
-    fn rotate_point_around_center(point: &[f64; 3], center: &[f64; 3], angle: f64) -> [f64; 3] {
-        let cos_a = angle.cos();
-        let sin_a = angle.sin();
-        
-        let dx = point[0] - center[0];
-        let dy = point[1] - center[1];
-        
-        [
-            center[0] + dx * cos_a - dy * sin_a,
-            center[1] + dx * sin_a + dy * cos_a,
-            point[2], // Z unchanged for 2D rotation
-        ]
-    }
-    
+
     // Public interface methods
     pub fn get_next_point(&mut self) -> Option<MotionPoint> {
+        if self.planned_points.is_empty() {
+            self.generate_next_segment();
+        }
         self.planned_points.pop_front()
     }
-    
+
     pub fn has_planned_points(&self) -> bool {
-        !self.planned_points.is_empty()
+        !self.planned_points.is_empty() || !self.segments.is_empty()
     }
-    
+
     pub fn get_buffer_level(&self) -> f64 {
         self.planned_points.len() as f64 / 1000.0 // Percentage full
     }
-    
+
     pub fn clear_buffer(&mut self) {
         self.segments.clear();
         self.planned_points.clear();
         self.current_time = 0.0;
+        self.current_speed = 0.0;
     }
-    
+
     pub fn set_motion_profile(&mut self, profile: MotionProfile) {
         self.profile_type = profile;
     }
-    
+
     pub fn set_constraints(&mut self, constraints: MotionConstraints) {
         self.constraints = constraints;
     }
-    
+
     pub fn get_current_constraints(&self) -> &MotionConstraints {
         &self.constraints
     }

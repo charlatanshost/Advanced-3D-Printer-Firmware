@@ -8,6 +8,20 @@ const MAX_RECOVERY_DATA_SIZE: usize = 512;
 const POWER_CHECK_INTERVAL_MS: u64 = 100;
 const CRITICAL_VOLTAGE_THRESHOLD: f32 = 11.5; // 12V system minimum
 const RECOVERY_FILE_MAGIC: u32 = 0xDEADBEEF;
+const LOW_VOLTAGE_SAMPLES: u8 = 3; // Consecutive low readings before acting, to ignore load dips
+const TEMPERATURE_WAIT_SECONDS: u32 = 900;
+
+/// CRC-32 (IEEE) for the saved recovery data
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrinterState {
@@ -39,6 +53,25 @@ pub struct RecoveryData {
     pub gcode_filename: String<64>,
     pub recovery_position: u32,
     pub checksum: u32,
+}
+
+impl RecoveryData {
+    /// The checksum covers everything except the checksum field itself
+    fn compute_checksum(&self) -> Option<u32> {
+        let mut unsigned = self.clone();
+        unsigned.checksum = 0;
+        postcard::to_vec::<_, MAX_RECOVERY_DATA_SIZE>(&unsigned).ok().map(|bytes| crc32(&bytes))
+    }
+
+    /// The checksum to store for this data
+    pub fn signed_checksum(&self) -> Option<u32> {
+        self.compute_checksum()
+    }
+
+    /// Is this intact data that we wrote?
+    pub fn is_valid(&self) -> bool {
+        self.magic == RECOVERY_FILE_MAGIC && self.compute_checksum() == Some(self.checksum)
+    }
 }
 
 impl Default for PrinterState {
@@ -73,7 +106,9 @@ pub struct PowerRecoveryManager {
     state: Mutex<CriticalSectionRawMutex, PrinterState>,
     recovery_data: Option<RecoveryData>,
     power_loss_detected: bool,
+    low_voltage_count: u8,
     last_save_time: u64,
+    gcode_filename: String<64>,
 }
 
 impl PowerRecoveryManager {
@@ -82,7 +117,9 @@ impl PowerRecoveryManager {
             state: Mutex::new(PrinterState::default()),
             recovery_data: None,
             power_loss_detected: false,
+            low_voltage_count: 0,
             last_save_time: 0,
+            gcode_filename: String::new(),
         }
     }
 
@@ -91,18 +128,33 @@ impl PowerRecoveryManager {
             Timer::after(Duration::from_millis(POWER_CHECK_INTERVAL_MS)).await;
             
             let voltage = self.read_power_voltage().await;
-            
-            if voltage < CRITICAL_VOLTAGE_THRESHOLD {
-                self.handle_power_loss().await;
-            }
-            
-            // Save state periodically during printing
+            self.process_voltage_sample(voltage).await;
+
+            // Save state periodically, only while printing. Flash wears out, so even
+            // this rate needs wear levelling once real storage is added.
             let current_time = embassy_time::Instant::now().as_millis();
-            if current_time - self.last_save_time > 5000 { // Save every 5 seconds
+            let printing = self.state.lock().await.printing;
+            if printing && !self.power_loss_detected && current_time - self.last_save_time > 5000 {
                 self.save_recovery_state().await;
                 self.last_save_time = current_time;
             }
         }
+    }
+
+    /// Run the power-loss sequence once per event, and re-arm when power returns.
+    /// Returns true if this sample triggered it.
+    pub async fn process_voltage_sample(&mut self, voltage: f32) -> bool {
+        if voltage < CRITICAL_VOLTAGE_THRESHOLD {
+            self.low_voltage_count = self.low_voltage_count.saturating_add(1);
+            if self.low_voltage_count >= LOW_VOLTAGE_SAMPLES && !self.power_loss_detected {
+                self.handle_power_loss().await;
+                return true;
+            }
+        } else {
+            self.low_voltage_count = 0;
+            self.power_loss_detected = false;
+        }
+        false
     }
 
     async fn read_power_voltage(&self) -> f32 {
@@ -156,15 +208,20 @@ impl PowerRecoveryManager {
 
     async fn save_recovery_state(&mut self) {
         let state = self.state.lock().await.clone();
-        
-        let recovery_data = RecoveryData {
+        let recovery_position = state.print_progress.bytes_processed;
+
+        let mut recovery_data = RecoveryData {
             magic: RECOVERY_FILE_MAGIC,
-            timestamp: embassy_time::Instant::now().as_millis(),
+            timestamp: embassy_time::Instant::now().as_millis(), // Time since boot: there is no clock
             printer_state: state,
-            gcode_filename: String::try_from("current_print.gcode").unwrap_or_default(), // Would get actual filename
-            recovery_position: 0, // Would track actual file position
-            checksum: 0, // Would calculate actual checksum
+            gcode_filename: self.gcode_filename.clone(),
+            recovery_position,
+            checksum: 0,
         };
+        let Some(checksum) = recovery_data.compute_checksum() else {
+            return; // Too big to store: keep the last good save
+        };
+        recovery_data.checksum = checksum;
 
         // Serialize and save to persistent storage (EEPROM/Flash)
         if let Ok(data) = postcard::to_vec::<_, MAX_RECOVERY_DATA_SIZE>(&recovery_data) {
@@ -183,7 +240,7 @@ impl PowerRecoveryManager {
 
     pub async fn check_for_recovery_data(&mut self) -> bool {
         if let Some(data) = self.load_recovery_data_from_storage().await {
-            if data.magic == RECOVERY_FILE_MAGIC {
+            if data.is_valid() {
                 self.recovery_data = Some(data);
                 return true;
             }
@@ -205,7 +262,8 @@ impl PowerRecoveryManager {
                 *state = recovery_data.printer_state.clone();
             }
 
-            // Reheat bed and hotend
+            // Nothing below can reach the hardware yet, so report that instead of claiming
+            // the print resumed. Reheat bed and hotend
             self.restore_temperatures(&recovery_data.printer_state).await?;
 
             // Wait for temperatures to stabilize
@@ -232,7 +290,8 @@ impl PowerRecoveryManager {
     async fn restore_temperatures(&self, state: &PrinterState) -> Result<(), RecoveryError> {
         // Set target temperatures for hotend and bed
         // Wait for them to reach target
-        Ok(())
+        let _ = state;
+        Err(RecoveryError::NotImplemented)
     }
 
     async fn wait_for_temperature_stability(&self) -> Result<(), RecoveryError> {
@@ -240,32 +299,34 @@ impl PowerRecoveryManager {
         let mut stable_count = 0;
         let required_stable_readings = 10;
 
-        loop {
+        for _ in 0..TEMPERATURE_WAIT_SECONDS {
             Timer::after(Duration::from_millis(1000)).await;
             
             // Check if temperatures are stable
             if self.temperatures_stable().await {
                 stable_count += 1;
                 if stable_count >= required_stable_readings {
-                    break;
+                    return Ok(());
                 }
             } else {
                 stable_count = 0;
             }
         }
-        
-        Ok(())
+
+        // A heater that never gets there must not leave this waiting forever
+        Err(RecoveryError::TemperatureTimeout)
     }
 
     async fn temperatures_stable(&self) -> bool {
         // Check if current temperatures are within 2°C of target
-        true // Placeholder
+        false // Not readable yet. Must never claim stable without a real reading.
     }
 
     async fn restore_position(&self, state: &PrinterState) -> Result<(), RecoveryError> {
-        // Home axes if needed
+        // Declare Z, raise it, and only then home XY. Z must not be homed: the print is in
+        // the way. Then move XY, then lower Z, then restore the E counter.
         self.home_axes().await?;
-        
+
         // Move to last known position
         self.move_to_position(state.current_position).await?;
         
@@ -273,7 +334,7 @@ impl PowerRecoveryManager {
     }
 
     async fn home_axes(&self) -> Result<(), RecoveryError> {
-        // Home X, Y, and Z axes
+        // Home X and Y only (see restore_position)
         Ok(())
     }
 
@@ -307,6 +368,28 @@ impl PowerRecoveryManager {
         state.current_temperatures = [hotend, bed];
     }
 
+    /// The temperatures to reheat to on resume
+    pub async fn update_target_temperatures(&self, hotend: f32, bed: f32) {
+        let mut state = self.state.lock().await;
+        state.target_temperatures = [hotend, bed];
+    }
+
+    pub async fn update_motion_settings(&self, feed_rate: f32, fan_speeds: [u8; 2], active_tool: u8) {
+        let mut state = self.state.lock().await;
+        state.feed_rate = feed_rate;
+        state.fan_speeds = fan_speeds;
+        state.active_tool = active_tool;
+    }
+
+    /// Record the file being printed. Call at print start.
+    pub async fn set_print_file(&mut self, filename: &str, total_bytes: u32, total_lines: u32) -> Result<(), RecoveryError> {
+        self.gcode_filename = String::try_from(filename).map_err(|_| RecoveryError::InvalidData)?;
+        let mut state = self.state.lock().await;
+        state.print_progress.total_bytes = total_bytes;
+        state.print_progress.total_lines = total_lines;
+        Ok(())
+    }
+
     pub async fn update_print_progress(&self, line: u32, bytes: u32, layer: u32) {
         let mut state = self.state.lock().await;
         state.print_progress.current_line = line;
@@ -321,9 +404,12 @@ impl PowerRecoveryManager {
 
     pub async fn get_recovery_info(&self) -> Option<(u64, f32)> {
         if let Some(recovery_data) = &self.recovery_data {
-            let progress = recovery_data.printer_state.print_progress.bytes_processed as f32 
-                         / recovery_data.printer_state.print_progress.total_bytes as f32 
-                         * 100.0;
+            let total_bytes = recovery_data.printer_state.print_progress.total_bytes;
+            let progress = if total_bytes > 0 {
+                recovery_data.printer_state.print_progress.bytes_processed as f32 / total_bytes as f32 * 100.0
+            } else {
+                0.0
+            };
             Some((recovery_data.timestamp, progress))
         } else {
             None
@@ -338,6 +424,7 @@ pub enum RecoveryError {
     MovementError,
     FileNotFound,
     InvalidData,
+    NotImplemented,
 }
 
 pub static POWER_RECOVERY: Mutex<CriticalSectionRawMutex, Option<PowerRecoveryManager>> = Mutex::new(None);

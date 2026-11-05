@@ -345,14 +345,20 @@ impl SlicerIntegration {
         for line in input_gcode.lines() {
             let trimmed = line.trim();
             
-            if trimmed.starts_with("G1") || trimmed.starts_with("G0") {
+            // The code part only. A comment must not be read as words, and exactly G0/G1
+            // are moves: G10, G17 and so on merely start the same way.
+            let code = trimmed.split(';').next().unwrap_or("").trim();
+            let is_move = matches!(code.split_whitespace().next(), Some("G0" | "G1" | "G00" | "G01"));
+
+            if is_move {
                 // Parse move command
                 let mut x = current_position.x;
                 let mut y = current_position.y;
                 let mut z = current_position.z;
                 let mut feedrate: Option<f64> = None;
-                
-                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                let mut extrusion: Option<&str> = None;
+
+                let parts: Vec<&str> = code.split_whitespace().collect();
                 for part in parts.iter().skip(1) {
                     if let Some(value_str) = part.strip_prefix('X') {
                         x = value_str.parse().unwrap_or(x);
@@ -362,7 +368,16 @@ impl SlicerIntegration {
                         z = value_str.parse().unwrap_or(z);
                     } else if let Some(value_str) = part.strip_prefix('F') {
                         feedrate = value_str.parse().ok();
+                    } else if let Some(value_str) = part.strip_prefix('E') {
+                        extrusion = Some(value_str);
                     }
+                }
+
+                // A move with no position (E or F only) stays as it is
+                let has_position = parts.iter().skip(1).any(|p| p.starts_with(['X', 'Y', 'Z']));
+                if !has_position {
+                    output_lines.push(trimmed.to_string());
+                    continue;
                 }
                 
                 let target_position = Point3::new(x, y, z);
@@ -373,7 +388,12 @@ impl SlicerIntegration {
                 // Generate 5-axis G-code
                 let mut output_line = format!("{} X{:.3} Y{:.3} Z{:.3} A{:.3} B{:.3}", 
                     &parts[0], x, y, z, orientation_angles.0, orientation_angles.1);
-                
+
+                // Without its E word a move prints nothing
+                if let Some(e) = extrusion {
+                    output_line.push_str(&format!(" E{}", e));
+                }
+
                 if let Some(f) = feedrate {
                     output_line.push_str(&format!(" F{}", f));
                 }
@@ -401,7 +421,11 @@ impl SlicerIntegration {
                 Ok((normal_angle, 0.0))
             },
             "adaptive" => {
-                // Adaptive orientation based on local geometry
+                // Adaptive orientation based on local geometry. Upright at bed level, where
+                // these angles are undefined (0/0 gave NaN, which came out as a hard tilt).
+                if position.z.abs() < 1e-6 {
+                    return Ok((0.0, 0.0));
+                }
                 let a_angle = (position.y / position.z).atan().to_degrees().max(-45.0).min(45.0);
                 let b_angle = (position.x / position.z).atan().to_degrees().max(-30.0).min(30.0);
                 Ok((a_angle, b_angle))
@@ -422,8 +446,8 @@ impl PostProcessor for RepRapFirmwarePostProcessor {
         let mut output_lines = Vec::new();
         
         // Add RRF-specific initialization
+        // Kinematics are the machine's configuration. A print file must not change them.
         output_lines.push("; 5-axis G-code processed for RepRapFirmware".to_string());
-        output_lines.push("M669 K11 ; Set to 5-axis kinematics".to_string());
         
         // Process each line
         for line in input.lines() {
@@ -466,10 +490,16 @@ impl PostProcessor for MarlinPostProcessor {
         for line in input.lines() {
             let trimmed = line.trim();
             
-            if trimmed.contains(" A") || trimmed.contains(" B") {
+            // Only in the code part of moves: not in comments, nor in text like M117 messages
+            let (code, comment) = match trimmed.find(';') {
+                Some(index) => trimmed.split_at(index),
+                None => (trimmed, ""),
+            };
+            let is_move = matches!(code.split_whitespace().next(), Some("G0" | "G1" | "G00" | "G01"));
+            if is_move && (code.contains(" A") || code.contains(" B")) {
                 // Convert A/B to appropriate Marlin axis names (often I/J)
-                let converted = trimmed.replace(" A", " I").replace(" B", " J");
-                output_lines.push(format!("{} ; Marlin 5-axis", converted));
+                let converted = code.trim_end().replace(" A", " I").replace(" B", " J");
+                output_lines.push(format!("{} {}", converted, if comment.is_empty() { "; Marlin 5-axis" } else { comment }));
             } else {
                 output_lines.push(trimmed.to_string());
             }
@@ -501,8 +531,9 @@ impl PostProcessor for KlipperPostProcessor {
     fn process_gcode(&self, input: &str, _config: &SlicerProfile) -> Result<String, ProcessingError> {
         let mut output_lines = Vec::new();
         
+        // No SET_KINEMATIC_POSITION here: it tells Klipper the machine is homed wherever it
+        // happens to be, which defeats the protection against moving when not homed.
         output_lines.push("; 5-axis G-code processed for Klipper".to_string());
-        output_lines.push("SET_KINEMATIC_POSITION ; Initialize 5-axis kinematics".to_string());
         
         for line in input.lines() {
             let trimmed = line.trim();
@@ -524,6 +555,43 @@ impl PostProcessor for KlipperPostProcessor {
     
     fn supports_machine_type(&self, _machine_type: &PracticalMachineType) -> bool {
         true // Klipper supports custom kinematics modules
+    }
+}
+
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+
+    fn integration() -> SlicerIntegration {
+        SlicerIntegration::new(PracticalKinematics::new(PracticalMachineType::penta_axis_style()), SlicerProfile::penta_axis_prusa_profile())
+    }
+
+    #[test]
+    fn surface_following_keeps_extrusion_and_only_rewrites_moves() {
+        let output = integration().convert_to_surface_following(
+            "G1 X10 Y20 Z5 E1.5 F600 ; Z99 comment\nG10\nG1 E-1 F2400\nM104 S200\nG1 X0 Y0 Z0 E2",
+            "adaptive",
+        ).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert!(lines[0].contains("E1.5") && lines[0].contains("Z5.000"), "{}", lines[0]);
+        assert_eq!(lines[1], "G10");
+        assert_eq!(lines[2], "G1 E-1 F2400");
+        assert_eq!(lines[3], "M104 S200");
+        // Bed level is upright, not a hard tilt
+        assert!(lines[4].contains("A0.000 B0.000"), "{}", lines[4]);
+    }
+
+    #[test]
+    fn post_processors_do_not_touch_machine_state_or_text() {
+        let profile = SlicerProfile::penta_axis_prusa_profile();
+        let input = "M117 A Big Print\nG1 X1 A5 B6 ; A comment\n";
+        let marlin = MarlinPostProcessor::new(PracticalMachineType::penta_axis_style()).process_gcode(input, &profile).unwrap();
+        assert!(marlin.contains("M117 A Big Print"), "{}", marlin);
+        assert!(marlin.contains("G1 X1 I5 J6 ; A comment"), "{}", marlin);
+        let klipper = KlipperPostProcessor::new(PracticalMachineType::penta_axis_style()).process_gcode(input, &profile).unwrap();
+        assert!(!klipper.contains("SET_KINEMATIC_POSITION"));
+        let rrf = RepRapFirmwarePostProcessor::new(PracticalMachineType::penta_axis_style()).process_gcode(input, &profile).unwrap();
+        assert!(!rrf.contains("M669"));
     }
 }
 

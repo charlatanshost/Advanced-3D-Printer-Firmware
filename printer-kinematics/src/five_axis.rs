@@ -222,8 +222,9 @@ impl FiveAxisKinematics {
                     x_limits: (-600.0, 600.0),
                     y_limits: (-400.0, 400.0),
                     z_limits: (0.0, 500.0),
-                    a_limits: (0.0, 0.0), // No A-axis in tilting head
-                    b_or_c_limits: (-(*max_b_angle).max(*max_c_angle), (*max_b_angle).max(*max_c_angle)),
+                    // Joint `a` carries the head's B (tilt) axis, `b_or_c` its C axis.
+                    a_limits: (-*max_b_angle, *max_b_angle),
+                    b_or_c_limits: (-*max_c_angle, *max_c_angle),
                     max_tool_length: 250.0,
                     safety_margin: 20.0,
                 }
@@ -246,7 +247,10 @@ impl FiveAxisKinematics {
     pub fn forward_kinematics(&self, joints: &JointConfiguration) -> Result<Pose6DOF, KinematicsError> {
         // Check joint limits
         self.check_joint_limits(joints)?;
-        
+        self.forward_kinematics_unchecked(joints)
+    }
+
+    fn forward_kinematics_unchecked(&self, joints: &JointConfiguration) -> Result<Pose6DOF, KinematicsError> {
         match &self.config {
             FiveAxisConfiguration::RotaryTable { 
                 table_offset, 
@@ -291,53 +295,25 @@ impl FiveAxisKinematics {
         b_axis_position: &Vector3<f64>,
         spindle_offset: &Vector3<f64>,
     ) -> Result<Pose6DOF, KinematicsError> {
-        // Machine coordinate system transformations
-        
-        // 1. Start with machine base coordinates
-        let machine_base = Isometry3::identity();
-        
-        // 2. Apply linear X, Y, Z motions
-        let linear_transform = Isometry3::from_parts(
-            Translation3::new(joints.x, joints.y, joints.z),
-            nalgebra::UnitQuaternion::identity(),
-        );
-        
-        // 3. Transform to table coordinate system
-        let table_transform = Isometry3::from_parts(
-            Translation3::from(*table_offset),
-            nalgebra::UnitQuaternion::identity(),
-        );
-        
-        // 4. Apply A-axis rotation (around X-axis)
-        let a_rotation = Rotation3::from_axis_angle(
-            &Vector3::x_axis(),
-            joints.a.to_radians(),
-        );
-        let a_transform = Isometry3::from_parts(
-            Translation3::from(*a_axis_position),
-            nalgebra::UnitQuaternion::from_rotation_matrix(&a_rotation),
-        );
-        
-        // 5. Apply B-axis rotation (around Z-axis)
-        let b_rotation = Rotation3::from_axis_angle(
-            &Vector3::z_axis(),
-            joints.b_or_c.to_radians(),
-        );
-        let b_transform = Isometry3::from_parts(
-            Translation3::from(*b_axis_position),
-            nalgebra::UnitQuaternion::from_rotation_matrix(&b_rotation),
-        );
-        
-        // 6. Apply spindle offset to get tool tip position
-        let spindle_transform = Isometry3::from_parts(
-            Translation3::from(*spindle_offset),
-            nalgebra::UnitQuaternion::identity(),
-        );
-        
-        // Chain all transformations
-        let final_transform = machine_base * linear_transform * table_transform * a_transform * b_transform * spindle_transform;
-        
-        Ok(Pose6DOF::from_transform(&final_transform))
+        // The rotation centres would only matter for RTCP (see table_machine_pose).
+        let _ = (a_axis_position, b_axis_position);
+        Ok(Self::table_machine_pose(joints, table_offset + spindle_offset))
+    }
+
+    /// Pose for machines where the table turns and the spindle does not. The tool tip
+    /// position comes from the linear axes and fixed offsets only, in machine coordinates.
+    /// The orientation is the tool relative to the table: the inverse of the table's
+    /// rotation Rx(a) * Rz(b), so a and b together can aim the tool in any direction.
+    /// Moving the linear axes to follow the part as the table turns (RTCP) is not done here.
+    fn table_machine_pose(joints: &JointConfiguration, offsets: Vector3<f64>) -> Pose6DOF {
+        let a_rotation = Rotation3::from_axis_angle(&Vector3::x_axis(), joints.a.to_radians());
+        let b_rotation = Rotation3::from_axis_angle(&Vector3::z_axis(), joints.b_or_c.to_radians());
+        let table = a_rotation * b_rotation;
+        let position = Vector3::new(joints.x, joints.y, joints.z) + offsets;
+        Pose6DOF::from_transform(&Isometry3::from_parts(
+            Translation3::from(position),
+            nalgebra::UnitQuaternion::from_rotation_matrix(&table.inverse()),
+        ))
     }
     
     fn forward_kinematics_trunnion(
@@ -347,53 +323,10 @@ impl FiveAxisKinematics {
         c_axis_height: f64,
         spindle_offset: &Vector3<f64>,
     ) -> Result<Pose6DOF, KinematicsError> {
-        // Linear motion
-        let linear_transform = Isometry3::from_parts(
-            Translation3::new(joints.x, joints.y, joints.z),
-            nalgebra::UnitQuaternion::identity(),
-        );
-        
-        // Move to trunnion center
-        let trunnion_transform = Isometry3::from_parts(
-            Translation3::from(*trunnion_center),
-            nalgebra::UnitQuaternion::identity(),
-        );
-        
-        // A-axis rotation (trunnion tilt)
-        let a_rotation = Rotation3::from_axis_angle(
-            &Vector3::x_axis(),
-            joints.a.to_radians(),
-        );
-        let a_transform = Isometry3::from_parts(
-            Translation3::identity(),
-            nalgebra::UnitQuaternion::from_rotation_matrix(&a_rotation),
-        );
-        
-        // Move to C-axis
-        let c_axis_transform = Isometry3::from_parts(
-            Translation3::new(0.0, 0.0, c_axis_height),
-            nalgebra::UnitQuaternion::identity(),
-        );
-        
-        // C-axis rotation (table rotation)
-        let c_rotation = Rotation3::from_axis_angle(
-            &Vector3::z_axis(),
-            joints.b_or_c.to_radians(),
-        );
-        let c_transform = Isometry3::from_parts(
-            Translation3::identity(),
-            nalgebra::UnitQuaternion::from_rotation_matrix(&c_rotation),
-        );
-        
-        // Spindle offset
-        let spindle_transform = Isometry3::from_parts(
-            Translation3::from(*spindle_offset),
-            nalgebra::UnitQuaternion::identity(),
-        );
-        
-        let final_transform = linear_transform * trunnion_transform * a_transform * c_axis_transform * c_transform * spindle_transform;
-        
-        Ok(Pose6DOF::from_transform(&final_transform))
+        // A trunnion is also a table that turns under a fixed spindle. The trunnion's
+        // geometry only matters for RTCP (see table_machine_pose).
+        let _ = (trunnion_center, c_axis_height);
+        Ok(Self::table_machine_pose(joints, *spindle_offset))
     }
     
     fn forward_kinematics_tilting_head(
@@ -421,8 +354,9 @@ impl FiveAxisKinematics {
             &Vector3::y_axis(),
             joints.a.to_radians(), // A maps to B in tilting head
         );
+        // The head hangs below its pivot, so these offsets run down the tool axis.
         let b_transform = Isometry3::from_parts(
-            Translation3::new(0.0, 0.0, b_axis_offset),
+            Translation3::new(0.0, 0.0, -b_axis_offset),
             nalgebra::UnitQuaternion::from_rotation_matrix(&b_rotation),
         );
         
@@ -432,17 +366,19 @@ impl FiveAxisKinematics {
             joints.b_or_c.to_radians(),
         );
         let c_transform = Isometry3::from_parts(
-            Translation3::new(0.0, 0.0, c_axis_offset),
+            Translation3::new(0.0, 0.0, -c_axis_offset),
             nalgebra::UnitQuaternion::from_rotation_matrix(&c_rotation),
         );
         
         // Tool length offset
         let tool_transform = Isometry3::from_parts(
-            Translation3::new(0.0, 0.0, tool_length_offset),
+            Translation3::new(0.0, 0.0, -tool_length_offset),
             nalgebra::UnitQuaternion::identity(),
         );
         
-        let final_transform = linear_transform * head_transform * b_transform * c_transform * tool_transform;
+        // C turns the whole head and B tilts on it, so B must come after C for the two
+        // together to aim the tool in any direction.
+        let final_transform = linear_transform * head_transform * c_transform * b_transform * tool_transform;
         
         Ok(Pose6DOF::from_transform(&final_transform))
     }
@@ -459,7 +395,8 @@ impl FiveAxisKinematics {
             let joint_value = joint_values.get(i).unwrap_or(&0.0);
             
             let (theta, d) = match dh.joint_type {
-                JointType::Revolute => (*joint_value + dh.theta, dh.d),
+                // Joint values for revolute axes are in degrees everywhere else
+                JointType::Revolute => (joint_value.to_radians() + dh.theta, dh.d),
                 JointType::Prismatic => (dh.theta, *joint_value + dh.d),
                 JointType::Fixed => (dh.theta, dh.d),
             };
@@ -508,108 +445,69 @@ impl FiveAxisKinematics {
         }
     }
     
-    fn inverse_kinematics_rotary_table(&self, target_pose: &Pose6DOF) -> Result<Vec<JointConfiguration>, KinematicsError> {
+    /// Closed-form IK given the tool's tilt and spin angles (degrees). Five axes can aim
+    /// the tool but not roll it, so only its direction has to match. There are generally
+    /// two answers: (tilt, spin) and (-tilt, spin + 180). When upright, spin is undefined
+    /// and is left at 0. With angles known, the linear axes are the target minus the fixed
+    /// part of the chain, since they sit first in the forward kinematics.
+    fn solve_for_tool_angles(&self, target_pose: &Pose6DOF, tilt_deg: f64, spin_deg: f64) -> Result<Vec<JointConfiguration>, KinematicsError> {
+        let mut candidates = vec![(tilt_deg, spin_deg)];
+        if tilt_deg.abs() > 1e-9 {
+            let flipped = if spin_deg > 0.0 { spin_deg - 180.0 } else { spin_deg + 180.0 };
+            candidates.push((-tilt_deg, flipped));
+        }
+
         let mut solutions = Vec::new();
-        
-        if let FiveAxisConfiguration::RotaryTable { 
-            table_offset, 
-            a_axis_position: _, 
-            b_axis_position: _, 
-            spindle_offset: _, 
-            .. 
-        } = &self.config {
-            
-            // Get target position and orientation
-            let target_pos = target_pose.position;
-            let (_roll, _pitch, _yaw) = target_pose.euler_angles();
-            
-            // For rotary table, we need to solve for the table orientation
-            // that positions the workpiece correctly relative to the tool
-            
-            // Try different A and B angle combinations
-            let a_step = 5.0; // degrees
-            let b_step = 5.0; // degrees
-            
-            for a_deg in (-90..=90).step_by(a_step as usize) {
-                for b_deg in (-180..=180).step_by(b_step as usize) {
-                    let _a_rad = (a_deg as f64).to_radians();
-                    let _b_rad = (b_deg as f64).to_radians();
-                    
-                    // Calculate required linear position
-                    // This is a simplified approach - in practice, you'd use
-                    // the full inverse transformation chain
-                    
-                    let joints = JointConfiguration::new(
-                        target_pos.x - table_offset.x,
-                        target_pos.y - table_offset.y,
-                        target_pos.z - table_offset.z,
-                        a_deg as f64,
-                        b_deg as f64,
-                    );
-                    
-                    // Verify solution by forward kinematics
-                    if let Ok(computed_pose) = self.forward_kinematics(&joints) {
-                        let position_error = (computed_pose.position - target_pose.position).norm();
-                        if position_error < 0.1 { // 0.1mm tolerance
-                            solutions.push(joints);
-                        }
-                    }
-                }
+        for (a, b) in candidates {
+            // Evaluate the chain with the linear axes at zero
+            let chain = self.forward_kinematics_unchecked(&JointConfiguration::new(0.0, 0.0, 0.0, a, b))?;
+            let joints = JointConfiguration::new(
+                target_pose.position.x - chain.position.x,
+                target_pose.position.y - chain.position.y,
+                target_pose.position.z - chain.position.z,
+                a,
+                b,
+            );
+            if self.check_joint_limits(&joints).is_ok() {
+                solutions.push(joints);
             }
         }
-        
+
         if solutions.is_empty() {
-            Err(KinematicsError::SolutionNotFound)
+            Err(KinematicsError::JointLimitsExceeded)
         } else {
             Ok(solutions)
         }
     }
-    
-    fn inverse_kinematics_trunnion(&self, target_pose: &Pose6DOF) -> Result<Vec<JointConfiguration>, KinematicsError> {
-        // Similar approach to rotary table but with trunnion geometry
-        // This would implement the specific inverse kinematics for trunnion configuration
-        
-        // Placeholder implementation
-        let joints = JointConfiguration::new(
-            target_pose.position.x,
-            target_pose.position.y,
-            target_pose.position.z,
-            0.0,
-            0.0,
-        );
-        
-        Ok(vec![joints])
+
+    /// Tool tilt from vertical, in degrees
+    fn tool_tilt_deg(direction: &Vector3<f64>) -> f64 {
+        direction.z.clamp(-1.0, 1.0).acos().to_degrees()
     }
-    
+
+    /// The table's Rx(a) * Rz(b), inverted, points the tool along
+    /// (sin a sin b, sin a cos b, cos a).
+    fn inverse_kinematics_table(&self, target_pose: &Pose6DOF) -> Result<Vec<JointConfiguration>, KinematicsError> {
+        let d = target_pose.tool_direction();
+        let tilt = Self::tool_tilt_deg(&d);
+        let spin = if tilt < 1e-6 { 0.0 } else { d.x.atan2(d.y).to_degrees() };
+        self.solve_for_tool_angles(target_pose, if tilt < 1e-6 { 0.0 } else { tilt }, spin)
+    }
+
+    fn inverse_kinematics_rotary_table(&self, target_pose: &Pose6DOF) -> Result<Vec<JointConfiguration>, KinematicsError> {
+        self.inverse_kinematics_table(target_pose)
+    }
+
+    fn inverse_kinematics_trunnion(&self, target_pose: &Pose6DOF) -> Result<Vec<JointConfiguration>, KinematicsError> {
+        self.inverse_kinematics_table(target_pose)
+    }
+
+    /// The head's Rz(c) * Ry(b) points the tool along (cos c sin b, sin c sin b, cos b).
     fn inverse_kinematics_tilting_head(&self, target_pose: &Pose6DOF) -> Result<Vec<JointConfiguration>, KinematicsError> {
-        // Analytical solution for tilting head configuration
-        // The linear axes directly control the tool tip position
-        
-        if let FiveAxisConfiguration::TiltingHead { 
-            head_pivot_point, 
-            tool_length_offset, 
-            .. 
-        } = &self.config {
-            
-            // Calculate linear positions
-            let x = target_pose.position.x - head_pivot_point.x;
-            let y = target_pose.position.y - head_pivot_point.y;
-            let z = target_pose.position.z - head_pivot_point.z - tool_length_offset;
-            
-            // Calculate required head orientation
-            let _tool_direction = target_pose.tool_direction();
-            let (_roll, pitch, yaw) = target_pose.euler_angles();
-            
-            // Convert orientation to B and C angles
-            let b_angle = pitch.to_degrees();
-            let c_angle = yaw.to_degrees();
-            
-            let joints = JointConfiguration::new(x, y, z, b_angle, c_angle);
-            
-            Ok(vec![joints])
-        } else {
-            Err(KinematicsError::InvalidConfiguration)
-        }
+        let d = target_pose.tool_direction();
+        let tilt = Self::tool_tilt_deg(&d);
+        let spin = if tilt < 1e-6 { 0.0 } else { d.y.atan2(d.x).to_degrees() };
+        self.solve_for_tool_angles(target_pose, if tilt < 1e-6 { 0.0 } else { tilt }, spin)
     }
     
     fn inverse_kinematics_numerical(&self, target_pose: &Pose6DOF) -> Result<Vec<JointConfiguration>, KinematicsError> {
@@ -632,17 +530,18 @@ impl FiveAxisKinematics {
             // Compute forward kinematics
             let current_pose = self.forward_kinematics(&joints)?;
             
-            // Calculate error
+            // Calculate error: position, then tool direction as a small rotation about
+            // the X and Y axes (rotation about the tool axis itself does not matter)
             let position_error = target_pose.position - current_pose.position;
-            let orientation_error = target_pose.orientation.quaternion() - current_pose.orientation.quaternion();
-            
+            let orientation_error = (target_pose.orientation * current_pose.orientation.inverse()).scaled_axis();
+
             use nalgebra::Vector5;
             let error = Vector5::new(
                 position_error.x,
-                position_error.y, 
+                position_error.y,
                 position_error.z,
-                orientation_error.w,
-                orientation_error.w, // Using w component for both A and B/C axis error
+                orientation_error.x,
+                orientation_error.y,
             );
             
             if error.norm() < TOLERANCE {
@@ -654,13 +553,15 @@ impl FiveAxisKinematics {
             
             // Newton-Raphson update
             if let Some(jacobian_inv) = jacobian.try_inverse() {
+                // error = target - current and J = d(pose)/d(joint), so this step adds.
+                // J is already per joint unit, so the rotary steps are already degrees.
                 let delta = jacobian_inv * error;
-                
-                joints.x -= delta[0];
-                joints.y -= delta[1];
-                joints.z -= delta[2];
-                joints.a -= delta[3].to_degrees();
-                joints.b_or_c -= delta[4].to_degrees();
+
+                joints.x += delta[0];
+                joints.y += delta[1];
+                joints.z += delta[2];
+                joints.a += delta[3];
+                joints.b_or_c += delta[4];
                 
                 // Check joint limits
                 if self.check_joint_limits(&joints).is_err() {
@@ -690,13 +591,13 @@ impl FiveAxisKinematics {
             let perturbed_pose = self.forward_kinematics(&perturbed_config)?;
             
             let position_diff = (perturbed_pose.position - base_pose.position) / EPSILON;
-            let orientation_diff = (perturbed_pose.orientation.quaternion() - base_pose.orientation.quaternion()) / EPSILON;
+            let orientation_diff = (perturbed_pose.orientation * base_pose.orientation.inverse()).scaled_axis() / EPSILON;
             
             jacobian[(0, i)] = position_diff.x;
             jacobian[(1, i)] = position_diff.y;
             jacobian[(2, i)] = position_diff.z;
-            jacobian[(3, i)] = orientation_diff.w;
-            jacobian[(4, i)] = orientation_diff.i;
+            jacobian[(3, i)] = orientation_diff.x;
+            jacobian[(4, i)] = orientation_diff.y;
         }
         
         Ok(jacobian)
@@ -854,12 +755,98 @@ mod tests {
         
         let kinematics = FiveAxisKinematics::new(config);
         let target_pose = Pose6DOF::new(100.0, 100.0, 200.0, 0.0, 0.0, 0.0);
-        
+
         let result = kinematics.inverse_kinematics(&target_pose);
         assert!(result.is_ok());
-        
+
         let solutions = result.unwrap();
         assert!(!solutions.is_empty());
+
+        // Round trip, level and tilted
+        let back = kinematics.forward_kinematics(&solutions[0]).unwrap();
+        assert!((back.position - target_pose.position).norm() < 1e-6);
+        let joints = JointConfiguration::new(10.0, 20.0, 230.0, 30.0, 40.0);
+        let pose = kinematics.forward_kinematics(&joints).unwrap();
+        let solved = kinematics.inverse_kinematics(&pose).unwrap();
+        assert!((solved[0].a - 30.0).abs() < 1e-6, "got {:?}", solved[0]);
+        assert!((solved[0].b_or_c - 40.0).abs() < 1e-6, "got {:?}", solved[0]);
+        assert!((solved[0].z - 230.0).abs() < 1e-6, "got {:?}", solved[0]);
+    }
+
+    #[test]
+    fn test_inverse_honours_orientation() {
+        for config in [
+            FiveAxisConfiguration::RotaryTable {
+                table_offset: Vector3::new(1.0, 2.0, 3.0),
+                a_axis_position: Vector3::zeros(),
+                b_axis_position: Vector3::zeros(),
+                spindle_offset: Vector3::new(0.0, 0.0, 5.0),
+                max_a_angle: 90.0,
+                max_b_angle: 180.0,
+                table_diameter: 300.0,
+            },
+            FiveAxisConfiguration::Trunnion {
+                trunnion_center: Vector3::new(0.0, 0.0, 50.0),
+                c_axis_height: 10.0,
+                spindle_offset: Vector3::new(1.0, 2.0, 3.0),
+                max_a_angle: 90.0,
+                max_c_angle: 360.0,
+                table_size: (100.0, 100.0),
+            },
+        ] {
+            let kinematics = FiveAxisKinematics::new(config);
+            let joints = JointConfiguration::new(40.0, 50.0, 60.0, 25.0, -70.0);
+            let pose = kinematics.forward_kinematics(&joints).unwrap();
+            let solved = kinematics.inverse_kinematics(&pose).unwrap();
+            for (a, b) in solved[0].to_array().iter().zip(joints.to_array().iter()) {
+                assert!((a - b).abs() < 1e-6, "{:?} vs {:?}", solved[0], joints);
+            }
+            // The other answer must aim the tool the same way
+            let other = kinematics.forward_kinematics(&solved[1]).unwrap();
+            assert!((other.tool_direction().into_inner() - pose.tool_direction().into_inner()).norm() < 1e-6);
+            // A different direction gives different angles
+            let tilted = kinematics.forward_kinematics(&JointConfiguration::new(40.0, 50.0, 60.0, 40.0, 10.0)).unwrap();
+            assert_ne!(kinematics.inverse_kinematics(&tilted).unwrap()[0].a.round(), solved[0].a.round());
+        }
+    }
+
+    #[test]
+    fn test_unreachable_orientation_is_refused() {
+        let config = FiveAxisConfiguration::RotaryTable {
+            table_offset: Vector3::zeros(),
+            a_axis_position: Vector3::zeros(),
+            b_axis_position: Vector3::zeros(),
+            spindle_offset: Vector3::zeros(),
+            max_a_angle: 90.0,
+            max_b_angle: 180.0,
+            table_diameter: 300.0,
+        };
+        // Tilted 115 degrees from vertical, beyond the 90 degree A limit
+        let pose = Pose6DOF::new(50.0, 50.0, 50.0, 0.0, 2.0, 0.0);
+        assert!(FiveAxisKinematics::new(config).inverse_kinematics(&pose).is_err());
+    }
+
+    #[test]
+    fn test_numerical_ik_converges() {
+        let prismatic = |alpha: f64, theta: f64| DHParameter { a: 0.0, alpha, d: 0.0, theta, joint_type: JointType::Prismatic };
+        use std::f64::consts::FRAC_PI_2;
+        let config = FiveAxisConfiguration::Custom {
+            dh_parameters: vec![
+                prismatic(-FRAC_PI_2, FRAC_PI_2),
+                prismatic(-FRAC_PI_2, -FRAC_PI_2),
+                prismatic(0.0, 0.0),
+                DHParameter { a: 0.0, alpha: FRAC_PI_2, d: 10.0, theta: 0.0, joint_type: JointType::Revolute },
+                DHParameter { a: 0.0, alpha: 0.0, d: 20.0, theta: 0.0, joint_type: JointType::Revolute },
+            ],
+            joint_limits: vec![(-500.0, 500.0), (-500.0, 500.0), (-500.0, 500.0), (-180.0, 180.0), (-180.0, 180.0)],
+            link_geometries: vec![],
+        };
+        let kinematics = FiveAxisKinematics::new(config);
+        let joints = JointConfiguration::new(30.0, 40.0, 50.0, 20.0, 35.0);
+        let target = kinematics.forward_kinematics(&joints).unwrap();
+        let solved = kinematics.inverse_kinematics(&target).unwrap();
+        let back = kinematics.forward_kinematics(&solved[0]).unwrap();
+        assert!((back.position - target.position).norm() < 1e-3, "{:?}", solved[0]);
     }
     
     #[test]

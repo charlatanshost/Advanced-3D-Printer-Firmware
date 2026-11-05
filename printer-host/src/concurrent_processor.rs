@@ -85,9 +85,11 @@ pub struct ConcurrentGCodeProcessor {
     command_sender: mpsc::Sender<ProcessorMessage>,
     response_receiver: mpsc::Receiver<ProcessorResponse>,
     
-    // Internal channels
-    parse_sender: mpsc::Sender<ParsingTask>,
-    geometry_sender: mpsc::Sender<GeometryTask>,
+    // Internal channels. These are Options so shutdown can drop them: a worker only exits
+    // once every sender for its channel is gone.
+    parse_sender: Option<mpsc::Sender<ParsingTask>>,
+    geometry_sender: Option<mpsc::Sender<GeometryTask>>,
+    command_thread: Option<JoinHandle<()>>,
     
     // State
     current_file: Option<String>,
@@ -101,14 +103,15 @@ pub struct ConcurrentGCodeProcessor {
 #[derive(Debug)]
 struct ParsingTask {
     file_path: String,
-    task_id: u64,
     priority: u8, // 0 = highest priority
 }
 
 #[derive(Debug)]
 struct GeometryTask {
     commands: Vec<GCodeCommand>,
-    task_id: u64,
+    file_path: String,
+    modified: Option<std::time::SystemTime>,
+    parsing_time: Duration,
     response_sender: mpsc::Sender<ProcessorResponse>,
 }
 
@@ -122,6 +125,7 @@ struct GeometryCache {
 #[derive(Debug)]
 struct CacheEntry {
     file_path: String,
+    modified: Option<std::time::SystemTime>,
     geometry: ToolpathGeometry,
     last_accessed: Instant,
     memory_size: usize,
@@ -157,8 +161,9 @@ impl ConcurrentGCodeProcessor {
             geometry_thread: None,
             command_sender,
             response_receiver,
-            parse_sender,
-            geometry_sender,
+            parse_sender: Some(parse_sender),
+            geometry_sender: Some(geometry_sender),
+            command_thread: None,
             current_file: None,
             is_loading: false,
             geometry_cache: geometry_cache.clone(),
@@ -187,7 +192,7 @@ impl ConcurrentGCodeProcessor {
     ) -> Result<(), ProcessorError> {
         
         let config_for_parser = self.config.clone();
-        let geometry_sender = self.geometry_sender.clone();
+        let geometry_sender = self.geometry_sender.clone().ok_or(ProcessorError::ThreadCommunication)?;
         let response_sender_clone = response_sender.clone();
         self.parsing_thread = Some(thread::spawn(move || {
             Self::parsing_thread_worker(
@@ -213,17 +218,17 @@ impl ConcurrentGCodeProcessor {
         }));
         
         // Start main command processing thread
-        let parse_sender_clone = self.parse_sender.clone();
+        let parse_sender_clone = self.parse_sender.clone().ok_or(ProcessorError::ThreadCommunication)?;
         let cache_clone = geometry_cache;
-        
-        thread::spawn(move || {
+
+        self.command_thread = Some(thread::spawn(move || {
             Self::command_thread_worker(
                 command_receiver,
                 response_sender,
                 parse_sender_clone,
                 cache_clone,
             );
-        });
+        }));
         
         Ok(())
     }
@@ -235,15 +240,15 @@ impl ConcurrentGCodeProcessor {
         parse_sender: mpsc::Sender<ParsingTask>,
         geometry_cache: Arc<Mutex<GeometryCache>>,
     ) {
-        let mut task_id = 0u64;
-        
         while let Ok(message) = command_receiver.recv() {
             match message {
                 ProcessorMessage::LoadFile(file_path) => {
                     // Check cache first
                     {
                         let mut cache = geometry_cache.lock().unwrap();
-                        if let Some(entry) = cache.find_entry(&file_path) {
+                        let modified = Self::file_modified(&file_path);
+                        // Only a hit if the file has not changed since it was cached
+                        if let Some(entry) = cache.find_entry(&file_path).filter(|e| e.modified == modified && modified.is_some()) {
                             // Cache hit - return geometry immediately
                             let geometry = entry.geometry.clone();
                             entry.last_accessed = Instant::now();
@@ -263,7 +268,6 @@ impl ConcurrentGCodeProcessor {
                     
                     let parsing_task = ParsingTask {
                         file_path,
-                        task_id,
                         priority: 0,
                     };
                     
@@ -272,8 +276,6 @@ impl ConcurrentGCodeProcessor {
                             "Failed to queue parsing task".to_string()
                         ));
                     }
-                    
-                    task_id += 1;
                 }
                 
                 ProcessorMessage::Shutdown => {
@@ -299,6 +301,7 @@ impl ConcurrentGCodeProcessor {
             let start_time = Instant::now();
             
             // Parse the file
+            let modified = Self::file_modified(&task.file_path);
             match Self::parse_file_async(&task.file_path, &config) {
                 Ok(commands) => {
                     let parsing_time = start_time.elapsed();
@@ -306,7 +309,9 @@ impl ConcurrentGCodeProcessor {
                     // Send parsed commands to geometry processing
                     let geometry_task = GeometryTask {
                         commands,
-                        task_id: task.task_id,
+                        file_path: task.file_path,
+                        modified,
+                        parsing_time,
                         response_sender: response_sender.clone(),
                     };
                     
@@ -333,8 +338,6 @@ impl ConcurrentGCodeProcessor {
         config: ProcessorConfig,
     ) {
         while let Ok(task) = geometry_receiver.recv() {
-            let start_time = Instant::now();
-            
             // Generate geometry from commands with optimizations
             let mut generator = GeometryGenerator::new();
             
@@ -345,14 +348,13 @@ impl ConcurrentGCodeProcessor {
             // Generate simplified versions for LOD
             processed_geometry = Self::generate_lod_geometry(processed_geometry, &config.lod_config);
             
-            let geometry_time = start_time.elapsed();
-            
             // Cache the processed geometry
             let memory_size = Self::estimate_geometry_memory_size(&processed_geometry);
             {
                 let mut cache = geometry_cache.lock().unwrap();
                 let cache_entry = CacheEntry {
-                    file_path: format!("task_{}", task.task_id), // Use task ID as temporary key
+                    file_path: task.file_path.clone(),
+                    modified: task.modified,
                     geometry: processed_geometry.clone(),
                     last_accessed: Instant::now(),
                     memory_size,
@@ -366,7 +368,7 @@ impl ConcurrentGCodeProcessor {
             let _ = task.response_sender.send(ProcessorResponse::LoadCompleted {
                 line_count: task.commands.len() as u32,
                 geometry_stats: stats,
-                parsing_time: geometry_time,
+                parsing_time: task.parsing_time,
             });
         }
     }
@@ -533,6 +535,10 @@ impl ConcurrentGCodeProcessor {
         vertices_size + colors_size + indices_size + segments_size
     }
     
+    fn file_modified(file_path: &str) -> Option<std::time::SystemTime> {
+        std::fs::metadata(file_path).and_then(|m| m.modified()).ok()
+    }
+
     fn parse_file_async(file_path: &str, config: &ProcessorConfig) -> Result<Vec<GCodeCommand>, ProcessorError> {
         let file = File::open(file_path)?;
         let mut parser = StreamingGCodeParser::new()
@@ -652,12 +658,19 @@ impl ConcurrentGCodeProcessor {
     }
     
     pub fn shutdown(&mut self) -> Result<(), ProcessorError> {
-        // Send shutdown message
-        self.command_sender
-            .send(ProcessorMessage::Shutdown)
-            .map_err(|_| ProcessorError::ThreadCommunication)?;
-        
-        // Wait for threads to complete
+        // Send shutdown message (it fails harmlessly if already shut down)
+        let _ = self.command_sender.send(ProcessorMessage::Shutdown);
+
+        // Drop our senders. Workers exit when their channel closes, so holding these
+        // while joining below would wait forever.
+        self.parse_sender = None;
+        self.geometry_sender = None;
+
+        // Wait for threads to complete, in pipeline order
+        if let Some(thread) = self.command_thread.take() {
+            let _ = thread.join();
+        }
+
         if let Some(thread) = self.parsing_thread.take() {
             let _ = thread.join();
         }
@@ -678,6 +691,13 @@ impl GeometryCache {
     }
     
     fn add_entry(&mut self, entry: CacheEntry) {
+        // Replace any older version of the same file
+        if let Some(index) = self.entries.iter().position(|e| e.file_path == entry.file_path) {
+            if let Some(old_entry) = self.entries.remove(index) {
+                self.total_memory -= old_entry.memory_size;
+            }
+        }
+
         // Remove oldest entries if cache is full
         while self.entries.len() >= self.max_size && !self.entries.is_empty() {
             if let Some(old_entry) = self.entries.pop_back() {
@@ -774,12 +794,52 @@ impl PerformanceOptimizedGCodeLoader {
 mod tests {
     use super::*;
     use std::fs;
-    
+
     #[test]
     fn test_concurrent_processor_creation() {
         let config = ProcessorConfig::default();
         let processor = ConcurrentGCodeProcessor::new(config);
         assert!(processor.is_ok());
+    }
+
+    fn wait_for_completion(processor: &mut ConcurrentGCodeProcessor) -> Duration {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            for response in processor.poll_responses() {
+                match response {
+                    ProcessorResponse::LoadCompleted { parsing_time, .. } => return parsing_time,
+                    ProcessorResponse::LoadError(e) => panic!("{}", e),
+                    _ => {}
+                }
+            }
+            assert!(Instant::now() < deadline, "timed out");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn test_shutdown_returns_and_cache_is_used() {
+        let path = std::env::temp_dir().join(format!("processor_test_{}.gcode", std::process::id()));
+        fs::write(&path, "G1 X1 Y1 E1\nG1 X2 Y2 E2\n").unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let path_for_thread = path.clone();
+        thread::spawn(move || {
+            let mut processor = ConcurrentGCodeProcessor::new(ProcessorConfig::default()).unwrap();
+            processor.load_file(&path_for_thread).unwrap();
+            wait_for_completion(&mut processor);
+            assert_eq!(processor.get_cache_info().unwrap().len(), 1);
+            processor.load_file(&path_for_thread).unwrap();
+            // Cache hits report zero parsing time
+            assert_eq!(wait_for_completion(&mut processor), Duration::from_millis(0));
+            processor.shutdown().unwrap();
+            drop(processor);
+            done_tx.send(()).unwrap();
+        });
+
+        let finished = done_rx.recv_timeout(Duration::from_secs(30));
+        let _ = fs::remove_file(&path);
+        assert!(finished.is_ok(), "processor did not shut down");
     }
     
     #[test]

@@ -209,6 +209,9 @@ impl VolumetricCompensator {
     /// Start volumetric calibration sequence
     pub fn start_calibration(&mut self) -> Result<Vec<String>, CompensationError> {
         let sequence = self.generate_probe_sequence()?;
+        // Measure the raw machine. Moves corrected by an old map would measure that map's
+        // errors, and new results must not merge into it.
+        self.active_map = None;
         let mut gcode_commands = Vec::new();
 
         // Initialization commands
@@ -309,7 +312,8 @@ impl VolumetricCompensator {
 
     /// Finalize calibration and generate compensation grid
     pub fn finalize_calibration(&mut self) -> Result<CompensationMap, CompensationError> {
-        let map = self.active_map.take().ok_or(CompensationError::NoCalibrationData)?;
+        // Work on a copy. A failure here must not throw away hours of probing.
+        let map = self.active_map.clone().ok_or(CompensationError::NoCalibrationData)?;
 
         if map.probe_points.len() < 8 {
             return Err(CompensationError::InsufficientData);
@@ -323,8 +327,16 @@ impl VolumetricCompensator {
         self.generate_compensation_grid(&mut finalized_map)?;
 
         // Calculate thermal compensation coefficients if enabled
+        // All probing at one temperature is normal: it just means no thermal model.
         if self.config.temperature_compensation {
-            finalized_map.temperature_coefficients = Some(self.calculate_thermal_coefficients(&finalized_map.probe_points)?);
+            finalized_map.temperature_coefficients = match self.calculate_thermal_coefficients(&finalized_map.probe_points) {
+                Ok(coefficients) => Some(coefficients),
+                Err(CompensationError::InsufficientThermalData) => {
+                    println!("⚠️ Not enough temperature variation for thermal compensation, leaving it off");
+                    None
+                }
+                Err(e) => return Err(e),
+            };
         }
 
         // Validate the compensation map
@@ -392,7 +404,8 @@ impl VolumetricCompensator {
         let mut temp_groups: HashMap<i32, Vec<&ProbePoint>> = HashMap::new();
 
         for point in probe_points {
-            let temp_key = (point.temperature * 10.0) as i32; // Group by 0.1°C
+            // Group by whole degrees. Sensor noise would make 0.1°C groups meaningless.
+            let temp_key = point.temperature.round() as i32 * 10;
             temp_groups.entry(temp_key).or_insert_with(Vec::new).push(point);
         }
 
@@ -470,33 +483,65 @@ impl VolumetricCompensator {
             return commanded_pos; // No compensation if no map loaded
         };
 
-        // Find grid indices
-        let x_idx = (commanded_pos.x / map.grid_resolution).round() as i32;
-        let y_idx = (commanded_pos.y / map.grid_resolution).round() as i32;
-        let z_idx = (commanded_pos.z / map.grid_resolution).round() as i32;
+        // Still collecting probe points: no finished map to use, and correcting while
+        // measuring would corrupt the measurements.
+        if map.grid_points.is_empty() {
+            return commanded_pos;
+        }
 
-        // Get correction vector from grid
-        let correction = map.grid_points.get(&(x_idx, y_idx, z_idx))
-            .copied()
-            .unwrap_or_else(|| {
-                // Interpolate if exact grid point not found
-                self.interpolate_correction(&map.probe_points, commanded_pos)
-            });
+        // Expected error here, blended smoothly between grid points. Snapping to the nearest
+        // point would put a visible step in the print at every cell boundary.
+        let error = self.interpolate_grid(map, commanded_pos);
 
-        // Apply thermal compensation if available
-        let thermal_correction = if let Some(ref thermal) = map.temperature_coefficients {
+        // Temperature drift: the regression slope is already mm of error per °C
+        let thermal_error = if let Some(ref thermal) = map.temperature_coefficients {
             let temp_diff = self.current_temperature - self.config.reference_temperature;
             Vector3::new(
-                thermal.linear_expansion[0] * temp_diff * commanded_pos.x,
-                thermal.linear_expansion[1] * temp_diff * commanded_pos.y,
-                thermal.linear_expansion[2] * temp_diff * commanded_pos.z,
+                thermal.linear_expansion[0] * temp_diff,
+                thermal.linear_expansion[1] * temp_diff,
+                thermal.linear_expansion[2] * temp_diff,
             )
         } else {
             Vector3::zeros()
         };
 
-        // Apply compensation
-        commanded_pos + correction + thermal_correction
+        // The error is where the machine went minus where it was told. To land on target it
+        // must be told the opposite. Adding it would double every error instead of removing it.
+        commanded_pos - error - thermal_error
+    }
+
+    /// Trilinear interpolation of the correction grid, holding the edge values outside it
+    fn interpolate_grid(&self, map: &CompensationMap, position: Point3<f32>) -> Vector3<f32> {
+        let cell = |value: f32, size: f32| -> (i32, f32) {
+            let scaled = (value / map.grid_resolution).clamp(0.0, size / map.grid_resolution);
+            let index = scaled.floor();
+            (index as i32, scaled - index)
+        };
+        let (x0, fx) = cell(position.x, map.build_volume[0]);
+        let (y0, fy) = cell(position.y, map.build_volume[1]);
+        let (z0, fz) = cell(position.z, map.build_volume[2]);
+
+        let mut result = Vector3::zeros();
+        let mut total_weight = 0.0;
+        for (dx, wx) in [(0, 1.0 - fx), (1, fx)] {
+            for (dy, wy) in [(0, 1.0 - fy), (1, fy)] {
+                for (dz, wz) in [(0, 1.0 - fz), (1, fz)] {
+                    let weight = wx * wy * wz;
+                    if weight > 0.0 {
+                        if let Some(error) = map.grid_points.get(&(x0 + dx, y0 + dy, z0 + dz)) {
+                            result += *error * weight;
+                            total_weight += weight;
+                        }
+                    }
+                }
+            }
+        }
+        if total_weight > 0.0 {
+            result / total_weight
+        } else {
+            // A map with gaps: fall back to the raw measurements
+            self.interpolate_correction(&map.probe_points, position)
+        }
     }
 
     pub fn set_current_temperature(&mut self, temperature: f32) {
@@ -578,7 +623,35 @@ mod tests {
 
     #[test]
     fn test_compensation_interpolation() {
-        let compensator = VolumetricCompensator::new(VolumetricCompensationConfig::default());
+        let mut compensator = VolumetricCompensator::new(VolumetricCompensationConfig {
+            build_volume: [100.0, 100.0, 100.0],
+            probe_resolution: 100.0,
+            temperature_compensation: false,
+            ..VolumetricCompensationConfig::default()
+        });
+
+        // The machine overshoots by +0.1 in X everywhere, so it must be told 0.1 less.
+        for x in [0.0f32, 100.0] {
+            for y in [0.0f32, 100.0] {
+                for z in [0.0f32, 100.0] {
+                    let commanded = Point3::new(x, y, z);
+                    compensator.process_probe_result(commanded, commanded + Vector3::new(0.1, 0.0, 0.0), 20.0).unwrap();
+                }
+            }
+        }
+        let mid = Point3::new(50.0, 50.0, 50.0);
+        assert_eq!(compensator.apply_compensation(mid), mid, "no correction until finalized");
+        compensator.finalize_calibration().unwrap();
+        let corrected = compensator.apply_compensation(mid);
+        assert!((corrected.x - 49.9).abs() < 1e-3, "{:?}", corrected);
+        assert!((corrected.y - 50.0).abs() < 1e-3, "{:?}", corrected);
+
+        // Too little data keeps what was probed
+        let mut short = VolumetricCompensator::new(VolumetricCompensationConfig::default());
+        short.process_probe_result(mid, mid, 20.0).unwrap();
+        assert!(short.finalize_calibration().is_err());
+        assert!(short.finalize_calibration().is_err(), "second attempt sees the same data, not none");
+        assert!(matches!(short.finalize_calibration(), Err(CompensationError::InsufficientData)));
 
         let probe_points = vec![
             ProbePoint {

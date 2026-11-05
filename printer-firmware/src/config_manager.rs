@@ -37,11 +37,11 @@ pub struct PrinterConfiguration {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MotionConfig {
-    pub max_feedrate: [f32; 4], // X, Y, Z, E mm/min
+    pub max_feedrate: [f32; 4], // X, Y, Z, E mm/s
     pub max_acceleration: [f32; 4], // X, Y, Z, E mm/s²
     pub max_jerk: [f32; 4], // X, Y, Z, E mm/s
     pub steps_per_mm: [f32; 4], // X, Y, Z, E steps/mm
-    pub homing_feedrate: [f32; 3], // X, Y, Z mm/min
+    pub homing_feedrate: [f32; 3], // X, Y, Z mm/s
     pub homing_direction: [i8; 3], // X, Y, Z (-1 or 1)
     pub build_volume: [[f32; 2]; 3], // [[min_x, max_x], [min_y, max_y], [min_z, max_z]]
     pub z_probe_offset: f32,
@@ -347,13 +347,17 @@ impl ConfigManager {
         profile_names
     }
 
+    /// Reset everything except network settings: a reset done over the network must not
+    /// lock the user out of the printer.
     pub async fn reset_to_defaults(&self) -> Result<(), ConfigError> {
-        let default_config = PrinterConfiguration::default();
+        let mut default_config = PrinterConfiguration::default();
+        default_config.network = self.get_current_config().await.network;
         self.update_config(default_config).await
     }
 
-    pub async fn import_config(&self, json_data: &str) -> Result<(), ConfigError> {
-        let config: PrinterConfiguration = postcard::from_bytes(json_data.as_bytes())
+    /// Import a configuration in the binary (postcard) format used for storage
+    pub async fn import_config(&self, data: &[u8]) -> Result<(), ConfigError> {
+        let config: PrinterConfiguration = postcard::from_bytes(data)
             .map_err(|_| ConfigError::InvalidConfigFormat)?;
             
         self.update_config(config).await
@@ -368,36 +372,43 @@ impl ConfigManager {
     }
 
     fn validate_config(&self, config: &PrinterConfiguration) -> Result<(), ConfigError> {
+        // Every check is written as "must be in range", so NaN fails instead of slipping
+        // through the way it does with "reject if out of range" comparisons.
+        fn in_range(value: f32, min_exclusive: f32, max: f32) -> bool {
+            value > min_exclusive && value <= max
+        }
+
         // Validate motion settings
-        if config.motion.max_feedrate.iter().any(|&f| f <= 0.0 || f > 1000.0) {
-            return Err(ConfigError::InvalidMotionConfig);
-        }
-        
-        if config.motion.max_acceleration.iter().any(|&a| a <= 0.0 || a > 10000.0) {
-            return Err(ConfigError::InvalidMotionConfig);
-        }
-        
-        if config.motion.steps_per_mm.iter().any(|&s| s <= 0.0 || s > 10000.0) {
+        let motion = &config.motion;
+        if !motion.max_feedrate.iter().all(|&f| in_range(f, 0.0, 1000.0))
+            || !motion.max_acceleration.iter().all(|&a| in_range(a, 0.0, 50000.0))
+            || !motion.max_jerk.iter().all(|&j| in_range(j, 0.0, 100.0))
+            || !motion.steps_per_mm.iter().all(|&s| in_range(s, 0.0, 10000.0))
+            || !motion.homing_feedrate.iter().all(|&f| in_range(f, 0.0, 1000.0))
+            || !motion.homing_direction.iter().all(|&d| d == 1 || d == -1)
+            || !motion.build_volume.iter().all(|axis| axis[0].is_finite() && axis[1].is_finite() && axis[0] < axis[1])
+            || !motion.z_probe_offset.is_finite()
+        {
             return Err(ConfigError::InvalidMotionConfig);
         }
 
         // Validate temperature settings
-        if config.temperature.hotend_max_temp < config.temperature.hotend_min_temp ||
-           config.temperature.hotend_max_temp > 500.0 {
+        let temperature = &config.temperature;
+        if !in_range(temperature.hotend_max_temp, temperature.hotend_min_temp, 500.0)
+            || !in_range(temperature.bed_max_temp, temperature.bed_min_temp, 200.0)
+        {
             return Err(ConfigError::InvalidTemperatureConfig);
         }
 
-        if config.temperature.bed_max_temp < config.temperature.bed_min_temp ||
-           config.temperature.bed_max_temp > 200.0 {
-            return Err(ConfigError::InvalidTemperatureConfig);
+        // Heater protection can only be changed by rebuilding the firmware, not over the network
+        if !temperature.thermal_runaway_protection || !config.safety.thermal_protection_enabled {
+            return Err(ConfigError::ThermalProtectionRequired);
         }
 
         // Validate extruder settings
-        if config.extruder.filament_diameter <= 0.0 || config.extruder.filament_diameter > 5.0 {
-            return Err(ConfigError::InvalidExtruderConfig);
-        }
-
-        if config.extruder.nozzle_diameter <= 0.0 || config.extruder.nozzle_diameter > 2.0 {
+        if !in_range(config.extruder.filament_diameter, 0.0, 5.0)
+            || !in_range(config.extruder.nozzle_diameter, 0.0, 2.0)
+        {
             return Err(ConfigError::InvalidExtruderConfig);
         }
 
@@ -427,10 +438,11 @@ impl ConfigManager {
     }
 
     pub async fn set_config_field(&self, field_path: &str, value: ConfigValue) -> Result<(), ConfigError> {
-        let mut config = self.current_config.lock().await;
-        self.update_config_value(&mut *config, field_path, value)?;
-        config.modified_timestamp = embassy_time::Instant::now().as_millis();
-        Ok(())
+        // Apply to a copy, so a bad value never takes effect. This goes through the same
+        // validation and saving as a full update.
+        let mut config = self.get_current_config().await;
+        self.update_config_value(&mut config, field_path, value)?;
+        self.update_config(config).await
     }
 
     fn extract_config_value(&self, config: &PrinterConfiguration, field_path: &str) -> Option<ConfigValue> {
@@ -460,7 +472,9 @@ impl ConfigManager {
             ("temperature.bed_max_temp", ConfigValue::Float(v)) => config.temperature.bed_max_temp = v,
             ("extruder.filament_diameter", ConfigValue::Float(v)) => config.extruder.filament_diameter = v,
             ("extruder.nozzle_diameter", ConfigValue::Float(v)) => config.extruder.nozzle_diameter = v,
-            ("network.web_port", ConfigValue::Int(v)) => config.network.web_port = v as u16,
+            ("network.web_port", ConfigValue::Int(v)) => {
+                config.network.web_port = u16::try_from(v).map_err(|_| ConfigError::InvalidNetworkConfig)?;
+            }
             ("safety.thermal_protection_enabled", ConfigValue::Bool(v)) => config.safety.thermal_protection_enabled = v,
             ("features.power_loss_recovery", ConfigValue::Bool(v)) => config.features.power_loss_recovery = v,
             _ => return Err(ConfigError::InvalidFieldPath),
@@ -490,6 +504,7 @@ pub enum ConfigError {
     SerializationError,
     StorageError,
     InvalidFieldPath,
+    ThermalProtectionRequired,
 }
 
 pub static CONFIG_MANAGER: Mutex<CriticalSectionRawMutex, Option<ConfigManager>> = Mutex::new(None);

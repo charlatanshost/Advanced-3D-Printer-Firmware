@@ -13,6 +13,7 @@ mod exclude_object;
 mod gcode_processor;
 mod config_manager;
 mod web_server;
+mod safety;
 
 use power_recovery::{init_power_recovery, POWER_RECOVERY, RecoveryError};
 use exclude_object::{init_exclude_object_manager, EXCLUDE_OBJECT_MANAGER, ObjectError, ObjectStatus};
@@ -69,6 +70,13 @@ fn main() -> ! {
         // For now, keep a simpler approach without the async tasks
 
         loop {
+            // Checked every pass, however the stop was triggered, and it overrides everything below
+            if safety::emergency_stop_active() {
+                channel.set_duty_cycle(0).ok();
+                let _ = COMMAND_CHANNEL.try_receive(); // Refuse anything queued
+                continue;
+            }
+
             if let Ok(cmd) = COMMAND_CHANNEL.try_receive() {
                 match cmd {
                     Command::SetServo { pin: _, angle } => {
@@ -82,7 +90,7 @@ fn main() -> ! {
                         // Check power recovery status - simplified for now  
                     }
                     Command::EmergencyStop => {
-                        // Handle emergency stop - simplified for now
+                        safety::trigger_emergency_stop();
                     }
                     Command::ExcludeObject { name } => {
                         // Handle exclude object command

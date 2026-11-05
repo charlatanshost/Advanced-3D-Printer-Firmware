@@ -95,6 +95,7 @@ impl Default for TrajectoryState {
 
 // S-curve trajectory generator (like LinuxCNC's trajectory planner)
 pub struct SCurveTrajectoryGenerator {
+    start_position: f64,
     current_position: f64,
     current_velocity: f64,
     current_acceleration: f64,
@@ -111,6 +112,7 @@ pub struct SCurveTrajectoryGenerator {
 impl SCurveTrajectoryGenerator {
     pub fn new(max_vel: f64, max_accel: f64, max_jerk: f64) -> Self {
         Self {
+            start_position: 0.0,
             current_position: 0.0,
             current_velocity: 0.0,
             current_acceleration: 0.0,
@@ -125,7 +127,40 @@ impl SCurveTrajectoryGenerator {
         }
     }
     
+    /// The shortest time this generator's limits allow for a move of this length
+    pub fn minimum_move_time(&self, distance: f64) -> f64 {
+        let distance = distance.abs();
+        let max_velocity = self.max_velocity.max(1e-6);
+        let max_acceleration = self.max_acceleration.max(1e-6);
+        let accel_time = max_velocity / max_acceleration;
+        let jerk_time = max_acceleration / self.max_jerk.max(1e-6);
+        if distance / max_velocity > accel_time {
+            distance / max_velocity + accel_time + jerk_time
+        } else {
+            2.0 * (distance / max_acceleration).sqrt() + jerk_time
+        }
+    }
+
+    /// Stop dead at a position, abandoning any move in progress
+    pub fn set_position(&mut self, position: f64) {
+        self.start_position = position;
+        self.current_position = position;
+        self.current_velocity = 0.0;
+        self.current_acceleration = 0.0;
+        self.target_position = position;
+        self.target_velocity = 0.0;
+        self.profile_complete = true;
+    }
+
+    /// Plan a move taking at least `minimum_time`, so several axes can be made to finish together
+    pub fn plan_timed_move(&mut self, start_pos: f64, end_pos: f64, minimum_time: f64) {
+        self.plan_move(start_pos, 0.0, end_pos, 0.0);
+        let total = self.trajectory_time.as_secs_f64().max(minimum_time);
+        self.trajectory_time = Duration::from_secs_f64(total);
+    }
+
     pub fn plan_move(&mut self, start_pos: f64, start_vel: f64, end_pos: f64, end_vel: f64) {
+        self.start_position = start_pos;
         self.current_position = start_pos;
         self.current_velocity = start_vel;
         self.current_acceleration = 0.0;
@@ -135,21 +170,7 @@ impl SCurveTrajectoryGenerator {
         self.profile_complete = false;
         
         // Calculate trajectory time using S-curve profile
-        let distance = (end_pos - start_pos).abs();
-        let velocity_change = (end_vel - start_vel).abs();
-        
-        // Simplified S-curve calculation - in practice this would be more complex
-        let accel_time = self.max_velocity / self.max_acceleration;
-        let jerk_time = self.max_acceleration / self.max_jerk;
-        
-        let total_time = if distance / self.max_velocity > accel_time {
-            // Long move with cruising phase
-            distance / self.max_velocity + accel_time + jerk_time
-        } else {
-            // Short move, triangular or S-curve profile
-            2.0 * (distance / self.max_acceleration).sqrt() + jerk_time
-        };
-        
+        let total_time = self.minimum_move_time(end_pos - start_pos);
         self.trajectory_time = Duration::from_secs_f64(total_time);
     }
     
@@ -170,28 +191,19 @@ impl SCurveTrajectoryGenerator {
             return (self.current_position, self.current_velocity, self.current_acceleration);
         }
         
-        // S-curve trajectory calculation
-        let distance = self.target_position - self.current_position;
+        // S-curve trajectory calculation, always measured from where the move began. Measuring
+        // from the current position would approach the target at the wrong speed each tick.
+        let distance = self.target_position - self.start_position;
         let progress = t / total_time;
-        
-        // Smooth S-curve using cubic interpolation (simplified)
-        let s = if progress < 0.5 {
-            2.0 * progress * progress
-        } else {
-            1.0 - 2.0 * (1.0 - progress) * (1.0 - progress)
-        };
-        
-        self.current_position = self.current_position + distance * s;
-        
-        // Calculate velocity and acceleration from position derivative
-        let dt = 0.001; // 1ms time step
-        let s_dt = if (progress + dt / total_time) < 0.5 {
-            2.0 * (progress + dt / total_time) * (progress + dt / total_time)
-        } else {
-            1.0 - 2.0 * (1.0 - (progress + dt / total_time)) * (1.0 - (progress + dt / total_time))
-        };
-        
-        self.current_velocity = distance * (s_dt - s) / dt;
+
+        // Smooth S-curve: smoothstep, with velocity and acceleration from its derivatives
+        let s = progress * progress * (3.0 - 2.0 * progress);
+        let ds = 6.0 * progress * (1.0 - progress) / total_time;
+        let dds = 6.0 * (1.0 - 2.0 * progress) / (total_time * total_time);
+
+        self.current_position = self.start_position + distance * s;
+        self.current_velocity = distance * ds;
+        self.current_acceleration = distance * dds;
         
         (self.current_position, self.current_velocity, self.current_acceleration)
     }
@@ -300,25 +312,45 @@ impl LinuxCNCController {
         
         self.last_update = now;
         let mut commands = HashMap::new();
-        
+
+        // An explicit zero for every motor, so a stop is never mistaken for "not time yet"
         if !self.enabled || self.emergency_stop {
+            for (axis_name, axis) in self.axes.iter_mut() {
+                axis.state.output_command = 0.0;
+                for motor_id in &axis.motor_ids {
+                    commands.insert(format!("{}_{}", axis_name, motor_id), 0.0);
+                }
+            }
             return Ok(commands);
         }
-        
+
         // Update each axis
         for (axis_name, axis) in self.axes.iter_mut() {
+            // A disabled or faulted axis gets no output until enable_axis clears it
+            if !axis.state.enabled || axis.state.fault {
+                axis.state.output_command = 0.0;
+                for motor_id in &axis.motor_ids {
+                    commands.insert(format!("{}_{}", axis_name, motor_id), 0.0);
+                }
+                continue;
+            }
+
             // Update trajectory generation
             let (cmd_pos, cmd_vel, cmd_acc) = axis.trajectory_generator.update();
             axis.state.commanded_position = cmd_pos;
             axis.state.commanded_velocity = cmd_vel;
             axis.state.commanded_acceleration = cmd_acc;
             
-            // Get actual position from encoders
-            if let Ok(closed_loop) = self.closed_loop_manager.lock() {
-                if let Some(diagnostics) = closed_loop.get_axis_diagnostics(axis_name) {
-                    axis.state.actual_position = diagnostics.current_position;
-                    axis.state.actual_velocity = diagnostics.velocity;
-                }
+            // Get actual position from encoders. An open-loop axis has none, and is assumed
+            // to be where it was told. Otherwise its "position" stays 0 and it faults.
+            let feedback = self.closed_loop_manager.lock().ok()
+                .and_then(|closed_loop| closed_loop.get_axis_diagnostics(axis_name));
+            if let Some(diagnostics) = feedback {
+                axis.state.actual_position = diagnostics.current_position;
+                axis.state.actual_velocity = diagnostics.velocity;
+            } else {
+                axis.state.actual_position = axis.state.commanded_position;
+                axis.state.actual_velocity = axis.state.commanded_velocity;
             }
             
             // Calculate position error
@@ -340,10 +372,11 @@ impl LinuxCNCController {
                                   else if axis.state.commanded_velocity < 0.0 { -1 } 
                                   else { axis.last_command_direction };
             
-            if command_direction != axis.backlash_direction && axis.parameters.backlash_compensation != 0.0 {
-                compensated_position += axis.parameters.backlash_compensation * command_direction as f64;
+            if command_direction != axis.backlash_direction {
                 axis.backlash_direction = command_direction;
             }
+            // Held for as long as the direction lasts, not just on the tick it changes
+            compensated_position += axis.parameters.backlash_compensation * axis.backlash_direction as f64;
             axis.last_command_direction = command_direction;
             
             // PID control calculation with feedforward
@@ -395,6 +428,8 @@ impl LinuxCNCController {
             axis.state.position_error = 0.0;
             axis.state.homed = true;
             axis.pid_controller.reset();
+            // Or the generator would carry on toward its old target from the old position
+            axis.trajectory_generator.set_position(0.0);
             Ok(())
         } else {
             Err(format!("Axis {} not found", axis_name))
@@ -410,8 +445,15 @@ impl LinuxCNCController {
         }
     }
     
+    /// Enable control. Does nothing while an emergency stop is latched: clearing one takes
+    /// a deliberate call to reset_emergency_stop.
     pub fn enable_global(&mut self) {
-        self.enabled = true;
+        if !self.emergency_stop {
+            self.enabled = true;
+        }
+    }
+
+    pub fn reset_emergency_stop(&mut self) {
         self.emergency_stop = false;
     }
     
@@ -463,20 +505,19 @@ impl LinuxCNCController {
             return Ok(()); // No movement needed
         }
         
-        let move_time = max_distance / feedrate;
-        
+        // Every axis must take the same time or the path is not a straight line: the longest
+        // of what the feedrate asks for and what the slowest axis needs.
+        let mut move_time: f64 = if feedrate > 0.0 { max_distance / feedrate } else { 0.0 };
+        for (axis_name, distance) in &axis_distances {
+            if let Some(axis) = self.axes.get(axis_name) {
+                move_time = move_time.max(axis.trajectory_generator.minimum_move_time(*distance));
+            }
+        }
+
         // Plan synchronized moves for all axes
         for (axis_name, target_pos) in target_positions {
             if let Some(axis) = self.axes.get_mut(&axis_name) {
-                let distance = axis_distances[&axis_name];
-                let axis_velocity = if move_time > 0.0 { distance / move_time } else { 0.0 };
-                
-                axis.trajectory_generator.plan_move(
-                    axis.state.commanded_position,
-                    0.0, // Start from rest
-                    target_pos,
-                    axis_velocity.min(axis.parameters.max_velocity)
-                );
+                axis.trajectory_generator.plan_timed_move(axis.state.commanded_position, target_pos, move_time);
             }
         }
         

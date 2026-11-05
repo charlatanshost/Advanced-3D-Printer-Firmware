@@ -131,6 +131,25 @@ impl PracticalKinematics {
         }
     }
     
+    /// A and B/C (degrees) that aim a head rotating as Rz(b) * Rx(a) along the pose's tool
+    /// direction, which works out as (sin a sin b, -sin a cos b, cos a). Euler angles would
+    /// not do: this order has no "pitch", and using it would lose the tilt.
+    fn head_angles_from_direction(pose: &Pose6DOF) -> (f64, f64) {
+        let d = pose.tool_direction();
+        let tilt = d.z.clamp(-1.0, 1.0).acos();
+        let spin = if tilt < 1e-9 { 0.0 } else { d.x.atan2(-d.y) };
+        (tilt.to_degrees(), spin.to_degrees())
+    }
+
+    /// A and C (degrees) for a table rotating as Rx(a) * Rz(c). The tool's direction relative
+    /// to the table is then (sin a sin c, sin a cos c, cos a).
+    fn table_angles_from_direction(pose: &Pose6DOF) -> (f64, f64) {
+        let d = pose.tool_direction();
+        let tilt = d.z.clamp(-1.0, 1.0).acos();
+        let spin = if tilt < 1e-9 { 0.0 } else { d.x.atan2(d.y) };
+        (tilt.to_degrees(), spin.to_degrees())
+    }
+
     // Toolhead rotary kinematics (most common for 3D printing)
     fn forward_toolhead_rotary(&self, joints: &JointConfiguration, tool_offset: f64) -> Result<Pose6DOF, KinematicsError> {
         // Linear position (X, Y, Z are direct)
@@ -142,7 +161,8 @@ impl PracticalKinematics {
         
         // Tool offset accounting for rotations
         // This is the "handshake" method mentioned by Grok - visually intuitive
-        let tool_offset_vector = Vector3::new(0.0, 0.0, tool_offset);
+        // The tool tip hangs below the pivot
+        let tool_offset_vector = Vector3::new(0.0, 0.0, -tool_offset);
         
         // Apply A-axis rotation (tilt around X)
         let a_rotation = Rotation3::from_axis_angle(&Vector3::x_axis(), a_rad);
@@ -166,13 +186,9 @@ impl PracticalKinematics {
     }
     
     fn inverse_toolhead_rotary(&self, target_pose: &Pose6DOF, tool_offset: f64, tilt_limits: (f64, f64), rotation_limits: (f64, f64)) -> Result<Vec<JointConfiguration>, KinematicsError> {
-        // Extract target orientation as Euler angles
-        let (_roll, pitch, yaw) = target_pose.euler_angles();
-        
-        // For toolhead rotary, A maps to pitch (tilt) and B maps to yaw (rotation)
-        let a_deg = pitch.to_degrees();
-        let b_deg = yaw.to_degrees();
-        
+        // Forward kinematics is Rz(b) * Rx(a), so A tilts and B spins
+        let (a_deg, b_deg) = Self::head_angles_from_direction(target_pose);
+
         // Check limits
         if a_deg < tilt_limits.0 || a_deg > tilt_limits.1 {
             return Err(KinematicsError::JointLimitsExceeded);
@@ -185,7 +201,7 @@ impl PracticalKinematics {
         let a_rad = a_deg.to_radians();
         let b_rad = b_deg.to_radians();
         
-        let tool_offset_vector = Vector3::new(0.0, 0.0, tool_offset);
+        let tool_offset_vector = Vector3::new(0.0, 0.0, -tool_offset);
         let a_rotation = Rotation3::from_axis_angle(&Vector3::x_axis(), a_rad);
         let b_rotation = Rotation3::from_axis_angle(&Vector3::z_axis(), b_rad);
         let offset_after_rotation = b_rotation * (a_rotation * tool_offset_vector);
@@ -217,19 +233,14 @@ impl PracticalKinematics {
         let a_rotation = Rotation3::from_axis_angle(&Vector3::x_axis(), a_rad);
         let c_rotation = Rotation3::from_axis_angle(&Vector3::z_axis(), c_rad);
         
-        // Table center transformation
-        let table_transform = Translation3::from(*table_center);
-        
-        // Combined transformation
-        let _combined_transform = Isometry3::from_parts(
-            table_transform,
-            UnitQuaternion::from_rotation_matrix(&(c_rotation * a_rotation)),
-        );
-        
-        // Tool is at spindle position, oriented vertically by default
+        // The tool is at the spindle position. Its orientation relative to the part is the
+        // inverse of the table's rotation. (Following the part with X/Y/Z, which is RTCP and
+        // what table_center would be for, is not done here.)
+        let _ = table_center;
+        let table_rotation = a_rotation * c_rotation;
         let tool_pose = Pose6DOF {
             position: Point3::from(spindle_pos),
-            orientation: UnitQuaternion::identity(),
+            orientation: UnitQuaternion::from_rotation_matrix(&table_rotation.inverse()),
         };
         
         Ok(tool_pose)
@@ -241,13 +252,8 @@ impl PracticalKinematics {
         let linear_pos = target_pose.position.coords;
         
         // Orientation determines table angles
-        let (_roll, pitch, yaw) = target_pose.euler_angles();
-        
-        // A-axis corresponds to pitch (tilt)
-        // C-axis corresponds to yaw (rotation)
-        let a_deg = pitch.to_degrees();
-        let c_deg = yaw.to_degrees();
-        
+        let (a_deg, c_deg) = Self::table_angles_from_direction(target_pose);
+
         let solution = JointConfiguration::new(
             linear_pos.x,
             linear_pos.y,
@@ -260,9 +266,10 @@ impl PracticalKinematics {
     }
     
     fn forward_corexy_rotary(&self, joints: &JointConfiguration, belt_ratio: f64, rotary_offset: &Vector3<f64>) -> Result<Pose6DOF, KinematicsError> {
-        // CoreXY transformation for X, Y
-        let corexy_x = (joints.x + joints.y) / belt_ratio;
-        let corexy_y = (joints.x - joints.y) / belt_ratio;
+        // CoreXY transformation for X, Y. The inverse of motor_a = (x + y) * ratio and
+        // motor_b = (x - y) * ratio, which needs the factor of 2.
+        let corexy_x = (joints.x + joints.y) / (2.0 * belt_ratio);
+        let corexy_y = (joints.x - joints.y) / (2.0 * belt_ratio);
         
         // Z is direct
         let linear_pos = Vector3::new(corexy_x, corexy_y, joints.z);
@@ -288,10 +295,8 @@ impl PracticalKinematics {
     
     fn inverse_corexy_rotary(&self, target_pose: &Pose6DOF, belt_ratio: f64, rotary_offset: &Vector3<f64>) -> Result<Vec<JointConfiguration>, KinematicsError> {
         // Extract orientation
-        let (_roll, pitch, yaw) = target_pose.euler_angles();
-        let a_deg = pitch.to_degrees();
-        let c_deg = yaw.to_degrees();
-        
+        let (a_deg, c_deg) = Self::head_angles_from_direction(target_pose);
+
         // Back out rotary offset
         let a_rad = a_deg.to_radians();
         let c_rad = c_deg.to_radians();
@@ -401,33 +406,41 @@ impl PracticalKinematics {
         (full_steps_per_rev as f64) * gear_ratio * (microstepping as f64) / 360.0
     }
     
+    /// Move Z up relative to wherever it is, for clearance before anything is homed
+    fn raise_z_commands() -> Vec<String> {
+        vec!["G91".to_string(), "G1 Z10 F600".to_string(), "G90".to_string()]
+    }
+
     /// Generate homing sequence that avoids collisions
     pub fn generate_safe_homing_sequence(&self) -> Vec<String> {
         let mut sequence = Vec::new();
         
         match &self.machine_type {
             PracticalMachineType::ToolheadRotary { .. } => {
-                // Home rotaries first to neutral position
+                // Raise first: a tilted head can swing into the bed while its rotaries home
+                sequence.extend(Self::raise_z_commands());
                 sequence.push("G28 A0".to_string());      // Tilt to neutral
                 sequence.push("G28 B0".to_string());      // Rotation to neutral
-                sequence.push("G28 Z".to_string());       // Z up for clearance
-                sequence.push("G28 X Y".to_string());     // Finally X, Y
+                sequence.push("G28 X Y".to_string());     // X, Y, with the head upright
+                sequence.push("G28 Z".to_string());       // Z last, now over a known spot
             },
             
             PracticalMachineType::TableRotary { .. } => {
-                // For table rotary, clear Z first, then home table
-                sequence.push("G28 Z".to_string());       // Z up for clearance
+                // Raise first, as the table needs room to turn. G28 Z itself may go down.
+                sequence.extend(Self::raise_z_commands());
                 sequence.push("G28 A0".to_string());      // Table tilt to neutral
                 sequence.push("G28 C0".to_string());      // Table rotation to neutral
                 sequence.push("G28 X Y".to_string());     // Linear axes
+                sequence.push("G28 Z".to_string());       // Z last, with the table level
             },
             
             PracticalMachineType::CoreXYRotary { .. } => {
                 // Similar to toolhead rotary
+                sequence.extend(Self::raise_z_commands());
                 sequence.push("G28 A0".to_string());
                 sequence.push("G28 C0".to_string());
-                sequence.push("G28 Z".to_string());
                 sequence.push("G28 X Y".to_string());
+                sequence.push("G28 Z".to_string());
             },
             
             PracticalMachineType::RobotArm { .. } => {
@@ -553,8 +566,37 @@ mod tests {
         // Verify solution by forward kinematics
         let computed_pose = kinematics.forward_kinematics_fast(&sols[0]);
         assert!(computed_pose.is_ok());
-        
-        let error = (computed_pose.unwrap().position - target_pose.position).norm();
+        let computed_pose = computed_pose.unwrap();
+
+        let error = (computed_pose.position - target_pose.position).norm();
         assert!(error < 0.1); // Less than 0.1mm error
+
+        // And the tool must point the right way
+        let direction_error = (computed_pose.tool_direction().into_inner() - target_pose.tool_direction().into_inner()).norm();
+        assert!(direction_error < 1e-6, "tool direction off by {}", direction_error);
+    }
+
+    #[test]
+    fn test_corexy_round_trip() {
+        let axis = AxisConfig { min_angle: -90.0, max_angle: 90.0, steps_per_degree: 10.0, gear_ratio: 1.0, homing_speed: 100.0, max_speed: 1000.0, acceleration: 100.0 };
+        let machine = PracticalMachineType::CoreXYRotary {
+            belt_ratio: 1.0,
+            rotary_offset: nalgebra::Vector3::new(0.0, 0.0, -30.0),
+            axis_configs: (axis.clone(), axis),
+        };
+        let kinematics = PracticalKinematics::new(machine);
+        let target = Pose6DOF::new(50.0, 20.0, 100.0, 0.3, 0.0, 0.0);
+        let joints = kinematics.inverse_kinematics_analytical(&target).unwrap();
+        let computed = kinematics.forward_kinematics_fast(&joints[0]).unwrap();
+        assert!((computed.position - target.position).norm() < 1e-9, "{:?}", computed.position);
+    }
+
+    #[test]
+    fn test_homing_raises_z_before_anything_swings() {
+        let kinematics = PracticalKinematics::new(PracticalMachineType::penta_axis_style());
+        let sequence = kinematics.generate_safe_homing_sequence();
+        let position = |text: &str| sequence.iter().position(|c| c.contains(text)).unwrap();
+        assert!(position("G1 Z10") < position("G28 A0"));
+        assert!(position("G28 X Y") < position("G28 Z"));
     }
 }

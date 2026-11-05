@@ -1,10 +1,28 @@
 use serde::{Deserialize, Serialize};
-use heapless::{String, Vec, FnvIndexMap};
+use heapless::{String, Vec};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 
 const MAX_OBJECTS: usize = 32;
 const MAX_OBJECT_NAME_LENGTH: usize = 32;
+const OBJECT_START_MARKER: &str = "; object:";
+pub const OBJECT_END_MARKER: &str = "; end object";
+
+/// The object name from a `; object: NAME [center:x,y] [time:n]` marker line. There is one
+/// definition of this, so names always match wherever they are read.
+pub fn parse_object_marker(line: &str) -> Option<String<MAX_OBJECT_NAME_LENGTH>> {
+    let start = line.find(OBJECT_START_MARKER)? + OBJECT_START_MARKER.len();
+    let mut name = line[start..].trim();
+    for metadata in [" center:", " time:"] {
+        if let Some(end) = name.find(metadata) {
+            name = name[..end].trim_end();
+        }
+    }
+    if name.is_empty() {
+        return None;
+    }
+    String::try_from(name).ok()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ObjectStatus {
@@ -27,6 +45,7 @@ pub struct PrintObject {
     pub progress: f32, // 0.0 to 100.0
     pub center: [f32; 2], // X, Y center coordinates
     pub bounds: [[f32; 2]; 2], // [[min_x, min_y], [max_x, max_y]]
+    pub has_bounds: bool, // A move at exactly (0, 0) must not look like "no bounds yet"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +78,7 @@ impl Default for PrintObject {
             progress: 0.0,
             center: [0.0, 0.0],
             bounds: [[0.0, 0.0], [0.0, 0.0]],
+            has_bounds: false,
         }
     }
 }
@@ -92,9 +112,13 @@ impl ExcludeObjectManager {
 
     pub async fn parse_gcode_objects(&mut self, gcode_content: &str) -> Result<(), ObjectError> {
         let objects = self.gcode_processor.extract_objects(gcode_content).await?;
-        
+
         let mut state = self.state.lock().await;
         state.objects.clear();
+        // A new print starts clean: an object named "A" excluded from the last print
+        // must not silently disappear from this one.
+        state.excluded_objects.clear();
+        state.current_object = None;
         
         for obj in objects.iter() {
             if state.objects.push(obj.clone()).is_err() {
@@ -114,21 +138,21 @@ impl ExcludeObjectManager {
         let mut state = self.state.lock().await;
         
         // Find object and mark as excluded
-        let mut found = false;
-        for obj in state.objects.iter_mut() {
-            if obj.name.as_str() == object_name {
-                if obj.status == ObjectStatus::Printing {
-                    return Err(ObjectError::ObjectCurrentlyPrinting);
-                }
-                obj.status = ObjectStatus::Excluded;
-                found = true;
-                break;
-            }
-        }
-        
-        if !found {
+        let Some(obj) = state.objects.iter_mut().find(|o| o.name.as_str() == object_name) else {
             return Err(ObjectError::ObjectNotFound);
+        };
+        match obj.status {
+            ObjectStatus::Printing => return Err(ObjectError::ObjectCurrentlyPrinting),
+            ObjectStatus::Completed => return Err(ObjectError::ObjectAlreadyCompleted),
+            _ => {}
         }
+        if obj.status == ObjectStatus::Failed {
+            state.failed_objects = state.failed_objects.saturating_sub(1);
+        }
+        let Some(obj) = state.objects.iter_mut().find(|o| o.name.as_str() == object_name) else {
+            return Err(ObjectError::ObjectNotFound);
+        };
+        obj.status = ObjectStatus::Excluded;
         
         // Add to excluded list
         let excluded_name = String::try_from(object_name).map_err(|_| ObjectError::InvalidName)?;
@@ -144,6 +168,7 @@ impl ExcludeObjectManager {
         
         // Find object and mark as pending
         let mut found = false;
+        let mut was_failed = false;
         for obj in state.objects.iter_mut() {
             if obj.name.as_str() == object_name {
                 if obj.status == ObjectStatus::Printing {
@@ -152,6 +177,7 @@ impl ExcludeObjectManager {
                 if obj.status == ObjectStatus::Completed {
                     return Err(ObjectError::ObjectAlreadyCompleted);
                 }
+                was_failed = obj.status == ObjectStatus::Failed;
                 obj.status = ObjectStatus::Pending;
                 found = true;
                 break;
@@ -160,6 +186,9 @@ impl ExcludeObjectManager {
         
         if !found {
             return Err(ObjectError::ObjectNotFound);
+        }
+        if was_failed {
+            state.failed_objects = state.failed_objects.saturating_sub(1);
         }
         
         // Remove from excluded list
@@ -170,47 +199,43 @@ impl ExcludeObjectManager {
         Ok(())
     }
 
-    pub async fn should_skip_line(&self, line_number: u32) -> bool {
-        let state = self.state.lock().await;
-        
-        for excluded_name in &state.excluded_objects {
-            if let Some(obj) = state.objects.iter().find(|o| &o.name == excluded_name) {
-                if line_number >= obj.start_line && line_number <= obj.end_line {
-                    return true;
-                }
-            }
+    /// An object's section has started in the print. Returns true if it must be skipped.
+    /// Objects usually have one section per layer, so this runs many times for each.
+    pub async fn object_started(&mut self, object_name: &str, _line_number: u32) -> bool {
+        let mut state = self.state.lock().await;
+        if state.excluded_objects.iter().any(|name| name.as_str() == object_name) {
+            return true;
         }
-        
+        let name = state.objects.iter_mut().find(|o| o.name.as_str() == object_name).map(|obj| {
+            obj.status = ObjectStatus::Printing;
+            obj.name.clone()
+        });
+        if name.is_some() {
+            state.current_object = name;
+        }
         false
     }
 
-    pub async fn update_current_object(&mut self, line_number: u32) -> Option<String<MAX_OBJECT_NAME_LENGTH>> {
+    /// The current object's section has ended. Only its last section completes it. In
+    /// between it goes back to Pending, so it can still be excluded on a later layer.
+    pub async fn object_finished(&mut self, line_number: u32) {
         let mut state = self.state.lock().await;
-        
-        // First, find the object name that should be current
-        let mut new_current: Option<String<MAX_OBJECT_NAME_LENGTH>> = None;
-        
-        for obj in state.objects.iter() {
-            if line_number >= obj.start_line && line_number <= obj.end_line && obj.status != ObjectStatus::Excluded {
-                if state.current_object.as_ref() != Some(&obj.name) {
-                    new_current = Some(obj.name.clone());
-                    break;
-                }
+        let Some(current_name) = state.current_object.take() else {
+            return;
+        };
+        let mut completed = false;
+        if let Some(obj) = state.objects.iter_mut().find(|o| o.name == current_name) {
+            if line_number >= obj.end_line {
+                obj.status = ObjectStatus::Completed;
+                obj.progress = 100.0;
+                completed = true;
+            } else {
+                obj.status = ObjectStatus::Pending;
             }
         }
-        
-        // If we found a new current object, update the state
-        if let Some(ref new_name) = new_current {
-            for obj in state.objects.iter_mut() {
-                if &obj.name == new_name {
-                    obj.status = ObjectStatus::Printing;
-                    break;
-                }
-            }
-            state.current_object = new_current.clone();
+        if completed {
+            state.completed_objects += 1;
         }
-        
-        new_current
     }
 
     pub async fn complete_current_object(&mut self) -> Result<(), ObjectError> {
@@ -283,8 +308,10 @@ impl ExcludeObjectManager {
         // Collect names first to avoid borrow issues
         let mut objects_to_exclude = Vec::<String<MAX_OBJECT_NAME_LENGTH>, 8>::new();
         
+        // Only objects already marked as failed: one that is just starting has low progress
+        // too, and that does not make it a failure.
         for obj in state.objects.iter() {
-            if obj.status == ObjectStatus::Printing && obj.progress < failure_threshold {
+            if obj.status == ObjectStatus::Failed && obj.progress < failure_threshold {
                 if objects_to_exclude.push(obj.name.clone()).is_err() {
                     break; // Vector full
                 }
@@ -306,7 +333,9 @@ impl ExcludeObjectManager {
         
         // Add to excluded objects list separately
         for name in &objects_to_exclude {
-            if state.excluded_objects.push(name.clone()).is_err() {
+            if !state.excluded_objects.iter().any(|existing| existing == name)
+                && state.excluded_objects.push(name.clone()).is_err()
+            {
                 break;
             }
         }
@@ -316,21 +345,20 @@ impl ExcludeObjectManager {
 }
 
 pub struct GcodeProcessor {
-    object_pattern_start: &'static str,
     object_pattern_end: &'static str,
 }
 
 impl GcodeProcessor {
     pub fn new() -> Self {
         Self {
-            object_pattern_start: "; object:",
-            object_pattern_end: "; end object",
+            object_pattern_end: OBJECT_END_MARKER,
         }
     }
 
     pub async fn extract_objects(&self, gcode_content: &str) -> Result<Vec<PrintObject, MAX_OBJECTS>, ObjectError> {
-        let mut objects = Vec::new();
-        let mut current_object: Option<PrintObject> = None;
+        // One entry per object, however many sections (usually one per layer) it spans.
+        let mut objects: Vec<PrintObject, MAX_OBJECTS> = Vec::new();
+        let mut current_object: Option<usize> = None;
         let mut line_number = 0u32;
         let mut layer_number = 0u32;
         
@@ -343,56 +371,46 @@ impl GcodeProcessor {
             }
             
             // Check for object start
-            if let Some(object_name) = self.parse_object_start(line) {
-                let mut obj = PrintObject::default();
-                obj.name = object_name;
-                obj.start_line = line_number;
-                obj.layer_start = layer_number;
-                obj.status = ObjectStatus::Pending;
-                
-                // Extract object metadata if available
-                self.parse_object_metadata(&mut obj, line);
-                
-                current_object = Some(obj);
+            if let Some(object_name) = parse_object_marker(line) {
+                let index = match objects.iter().position(|o| o.name == object_name) {
+                    Some(index) => index,
+                    None => {
+                        let mut obj = PrintObject::default();
+                        obj.name = object_name;
+                        obj.start_line = line_number;
+                        obj.layer_start = layer_number;
+                        obj.status = ObjectStatus::Pending;
+
+                        // Extract object metadata if available
+                        self.parse_object_metadata(&mut obj, line);
+
+                        objects.push(obj).map_err(|_| ObjectError::TooManyObjects)?;
+                        objects.len() - 1
+                    }
+                };
+                objects[index].end_line = line_number;
+                objects[index].layer_end = layer_number;
+                current_object = Some(index);
             }
-            
+
             // Check for object end
             if line.contains(self.object_pattern_end) {
-                if let Some(mut obj) = current_object.take() {
-                    obj.end_line = line_number;
-                    obj.layer_end = layer_number;
-                    
-                    if objects.push(obj).is_err() {
-                        return Err(ObjectError::TooManyObjects);
-                    }
+                if let Some(index) = current_object.take() {
+                    objects[index].end_line = line_number;
+                    objects[index].layer_end = layer_number;
                 }
             }
-            
-            // Update current object with movement data for bounds calculation
-            if let Some(ref mut obj) = current_object {
-                self.update_object_bounds(obj, line);
-            }
-        }
-        
-        // Handle case where object end marker is missing
-        if let Some(mut obj) = current_object {
-            obj.end_line = line_number;
-            obj.layer_end = layer_number;
-            objects.push(obj).map_err(|_| ObjectError::TooManyObjects)?;
-        }
-        
-        Ok(objects)
-    }
 
-    fn parse_object_start(&self, line: &str) -> Option<String<MAX_OBJECT_NAME_LENGTH>> {
-        if let Some(start_pos) = line.find(self.object_pattern_start) {
-            let name_start = start_pos + self.object_pattern_start.len();
-            let name = line[name_start..].trim();
-            if !name.is_empty() {
-                return String::try_from(name).ok();
+            // Update current object with movement data for bounds calculation
+            if let Some(index) = current_object {
+                self.update_object_bounds(&mut objects[index], line);
+                // Also covers a missing end marker: the section runs to the last line seen
+                objects[index].end_line = line_number;
+                objects[index].layer_end = layer_number;
             }
         }
-        None
+
+        Ok(objects)
     }
 
     fn parse_object_metadata(&self, obj: &mut PrintObject, line: &str) {
@@ -418,9 +436,9 @@ impl GcodeProcessor {
         if line.starts_with("G1 ") || line.starts_with("G0 ") {
             if let (Some(x), Some(y)) = (self.extract_coordinate(line, 'X'), self.extract_coordinate(line, 'Y')) {
                 // Update bounds
-                if obj.bounds[0][0] == 0.0 && obj.bounds[0][1] == 0.0 && 
-                   obj.bounds[1][0] == 0.0 && obj.bounds[1][1] == 0.0 {
+                if !obj.has_bounds {
                     // First coordinates - initialize bounds
+                    obj.has_bounds = true;
                     obj.bounds[0] = [x, y]; // min
                     obj.bounds[1] = [x, y]; // max
                 } else {
@@ -452,14 +470,16 @@ impl GcodeProcessor {
     }
 
     fn parse_coordinates(&self, coords_str: &str) -> Result<[f32; 2], ObjectError> {
-        let parts: Vec<&str, 4> = coords_str.split(',').collect();
-        if parts.len() >= 2 {
-            let x = parts[0].trim().parse().map_err(|_| ObjectError::InvalidCoordinates)?;
-            let y = parts[1].trim().parse().map_err(|_| ObjectError::InvalidCoordinates)?;
-            Ok([x, y])
-        } else {
-            Err(ObjectError::InvalidCoordinates)
-        }
+        // Up to the next space, as more metadata can follow. No fixed-size collection here:
+        // the firmware must not panic on the contents of a file.
+        let coords = coords_str.trim().split_whitespace().next().unwrap_or("");
+        let mut parts = coords.split(',');
+        let (Some(x), Some(y)) = (parts.next(), parts.next()) else {
+            return Err(ObjectError::InvalidCoordinates);
+        };
+        let x = x.trim().parse().map_err(|_| ObjectError::InvalidCoordinates)?;
+        let y = y.trim().parse().map_err(|_| ObjectError::InvalidCoordinates)?;
+        Ok([x, y])
     }
 }
 

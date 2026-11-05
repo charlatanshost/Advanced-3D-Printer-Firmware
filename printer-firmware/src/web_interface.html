@@ -439,6 +439,38 @@
             startStatusUpdates();
         });
 
+        // Fetch with the API token if one is saved. A 401 asks for it once.
+        async function apiFetch(url, options = {}) {
+            const withToken = () => {
+                const token = localStorage.getItem('apiToken');
+                const headers = Object.assign({}, options.headers);
+                if (token) headers['Authorization'] = `Bearer ${token}`;
+                return fetch(url, Object.assign({}, options, { headers }));
+            };
+            let response = await withToken();
+            if (response.status === 401) {
+                const token = prompt('API token for this printer:');
+                if (token) {
+                    localStorage.setItem('apiToken', token);
+                    response = await withToken();
+                }
+            }
+            return response;
+        }
+
+        // Object and profile names come from G-code files and other users. Anything
+        // inserted as HTML must be escaped, or a crafted name could run script here.
+        function escapeHtml(text) {
+            const element = document.createElement('div');
+            element.textContent = String(text);
+            return element.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
+        // Unknown values arrive as null
+        function showValue(value, unit) {
+            return value === null || value === undefined ? '--' : `${value}${unit}`;
+        }
+
         function connectWebSocket() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${protocol}//${window.location.hostname}:8080`;
@@ -489,11 +521,11 @@
         }
 
         function updateStatus(status) {
-            document.getElementById('hotend-temp').textContent = `${status.current_temp_hotend}°C`;
-            document.getElementById('hotend-target').textContent = `${status.target_temp_hotend}°C`;
-            document.getElementById('bed-temp').textContent = `${status.current_temp_bed}°C`;
-            document.getElementById('bed-target').textContent = `${status.target_temp_bed}°C`;
-            document.getElementById('print-progress').textContent = `${status.print_progress}%`;
+            document.getElementById('hotend-temp').textContent = showValue(status.current_temp_hotend, '°C');
+            document.getElementById('hotend-target').textContent = showValue(status.target_temp_hotend, '°C');
+            document.getElementById('bed-temp').textContent = showValue(status.current_temp_bed, '°C');
+            document.getElementById('bed-target').textContent = showValue(status.target_temp_bed, '°C');
+            document.getElementById('print-progress').textContent = showValue(status.print_progress, '%');
             document.getElementById('current-layer').textContent = status.current_layer;
             document.getElementById('pos-x').textContent = status.position[0].toFixed(1);
             document.getElementById('pos-y').textContent = status.position[1].toFixed(1);
@@ -529,7 +561,7 @@
 
         async function loadConfiguration() {
             try {
-                const response = await fetch('/api/config');
+                const response = await apiFetch('/api/config');
                 const data = await response.json();
                 
                 if (data.success) {
@@ -561,7 +593,7 @@
             const config = gatherConfigFromForm();
             
             try {
-                const response = await fetch('/api/config', {
+                const response = await apiFetch('/api/config', {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(config)
@@ -621,7 +653,7 @@
         async function resetConfiguration() {
             if (confirm('Are you sure you want to reset to default configuration?')) {
                 try {
-                    const response = await fetch('/api/config/reset', { method: 'POST' });
+                    const response = await apiFetch('/api/config/reset', { method: 'POST' });
                     const data = await response.json();
                     
                     if (data.success) {
@@ -660,12 +692,12 @@
             list.innerHTML = objects.map(obj => `
                 <div class="object-item">
                     <div>
-                        <strong>${obj.name}</strong><br>
+                        <strong>${escapeHtml(obj.name)}</strong><br>
                         <small>Progress: ${obj.progress.toFixed(1)}%</small>
                     </div>
                     <div>
-                        <span class="object-status status-${obj.status.toLowerCase()}">${obj.status}</span>
-                        <button class="button" onclick="toggleObject('${obj.name}', '${obj.status}')">
+                        <span class="object-status status-${escapeHtml(obj.status.toLowerCase())}">${escapeHtml(obj.status)}</span>
+                        <button class="button" data-name="${escapeHtml(obj.name)}" data-status="${escapeHtml(obj.status)}" onclick="toggleObject(this.dataset.name, this.dataset.status)">
                             ${obj.status === 'Excluded' ? 'Include' : 'Exclude'}
                         </button>
                     </div>
@@ -677,7 +709,7 @@
             const action = currentStatus === 'Excluded' ? 'include' : 'exclude';
             
             try {
-                const response = await fetch(`/api/objects/${action}`, {
+                const response = await apiFetch(`/api/objects/${action}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ object_name: objectName })
@@ -709,7 +741,7 @@
                         <div class="alert alert-info">
                             <h3>Recovery Data Available</h3>
                             <p>Print was interrupted at ${progress.toFixed(1)}% completion</p>
-                            <p>Last saved: ${new Date(timestamp).toLocaleString()}</p>
+                            <p>Last saved ${(timestamp / 60000).toFixed(1)} minutes after that session's start</p>
                             <button class="button success" onclick="resumePrint()">Resume Print</button>
                         </div>
                     `;
@@ -724,7 +756,7 @@
         async function resumePrint() {
             if (confirm('Resume print from last saved position?')) {
                 try {
-                    const response = await fetch('/api/recovery/resume', { method: 'POST' });
+                    const response = await apiFetch('/api/recovery/resume', { method: 'POST' });
                     const data = await response.json();
                     
                     if (data.success) {
@@ -742,7 +774,11 @@
             if (confirm('EMERGENCY STOP - Are you sure?')) {
                 try {
                     const response = await fetch('/api/emergency_stop', { method: 'POST' });
-                    showAlert('Emergency stop activated', 'info');
+                    if (response.ok) {
+                        showAlert('Emergency stop activated. Reset the board to clear it.', 'info');
+                    } else {
+                        showAlert(`EMERGENCY STOP FAILED (HTTP ${response.status})`, 'danger');
+                    }
                 } catch (error) {
                     showAlert('Failed to send emergency stop', 'danger');
                 }
@@ -773,7 +809,7 @@
             }
             
             try {
-                const response = await fetch('/api/config/save', {
+                const response = await apiFetch('/api/config/save', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ profile_name: profileName })
@@ -795,7 +831,7 @@
 
         async function loadProfiles() {
             try {
-                const response = await fetch('/api/profiles');
+                const response = await apiFetch('/api/profiles');
                 const data = await response.json();
                 
                 const profilesList = document.getElementById('profiles-list');
@@ -803,10 +839,10 @@
                 if (data.success && data.data.length > 0) {
                     profilesList.innerHTML = data.data.map(profile => `
                         <div class="object-item">
-                            <span>${profile}</span>
+                            <span>${escapeHtml(profile)}</span>
                             <div>
-                                <button class="button" onclick="loadProfile('${profile}')">Load</button>
-                                <button class="button danger" onclick="deleteProfile('${profile}')">Delete</button>
+                                <button class="button" data-name="${escapeHtml(profile)}" onclick="loadProfile(this.dataset.name)">Load</button>
+                                <button class="button danger" data-name="${escapeHtml(profile)}" onclick="deleteProfile(this.dataset.name)">Delete</button>
                             </div>
                         </div>
                     `).join('');
@@ -820,7 +856,7 @@
 
         async function loadProfile(profileName) {
             try {
-                const response = await fetch('/api/config/load', {
+                const response = await apiFetch('/api/config/load', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ profile_name: profileName })
@@ -842,7 +878,7 @@
         async function deleteProfile(profileName) {
             if (confirm(`Delete profile "${profileName}"?`)) {
                 try {
-                    const response = await fetch(`/api/profiles/${profileName}`, {
+                    const response = await apiFetch(`/api/profiles/${encodeURIComponent(profileName)}`, {
                         method: 'DELETE'
                     });
                     

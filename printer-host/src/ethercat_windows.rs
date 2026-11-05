@@ -81,8 +81,9 @@ impl WindowsEtherCATMaster {
             cycle_time_us: 1000, // 1ms default
             is_running: false,
             error_count: 0,
-        last_cycle: None,
-    };
+            last_cycle: None,
+        }
+    }
 
     /// Discover available EtherCAT-capable network adapters on Windows
     /// Takes an optional npcap_path parameter to specify where to find Npcap libraries
@@ -192,7 +193,7 @@ impl WindowsEtherCATMaster {
             return Err(anyhow::anyhow!("No adapter connected"));
         }
 
-        info!("Starting Windows EtherCAT Master");
+        warn!("Windows EtherCAT master: slave scanning only. Cyclic exchange is simulated, so no outputs reach the drives.");
         self.is_running = true;
 
         // In a real implementation, this would:
@@ -237,7 +238,9 @@ impl WindowsEtherCATMaster {
                     Ok(devices) => {
                         for device in devices {
                             if device.name == adapter.name {
-                                match Capture::from_device(device) {
+                                // The read timeout matters: with none, next_packet would block
+                                // forever on a quiet network and this could never finish.
+                                match Capture::from_device(device).map(|cap| cap.timeout(100)) {
                                     Ok(cap) => {
                                         info!("Opened capture on EtherCAT adapter");
 
@@ -282,10 +285,7 @@ impl WindowsEtherCATMaster {
 
                                                                             // Parse the response to identify slaves
                                                                             if packet.data.len() > 28 {
-                                                                                let working_counter = u16::from_le_bytes([
-                                                                                    packet.data[packet.data.len()-2],
-                                                                                    packet.data[packet.data.len()-1]
-                                                                                ]);
+                                                                                let working_counter = Self::parse_working_counter(packet.data).unwrap_or(0);
 
                                                                                 info!("Working counter: {}", working_counter);
 
@@ -296,7 +296,7 @@ impl WindowsEtherCATMaster {
                                                                                     for i in 1..=working_counter {
                                                                                         let slave = EtherCATSlaveInfo {
                                                                                             station_address: i,
-                                                                                            vendor_id: 0x00000002, // Beckhoff default
+                                                                                            vendor_id: 0x00000000, // Not read yet
                                                                                             product_code: 0x00000000, // To be read later
                                                                                             revision_number: 0x00000000,
                                                                                             serial_number: 0x00000000,
@@ -383,18 +383,10 @@ impl WindowsEtherCATMaster {
     /// Configure a slave to operational state
     pub async fn configure_slave(&mut self, station_address: u16) -> Result<(), anyhow::Error> {
         if let Some(slave) = self.slaves.get_mut(&station_address) {
-            info!("Configuring slave {} to operational state", station_address);
-
-            // In a real implementation, this would:
-            // 1. Set slave to PREOP state
-            // 2. Configure PDO mapping
-            // 3. Set slave to SAFEOP state
-            // 4. Set slave to OP state
-
-            slave.state = EtherCATSlaveState::Op;
-            slave.last_seen = Some(Instant::now());
-
-            Ok(())
+            // This would need to take the slave through PREOP (with PDO mapping) and SAFEOP
+            // to OP. Nothing does yet, so it must not report that the slave is operational.
+            slave.state = EtherCATSlaveState::Init;
+            Err(anyhow::anyhow!("Taking slave {} to operational state is not implemented on Windows", station_address))
         } else {
             Err(anyhow::anyhow!("Slave {} not found", station_address))
         }
@@ -472,8 +464,13 @@ impl WindowsEtherCATMaster {
         self.is_running
     }
 
-    /// Create an EtherCAT frame for slave count scanning
-    fn create_slave_count_frame(mac_address: &[u8; 6]) -> Vec<u8> {
+    /// Build one EtherCAT frame holding a single read datagram.
+    ///
+    /// The frame header is 16 bits, little-endian: 11 bits of length and a 4-bit type at the top.
+    /// The datagram is command, index, 16-bit position, 16-bit register, 16-bit length, 16-bit
+    /// IRQ (10 bytes), then the data and a 16-bit working counter.
+    pub fn build_read_frame(mac_address: &[u8; 6], command: u8, register: u16, data_length: u16) -> Vec<u8> {
+        const ETHERCAT_COMMAND_TYPE: u16 = 1;
         let mut frame = Vec::new();
 
         // Ethernet header
@@ -482,72 +479,56 @@ impl WindowsEtherCATMaster {
         frame.extend_from_slice(&[0x88, 0xA4]); // EtherType (EtherCAT)
 
         // EtherCAT header
-        frame.extend_from_slice(&[0x10, 0x01]); // Length (16 bytes) + Type (1)
+        let payload_length = 10 + data_length + 2;
+        frame.extend_from_slice(&((ETHERCAT_COMMAND_TYPE << 12) | payload_length).to_le_bytes());
 
-        // EtherCAT datagram - APRD (Auto-increment Physical Read) for slave count
-        frame.extend_from_slice(&[
-            0x01,        // Command: APRD
-            0x00,        // Index
-            0x00, 0x00,  // Auto-increment address (starts at 0)
-            0x02, 0x00,  // Length (2 bytes)
-            0x00, 0x00,  // Reserved/IRQ
-            0x00, 0x00,  // Data (2 bytes for slave count)
-            0x00, 0x00,  // Working counter
-        ]);
+        // Datagram
+        frame.extend_from_slice(&[command, 0x00]); // Command, index
+        frame.extend_from_slice(&0u16.to_le_bytes()); // Position: first slave
+        frame.extend_from_slice(&register.to_le_bytes()); // Register
+        frame.extend_from_slice(&data_length.to_le_bytes());
+        frame.extend_from_slice(&0u16.to_le_bytes()); // IRQ
+        frame.resize(frame.len() + data_length as usize, 0); // Data
+        frame.extend_from_slice(&0u16.to_le_bytes()); // Working counter
 
+        // Ethernet's minimum frame size, excluding the CRC the adapter adds
+        if frame.len() < 60 {
+            frame.resize(60, 0);
+        }
         frame
+    }
+
+    /// The working counter of a received frame. It sits where the header's length says the
+    /// datagram ends, not at the end of the packet, since short frames arrive padded.
+    pub fn parse_working_counter(packet: &[u8]) -> Option<u16> {
+        const HEADERS: usize = 14 + 2;
+        if packet.len() < HEADERS || packet[12] != 0x88 || packet[13] != 0xA4 {
+            return None;
+        }
+        let payload_length = (u16::from_le_bytes([packet[14], packet[15]]) & 0x07FF) as usize;
+        let end = HEADERS + payload_length;
+        if payload_length < 2 || end > packet.len() {
+            return None;
+        }
+        Some(u16::from_le_bytes([packet[end - 2], packet[end - 1]]))
+    }
+
+    /// Create an EtherCAT frame for slave count scanning
+    fn create_slave_count_frame(mac_address: &[u8; 6]) -> Vec<u8> {
+        const APRD: u8 = 0x01;
+        Self::build_read_frame(mac_address, APRD, 0x0000, 2)
     }
 
     /// Create an EtherCAT frame for device type scanning
     fn create_device_type_frame(mac_address: &[u8; 6]) -> Vec<u8> {
-        let mut frame = Vec::new();
-
-        // Ethernet header
-        frame.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]); // Destination MAC (broadcast)
-        frame.extend_from_slice(mac_address); // Source MAC
-        frame.extend_from_slice(&[0x88, 0xA4]); // EtherType (EtherCAT)
-
-        // EtherCAT header
-        frame.extend_from_slice(&[0x14, 0x01]); // Length (20 bytes) + Type (1)
-
-        // EtherCAT datagram - APRD for reading device type register (0x0000)
-        frame.extend_from_slice(&[
-            0x01,        // Command: APRD
-            0x00,        // Index
-            0x00, 0x00,  // Auto-increment address (starts at 0)
-            0x04, 0x00,  // Length (4 bytes)
-            0x00, 0x00,  // Reserved/IRQ
-            0x00, 0x00, 0x00, 0x00,  // Data (4 bytes for device type)
-            0x00, 0x00,  // Working counter
-        ]);
-
-        frame
+        const APRD: u8 = 0x01;
+        Self::build_read_frame(mac_address, APRD, 0x0000, 4)
     }
 
     /// Create a broadcast EtherCAT frame for general scanning
     fn create_broadcast_frame(mac_address: &[u8; 6]) -> Vec<u8> {
-        let mut frame = Vec::new();
-
-        // Ethernet header
-        frame.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]); // Destination MAC (broadcast)
-        frame.extend_from_slice(mac_address); // Source MAC
-        frame.extend_from_slice(&[0x88, 0xA4]); // EtherType (EtherCAT)
-
-        // EtherCAT header
-        frame.extend_from_slice(&[0x18, 0x01]); // Length (24 bytes) + Type (1)
-
-        // EtherCAT datagram - BRD (Broadcast Read)
-        frame.extend_from_slice(&[
-            0x07,        // Command: BRD (Broadcast Read)
-            0x00,        // Index
-            0x00, 0x01,  // Address (0x0100 - typically device type register)
-            0x08, 0x00,  // Length (8 bytes)
-            0x00, 0x00,  // Reserved/IRQ
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // Data (8 bytes)
-            0x00, 0x00,  // Working counter
-        ]);
-
-        frame
+        const BRD: u8 = 0x07;
+        Self::build_read_frame(mac_address, BRD, 0x0000, 8)
     }
 
     /// Get current cycle time

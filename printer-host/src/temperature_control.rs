@@ -157,10 +157,12 @@ pub struct PIDConfig {
 impl Default for PIDConfig {
     fn default() -> Self {
         Self {
-            kp: 20.0,                     // Moderate proportional gain
-            ki: 2.0,                      // Integral gain
-            kd: 0.5,                      // Small derivative gain
-            integral_limit: 100.0,        // Integral windup limit
+            // Output is a 0..1 duty, so these are the usual 0..255 hotend gains / 255.
+            // (A kp of 20 here would saturate at 0.05C of error and act as bang-bang.)
+            kp: 0.087,                    // Proportional gain (duty per degC)
+            ki: 0.0042,                   // Integral gain
+            kd: 0.45,                     // Derivative gain
+            integral_limit: 100.0,        // Integral windup limit (degC*s)
             derivative_filter: 0.1,       // Derivative smoothing
             output_limit: 1.0,            // 100% output allowed
         }
@@ -174,6 +176,8 @@ pub struct PIDState {
     pub last_derivative: f64,
     pub last_output: f64,
     pub last_update: Instant,
+    /// False until the first sample, so the derivative has no start-up kick.
+    pub initialized: bool,
 }
 
 impl Default for PIDState {
@@ -184,7 +188,50 @@ impl Default for PIDState {
             last_derivative: 0.0,
             last_output: 0.0,
             last_update: Instant::now(),
+            initialized: false,
         }
+    }
+}
+
+/// Thermal runaway protection settings for one heater.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThermalRunawayConfig {
+    pub enabled: bool,
+    /// While heating, the temperature must rise by `watch_rise` within `watch_period`.
+    pub watch_period: Duration,
+    pub watch_rise: f64,
+    /// After reaching target, it may not stay more than `hold_hysteresis` below
+    /// target for longer than `hold_period`.
+    pub hold_period: Duration,
+    pub hold_hysteresis: f64,
+}
+
+impl ThermalRunawayConfig {
+    /// Slow zones (bed, chamber) get a longer window than a hotend.
+    pub fn for_zone(zone: &TemperatureZone) -> Self {
+        let slow = matches!(zone, TemperatureZone::Bed | TemperatureZone::Chamber);
+        Self {
+            enabled: true,
+            watch_period: Duration::from_secs(if slow { 120 } else { 40 }),
+            watch_rise: 2.0,
+            hold_period: Duration::from_secs(if slow { 180 } else { 45 }),
+            hold_hysteresis: if slow { 5.0 } else { 15.0 },
+        }
+    }
+}
+
+/// Runtime state of the runaway monitor.
+#[derive(Debug, Clone)]
+struct RunawayMonitor {
+    watch_start: Instant,
+    watch_start_temp: f64,
+    reached_target: bool,
+    below_since: Option<Instant>,
+}
+
+impl RunawayMonitor {
+    fn new(temp: f64) -> Self {
+        Self { watch_start: Instant::now(), watch_start_temp: temp, reached_target: false, below_since: None }
     }
 }
 
@@ -229,7 +276,9 @@ pub struct TemperatureController {
     pub pid_state: PIDState,
     pub enabled: bool,
     pub safety_shutdown: bool,
-    
+    pub runaway_config: ThermalRunawayConfig,
+    runaway: Option<RunawayMonitor>,
+
     // History for modeling and display
     pub temperature_history: VecDeque<TemperatureReading>,
     pub setpoint_history: VecDeque<(Instant, f64)>,
@@ -248,8 +297,11 @@ impl TemperatureController {
         sensor_config: SensorConfig,
         heater_config: Option<HeaterConfig>,
     ) -> Self {
+        let runaway_config = ThermalRunawayConfig::for_zone(&zone);
         Self {
             zone,
+            runaway_config,
+            runaway: None,
             sensor_config,
             heater_config,
             pid_config: PIDConfig::default(),
@@ -270,8 +322,20 @@ impl TemperatureController {
     }
     
     pub fn update_reading(&mut self, raw_value: u16) -> Result<(), String> {
-        let temperature = self.raw_to_temperature(raw_value)?;
         let now = Instant::now();
+        let temperature = match self.raw_to_temperature(raw_value) {
+            Ok(t) => t,
+            Err(e) => {
+                // Open/shorted sensor. The old temperature must not stay trusted, or the
+                // heater would keep running on a stale reading.
+                self.error_count += 1;
+                self.current_reading.valid = false;
+                self.current_reading.raw_value = raw_value;
+                self.current_reading.timestamp = now;
+                self.trip_safety(format!("Sensor fault: {}", e));
+                return Err(e);
+            }
+        };
         
         // Apply low-pass filter to reduce noise
         let filtered_temp = if self.temperature_history.is_empty() {
@@ -289,12 +353,12 @@ impl TemperatureController {
             self.error_count += 1;
             if temperature > self.sensor_config.max_temp {
                 self.over_temp_events += 1;
-                self.safety_shutdown = true;
-                self.last_error = Some(format!("Over temperature: {:.1}°C", temperature));
+                self.trip_safety(format!("Over temperature: {:.1}°C", temperature));
             }
+            // Implausibly cold almost always means a disconnected sensor.
             if temperature < self.sensor_config.min_temp {
                 self.under_temp_events += 1;
-                self.last_error = Some(format!("Under temperature: {:.1}°C", temperature));
+                self.trip_safety(format!("Under temperature: {:.1}°C", temperature));
             }
         }
         
@@ -315,7 +379,23 @@ impl TemperatureController {
         Ok(())
     }
     
+    /// Latch the safety shutdown. Only `clear_safety_shutdown` releases it.
+    fn trip_safety(&mut self, reason: String) {
+        self.safety_shutdown = true;
+        self.enabled = false;
+        self.pid_state.last_output = 0.0;
+        self.last_error = Some(reason);
+    }
+
+    /// Set the target. Non-finite values turn the heater off, and targets are limited
+    /// to 15C below the sensor's shutdown limit, so a normal overshoot cannot trip it.
     pub fn set_target_temperature(&mut self, target: f64) {
+        let target = if target.is_finite() {
+            target.clamp(0.0, (self.sensor_config.max_temp - 15.0).max(0.0))
+        } else {
+            0.0
+        };
+        let previous = self.target_temperature;
         self.target_temperature = target;
         let now = Instant::now();
         
@@ -326,8 +406,11 @@ impl TemperatureController {
         }
         
         // Reset PID state when target changes significantly
-        if (target - self.target_temperature).abs() > 10.0 {
+        if (target - previous).abs() > 10.0 {
             self.reset_pid();
+        }
+        if target != previous {
+            self.runaway = None; // Restart the runaway watch for the new target
         }
     }
     
@@ -336,28 +419,48 @@ impl TemperatureController {
             return 0.0;
         }
         
+        // Sensor-only zones have nothing to drive.
+        let Some(heater) = self.heater_config.as_ref() else {
+            return 0.0;
+        };
+        let safety_timeout = heater.safety_timeout;
+        let max_duty = heater.max_pwm_duty;
+
         let now = Instant::now();
+
+        // Never heat on a bad or stale reading.
+        if !self.current_reading.valid {
+            self.pid_state.last_output = 0.0;
+            return 0.0;
+        }
+        if now.duration_since(self.current_reading.timestamp) > safety_timeout {
+            self.trip_safety("Temperature reading timed out".to_string());
+            return 0.0;
+        }
+
         let dt = now.duration_since(self.pid_state.last_update).as_secs_f64();
-        
-        if dt <= 0.0 || !self.current_reading.valid {
+        if dt <= 0.0 {
             return self.pid_state.last_output;
         }
-        
+
         let current_temp = self.current_reading.filtered_temperature;
+        if self.check_thermal_runaway(now, current_temp) {
+            return 0.0;
+        }
         let error = self.target_temperature - current_temp;
-        
-        // PID calculation
-        let pid_output = self.calculate_pid(error, dt);
-        
+        let output_limit = self.pid_config.output_limit.min(max_duty).max(0.0);
+
         // Feedforward calculation
         let feedforward_output = self.calculate_feedforward();
-        
-        // Combine PID and feedforward
-        let total_output = pid_output + feedforward_output;
-        
-        // Apply output limits
-        let limited_output = total_output.clamp(0.0, self.pid_config.output_limit);
-        
+
+        // PID + feedforward, with limits and anti-windup
+        let total_output = self.calculate_pid(error, dt, feedforward_output, output_limit);
+        let limited_output = if self.target_temperature <= 0.0 {
+            0.0 // A zero target always means off
+        } else {
+            total_output.clamp(0.0, output_limit)
+        };
+
         self.pid_state.last_output = limited_output;
         self.pid_state.last_update = now;
         
@@ -370,28 +473,77 @@ impl TemperatureController {
         limited_output
     }
     
-    fn calculate_pid(&mut self, error: f64, dt: f64) -> f64 {
+    /// Returns true (and latches the shutdown) if the heater is not behaving.
+    fn check_thermal_runaway(&mut self, now: Instant, temp: f64) -> bool {
+        let config = self.runaway_config.clone();
+        if !config.enabled || self.target_temperature <= 0.0 {
+            self.runaway = None;
+            return false;
+        }
+        let target = self.target_temperature;
+        let monitor = self.runaway.get_or_insert_with(|| RunawayMonitor::new(temp));
+        let mut fault = None;
+
+        if !monitor.reached_target {
+            if temp >= target - 1.0 {
+                monitor.reached_target = true;
+            } else if temp >= monitor.watch_start_temp + config.watch_rise {
+                monitor.watch_start = now;
+                monitor.watch_start_temp = temp;
+            } else if now.duration_since(monitor.watch_start) > config.watch_period {
+                fault = Some(format!(
+                    "Heating failed: under {:.1}°C rise in {}s (at {:.1}°C)",
+                    config.watch_rise, config.watch_period.as_secs(), temp
+                ));
+            }
+        } else if temp < target - config.hold_hysteresis {
+            let since = *monitor.below_since.get_or_insert(now);
+            if now.duration_since(since) > config.hold_period {
+                fault = Some(format!("Thermal runaway: {:.1}°C, target {:.1}°C", temp, target));
+            }
+        } else {
+            monitor.below_since = None;
+        }
+
+        if let Some(reason) = fault {
+            self.trip_safety(reason);
+            return true;
+        }
+        false
+    }
+
+    fn calculate_pid(&mut self, error: f64, dt: f64, feedforward: f64, output_limit: f64) -> f64 {
         // Proportional term
         let p_term = self.pid_config.kp * error;
-        
-        // Integral term with anti-windup
-        self.pid_state.integral += error * dt;
-        if self.pid_state.integral > self.pid_config.integral_limit {
-            self.pid_state.integral = self.pid_config.integral_limit;
-        } else if self.pid_state.integral < -self.pid_config.integral_limit {
-            self.pid_state.integral = -self.pid_config.integral_limit;
-        }
-        let i_term = self.pid_config.ki * self.pid_state.integral;
-        
-        // Derivative term with filtering
-        let derivative = (error - self.pid_state.last_error) / dt;
-        self.pid_state.last_derivative = self.pid_state.last_derivative + 
+
+        // Derivative term with filtering (nothing to compare against on the first sample)
+        let derivative = if self.pid_state.initialized {
+            (error - self.pid_state.last_error) / dt
+        } else {
+            0.0
+        };
+        self.pid_state.initialized = true;
+        self.pid_state.last_derivative = self.pid_state.last_derivative +
             self.pid_config.derivative_filter * (derivative - self.pid_state.last_derivative);
         let d_term = self.pid_config.kd * self.pid_state.last_derivative;
-        
         self.pid_state.last_error = error;
-        
-        p_term + i_term + d_term
+
+        // Integral term. Anti-windup: stop integrating while saturated in the same
+        // direction, and never let it hold the output on by itself.
+        let ki = self.pid_config.ki;
+        let unclamped = p_term + ki * (self.pid_state.integral + error * dt) + d_term + feedforward;
+        let saturating = (unclamped > output_limit && error > 0.0) || (unclamped < 0.0 && error < 0.0);
+        if !saturating {
+            self.pid_state.integral += error * dt;
+        }
+        let mut limit = self.pid_config.integral_limit.abs();
+        if ki.abs() > f64::EPSILON {
+            limit = limit.min(output_limit / ki.abs());
+        }
+        self.pid_state.integral = self.pid_state.integral.clamp(-limit, limit);
+        let i_term = ki * self.pid_state.integral;
+
+        p_term + i_term + d_term + feedforward
     }
     
     fn calculate_feedforward(&self) -> f64 {
@@ -440,20 +592,20 @@ impl TemperatureController {
     }
     
     fn raw_to_temperature(&self, raw_value: u16) -> Result<f64, String> {
+        // A reading at either rail means a broken circuit on every sensor type.
+        if raw_value == 0 {
+            return Err("Invalid ADC reading: 0".to_string());
+        }
+        if raw_value >= 4095 {
+            return Err("ADC saturated".to_string());
+        }
+
         match self.sensor_config.sensor_type {
             SensorType::Thermistor => {
                 // Steinhart-Hart equation for thermistor
-                if raw_value == 0 {
-                    return Err("Invalid ADC reading: 0".to_string());
-                }
-                
                 let adc_max = 4095.0; // Assuming 12-bit ADC
                 let voltage_ratio = raw_value as f64 / adc_max;
-                
-                if voltage_ratio >= 1.0 {
-                    return Err("ADC saturated".to_string());
-                }
-                
+
                 // Calculate resistance
                 let resistance = self.sensor_config.series_resistor * voltage_ratio / (1.0 - voltage_ratio);
                 
@@ -510,6 +662,7 @@ impl TemperatureController {
         if !self.safety_shutdown {
             self.enabled = true;
             self.reset_pid();
+            self.runaway = None;
         }
     }
     
@@ -681,10 +834,12 @@ impl TemperatureManager {
         
         // Disable all controllers and set outputs to zero
         for controller in self.controllers.values_mut() {
+            controller.set_target_temperature(0.0);
             controller.disable();
             controller.safety_shutdown = true;
+            controller.last_error = Some("Emergency stop".to_string());
         }
-        
+
         println!("Temperature emergency stop activated!");
     }
     
@@ -699,23 +854,25 @@ impl TemperatureManager {
         println!("Temperature emergency stop cleared");
     }
     
+    /// Compute heater duties. Returns an empty map only when it is too soon for an
+    /// update (keep the last duties). When stopped or disabled, every zone gets an
+    /// explicit 0.0 so the caller can always drive the outputs off.
     pub fn process_update(&mut self) -> Result<HashMap<TemperatureZone, f64>, String> {
         let now = Instant::now();
         let dt = now.duration_since(self.last_update);
-        let expected_interval = Duration::from_secs_f64(1.0 / self.update_rate_hz as f64);
-        
-        if dt >= expected_interval {
+        let expected_interval = Duration::from_secs_f64(1.0 / self.update_rate_hz.max(1) as f64);
+
+        // A stop must take effect now, not at the next update tick.
+        if self.emergency_stop || !self.global_enable || dt >= expected_interval {
             self.last_update = now;
-            
+
             let mut outputs = HashMap::new();
-            
-            if self.global_enable && !self.emergency_stop {
-                for (zone, controller) in self.controllers.iter_mut() {
-                    let output = controller.calculate_output();
-                    outputs.insert(zone.clone(), output);
-                }
+            let run = self.global_enable && !self.emergency_stop;
+            for (zone, controller) in self.controllers.iter_mut() {
+                let output = if run { controller.calculate_output() } else { 0.0 };
+                outputs.insert(zone.clone(), output);
             }
-            
+
             Ok(outputs)
         } else {
             Ok(HashMap::new()) // No update needed yet
@@ -853,23 +1010,21 @@ impl TemperatureSensorInterface for MockTemperatureSensor {
         if !self.connected {
             return Err("Sensor disconnected".to_string());
         }
-        
+
         use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let noise: f64 = rng.gen_range(-self.noise_amplitude..self.noise_amplitude);
-        let noisy_temp = self.current_temp + noise;
-        
-        // Convert temperature to ADC value (assuming thermistor)
-        // This is a rough approximation for testing
-        let adc_value = if noisy_temp <= 0.0 {
-            0
-        } else if noisy_temp >= 300.0 {
-            4095
+        let noise = if self.noise_amplitude > 0.0 {
+            rand::thread_rng().gen_range(-self.noise_amplitude..self.noise_amplitude)
         } else {
-            ((noisy_temp / 300.0) * 4095.0) as u16
+            0.0
         };
-        
-        Ok(adc_value)
+        let noisy_temp = self.current_temp + noise;
+
+        // Exact inverse of the default thermistor conversion in raw_to_temperature
+        let config = SensorConfig::default();
+        let inv_t0 = 1.0 / (config.t0 + 273.15);
+        let resistance = config.r25 * (config.beta * (1.0 / (noisy_temp + 273.15) - inv_t0)).exp();
+        let ratio = resistance / (resistance + config.series_resistor);
+        Ok((ratio * 4095.0).round().clamp(0.0, 4095.0) as u16)
     }
     
     fn is_connected(&self) -> bool {

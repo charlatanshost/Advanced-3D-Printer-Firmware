@@ -120,6 +120,47 @@ static PDU_STORAGE: PduStorage<MAX_FRAMES, MAX_PDU_DATA> = PduStorage::new();
 
 
 
+/// Encode positions for Modbus: a signed 32-bit count of micrometres/millidegrees per axis,
+/// high word first, in two registers each. A u16 of 1/1000 units cannot hold a position
+/// past 65.5mm or below zero, so bad values are refused rather than clipped.
+fn encode_modbus_positions(positions: &[f32; 5]) -> Result<[u16; 10], String> {
+    let mut registers = [0u16; 10];
+    for (i, &pos) in positions.iter().enumerate() {
+        let scaled = (pos as f64) * 1000.0;
+        if !scaled.is_finite() || scaled < i32::MIN as f64 || scaled > i32::MAX as f64 {
+            return Err(format!("Axis {} position {} cannot be encoded", i, pos));
+        }
+        let bits = scaled.round() as i32 as u32;
+        registers[i * 2] = (bits >> 16) as u16;
+        registers[i * 2 + 1] = (bits & 0xFFFF) as u16;
+    }
+    Ok(registers)
+}
+
+#[cfg(test)]
+mod modbus_encoding_tests {
+    use super::encode_modbus_positions;
+
+    fn decode(high: u16, low: u16) -> f32 {
+        (((high as u32) << 16 | low as u32) as i32) as f32 / 1000.0
+    }
+
+    #[test]
+    fn positions_survive_the_whole_range() {
+        let registers = encode_modbus_positions(&[100.0, 250.5, -12.25, 0.0, 359.0]).unwrap();
+        assert_eq!(decode(registers[0], registers[1]), 100.0, "above the old 65.5mm clip");
+        assert_eq!(decode(registers[2], registers[3]), 250.5);
+        assert_eq!(decode(registers[4], registers[5]), -12.25, "negative");
+        assert_eq!(decode(registers[8], registers[9]), 359.0);
+    }
+
+    #[test]
+    fn unencodable_positions_are_refused() {
+        assert!(encode_modbus_positions(&[f32::NAN, 0.0, 0.0, 0.0, 0.0]).is_err());
+        assert!(encode_modbus_positions(&[0.0, 1e9, 0.0, 0.0, 0.0]).is_err());
+    }
+}
+
 // Static function for Modbus TCP communication
 async fn send_modbus_tcp_positions_static(
     ip: &str, 
@@ -127,7 +168,9 @@ async fn send_modbus_tcp_positions_static(
     device_id: u8, 
     positions: &[f32; 5]
 ) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
+    let scaled_positions = encode_modbus_positions(positions)?;
+
+    #[cfg(all(target_os = "linux", feature = "fieldbus"))]
     {
         use tokio_modbus::prelude::*;
         
@@ -138,12 +181,6 @@ async fn send_modbus_tcp_positions_static(
         
         let mut client = tcp::connect(socket_addr).await
             .map_err(|e| format!("Failed to connect to Modbus TCP server: {}", e))?;
-        
-        // Convert f32 positions to u16 register values (scaling factor of 1000 for precision)
-        let scaled_positions: Vec<u16> = positions
-            .iter()
-            .map(|&pos| (pos * 1000.0).max(0.0).min(u16::MAX as f32) as u16)
-            .collect();
         
         // Write position data to holding registers starting at address 0x0000
         client.write_multiple_registers(0x0000, &scaled_positions).await
@@ -166,14 +203,15 @@ async fn send_modbus_tcp_positions_static(
         Ok(())
     }
     
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", feature = "fieldbus")))]
     {
-        // Mock implementation for non-Linux platforms
-        println!("Modbus TCP (Mock): Simulating send to device {} at {}:{}", 
+        // Mock implementation when real Modbus support is not built
+        let _ = &scaled_positions;
+        println!("Modbus TCP (Mock): Simulating send to device {} at {}:{}",
                  device_id, ip, port);
         println!("  X: {:.3}mm, Y: {:.3}mm, Z: {:.3}mm, A: {:.3}°, B: {:.3}°", 
                  positions[0], positions[1], positions[2], positions[3], positions[4]);
-        println!("  (Real Modbus TCP communication requires Linux platform)");
+        println!("  (Real Modbus TCP needs Linux and the `fieldbus` feature)");
         
         // Simulate network delay
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1152,13 +1190,10 @@ impl TerminalSession {
         
         // Process command
         let response = match command.trim().to_uppercase().as_str() {
-            cmd if cmd.starts_with("G") => format!("Executing G-code: {}", command),
-            cmd if cmd.starts_with("M") => format!("Executing M-code: {}", command),
-            "G28" => "Homing all axes...".to_string(),
-            "M84" => "Disabling stepper motors".to_string(),
-            "M105" => "T:20.5/0 B:19.2/0".to_string(),  // Temperature report
-            "M114" => "X:10.00 Y:20.00 Z:5.00 E:0.00".to_string(), // Position report
-            "HELP" => "Available commands: G-codes, M-codes, HELP, CLEAR".to_string(),
+            // There is no G-code backend behind this terminal yet. Say so, rather than
+            // reporting made-up temperatures and positions as if a printer had answered.
+            cmd if cmd.starts_with('G') || cmd.starts_with('M') => format!("NOT SENT (terminal has no printer connection): {}", command),
+            "HELP" => "This terminal is not connected to a printer. Local commands: HELP, CLEAR".to_string(),
             "CLEAR" => {
                 self.history.clear();
                 "Terminal cleared".to_string()
@@ -1387,6 +1422,9 @@ struct MyApp {
     printer_state: PrinterState,
     printer_settings: PrinterSettings,
     emergency_stop_triggered: bool,
+    last_modbus_positions: Option<[f32; 5]>,
+    modbus_send_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    out_of_reach_reported: bool,
     // Bed mesh system
     current_bed_mesh: Option<BedMesh>,
     saved_bed_meshes: Vec<BedMesh>,
@@ -1804,6 +1842,9 @@ impl MyApp {
                 rotary_axis_acceleration: [1800.0, 1800.0], // degrees/sec²
             },
             emergency_stop_triggered: false,
+            last_modbus_positions: None,
+            modbus_send_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            out_of_reach_reported: false,
             // Initialize bed mesh system
             current_bed_mesh: Some(BedMesh::new("default".to_string(), 7, 7, 0.0, 200.0, 0.0, 200.0)),
             saved_bed_meshes: vec![
@@ -2164,19 +2205,32 @@ impl MyApp {
         self.test_execution_state = ExecutionState::Idle;
         self.is_executing = false;
         self.is_test_executing = false;
-        
-        // Reset positions to safe state
-        self.x = 0.0;
-        self.y = 0.0;
-        self.z = 10.0; // Lift Z slightly for safety
-        
-        println!("🚨 EMERGENCY STOP ACTIVATED! All motion stopped.");
+
+        // Heaters off and latched. Reset of this button does not re-enable them.
+        self.temperature_manager.emergency_stop();
+
+        // Toolheads. Wait for the lock here: this stop must not be skipped because
+        // something else happens to be using the CAN manager.
+        let mut can_manager = match self.can_manager.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for uuid in can_manager.get_toolheads().keys().cloned().collect::<Vec<_>>() {
+            if let Err(e) = can_manager.emergency_stop(uuid) {
+                eprintln!("🚨 EMERGENCY STOP FAILED for toolhead 0x{:06X}: {}", uuid, e);
+            }
+        }
+        drop(can_manager);
+
+        // Keep x/y/z as they are: positions are streamed, so changing them here would
+        // command a move as soon as the stop is reset. Streaming stops while this is set.
+        println!("🚨 EMERGENCY STOP ACTIVATED! Motion commands stopped, heaters off.");
     }
-    
+
     fn reset_emergency_stop(&mut self) {
         self.emergency_stop_triggered = false;
         self.printer_state = PrinterState::Idle;
-        println!("Emergency stop reset - printer ready");
+        println!("Emergency stop reset. Heaters stay off until cleared in the Temperature tab. Re-home before moving.");
     }
     
     fn start_probe_sequence(&mut self) {
@@ -2637,7 +2691,7 @@ impl eframe::App for MyApp {
                 FRAME_COUNTER += 1;
                 if FRAME_COUNTER % 30 == 0 {
                     let gcode_lines: Vec<&str> = self.gcode.lines().collect();
-                    if self.current_line < gcode_lines.len() - 1 {
+                    if self.current_line + 1 < gcode_lines.len() {
                         self.current_line += 1;
                         ctx.request_repaint();
                     } else {
@@ -2655,7 +2709,7 @@ impl eframe::App for MyApp {
                 TEST_FRAME_COUNTER += 1;
                 if TEST_FRAME_COUNTER % 6 == 0 {
                     let gcode_lines: Vec<&str> = self.gcode.lines().collect();
-                    if self.test_current_line < gcode_lines.len() - 1 {
+                    if self.test_current_line + 1 < gcode_lines.len() {
                         self.test_current_line += 1;
                         ctx.request_repaint();
                     } else {
@@ -2927,7 +2981,13 @@ impl eframe::App for MyApp {
         });
 
         // Don't send positions if emergency stop is active
-        if !self.emergency_stop_triggered {
+        let reachable = self.kinematics.is_reachable(self.x, self.y, self.z, self.a, self.b);
+        if !reachable && !self.out_of_reach_reported {
+            eprintln!("Position X{} Y{} Z{} is out of reach: holding the last sent position", self.x, self.y, self.z);
+        }
+        self.out_of_reach_reported = !reachable;
+
+        if !self.emergency_stop_triggered && reachable {
             // Apply input shaping if enabled before converting to motor positions
             let (shaped_x, shaped_y, shaped_z, shaped_a, shaped_b) = if self.input_shaping_enabled {
                 let mut shaped_positions = (self.x, self.y, self.z, self.a, self.b);
@@ -2962,12 +3022,11 @@ impl eframe::App for MyApp {
             
             match self.communication_mode {
             CommunicationMode::EtherCAT => {
-                let tx = self.ethercat_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = tx.send(positions).await {
-                        eprintln!("Failed to send positions to EtherCAT task: {}", e);
-                    }
-                });
+                // Queue in order from this thread. One spawned task per frame could
+                // deliver positions out of order. A full queue just skips this frame.
+                if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) = self.ethercat_tx.try_send(positions) {
+                    eprintln!("Failed to send positions: EtherCAT task has stopped");
+                }
             }
             CommunicationMode::Serial => {
                 // Placeholder for future serial implementation
@@ -2984,17 +3043,20 @@ impl eframe::App for MyApp {
                 let ip = self.modbus_tcp_ip.clone();
                 let port = self.modbus_tcp_port;
                 let device_id = self.modbus_device_id;
-                tokio::spawn(async move {
-                    match send_modbus_tcp_positions_static(&ip, port, device_id, &positions).await {
-                        Ok(()) => {
-                            println!("Modbus TCP positions sent successfully to {}:{}, Device ID: {}", 
-                                ip, port, device_id);
-                        }
-                        Err(e) => {
+                // Send on change, one at a time, so writes cannot overtake each other.
+                let busy = &self.modbus_send_in_flight;
+                if self.last_modbus_positions != Some(positions)
+                    && !busy.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.last_modbus_positions = Some(positions);
+                    let busy = busy.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = send_modbus_tcp_positions_static(&ip, port, device_id, &positions).await {
                             eprintln!("Modbus TCP communication error: {}", e);
                         }
-                    }
-                });
+                        busy.store(false, std::sync::atomic::Ordering::SeqCst);
+                    });
+                }
             }
             CommunicationMode::ModbusRTU => {
                 // Placeholder for Modbus RTU implementation
@@ -3768,7 +3830,7 @@ impl eframe::App for MyApp {
                                         if now.duration_since(self.last_step_time).as_millis() > 100 { // 100ms debounce
                                             self.last_step_time = now;
                                             let gcode_line_count = self.gcode.lines().count(); // More efficient than collect
-                                            if self.test_current_line < gcode_line_count - 1 {
+                                            if self.test_current_line + 1 < gcode_line_count {
                                                 self.test_current_line += 1;
                                                 self.test_execution_state = ExecutionState::Paused;
                                             } else {
@@ -3788,7 +3850,7 @@ impl eframe::App for MyApp {
                                     let can_resume = self.execution_state == ExecutionState::Paused;
                                     let can_step = self.execution_state == ExecutionState::Paused || can_start;
                                     
-                                    ui.label("🔧 Real Controls:");
+                                    ui.label("🔧 Run Controls (preview only: no motion is sent from these yet):");
                                     if ui.add_enabled(can_start, egui::Button::new("▶ Start")).clicked() {
                                         self.execution_state = ExecutionState::Running;
                                         self.is_executing = true;
@@ -3807,7 +3869,7 @@ impl eframe::App for MyApp {
                                         if now.duration_since(self.last_step_time).as_millis() > 100 { // 100ms debounce
                                             self.last_step_time = now;
                                             let gcode_line_count = self.gcode.lines().count(); // More efficient than collect
-                                            if self.current_line < gcode_line_count - 1 {
+                                            if self.current_line + 1 < gcode_line_count {
                                                 self.current_line += 1;
                                                 self.execution_state = ExecutionState::Paused;
                                             } else {
@@ -9012,15 +9074,19 @@ impl MyApp {
     
     fn emergency_stop_toolhead(&mut self, uuid: u32) {
         if let Ok(mut can_manager) = self.can_manager.try_lock() {
-            let _ = can_manager.emergency_stop(uuid);
-            println!("Emergency stop for toolhead 0x{:06X}", uuid);
+            match can_manager.emergency_stop(uuid) {
+                Ok(()) => println!("Emergency stop for toolhead 0x{:06X}", uuid),
+                Err(e) => eprintln!("🚨 EMERGENCY STOP FAILED for toolhead 0x{:06X}: {}", uuid, e),
+            }
         }
     }
     
     fn emergency_stop_all_toolheads(&mut self) {
         if let Ok(mut can_manager) = self.can_manager.try_lock() {
             for uuid in can_manager.get_toolheads().keys().cloned().collect::<Vec<_>>() {
-                let _ = can_manager.emergency_stop(uuid);
+                if let Err(e) = can_manager.emergency_stop(uuid) {
+                    eprintln!("🚨 EMERGENCY STOP FAILED for toolhead 0x{:06X}: {}", uuid, e);
+                }
             }
             println!("Emergency stop sent to all toolheads");
         }

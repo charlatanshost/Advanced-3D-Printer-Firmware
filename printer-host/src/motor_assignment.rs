@@ -381,9 +381,22 @@ impl MotorAssignmentManager {
         let config = self.motors.remove(motor_id).ok_or_else(|| format!("Motor {} not found", motor_id))?;
         self.motor_states.remove(motor_id);
         
-        // Remove function assignment
+        // Remove just this motor from its function. Others may share it, as dual Z motors do.
         if config.function != MotorFunction::Unassigned {
-            self.function_assignments.remove(&config.function);
+            if let Some(motor_list) = self.function_assignments.get_mut(&config.function) {
+                motor_list.retain(|id| id != motor_id);
+                if motor_list.is_empty() {
+                    self.function_assignments.remove(&config.function);
+                }
+            }
+        }
+
+        // And from any axis group, which must not go on commanding a motor that is gone
+        for group in self.axis_groups.values_mut() {
+            group.motor_ids.retain(|id| id != motor_id);
+            if group.master_motor.as_deref() == Some(motor_id) {
+                group.master_motor = group.motor_ids.first().cloned();
+            }
         }
         
         self.record_assignment_event(motor_id, config.function.clone(), MotorFunction::Unassigned, "Motor removed");
@@ -443,18 +456,19 @@ impl MotorAssignmentManager {
     
     pub fn remove_motor_from_axis_group(&mut self, axis_name: &str, motor_id: &str) -> Result<(), String> {
         if let Some(axis_group) = self.axis_groups.get_mut(axis_name) {
+            // Check first, so a refusal leaves the group as it was
+            let remaining = axis_group.motor_ids.iter().filter(|id| id.as_str() != motor_id).count();
+            if remaining < axis_group.redundancy_level as usize {
+                return Err(format!("Removing motor {} would leave insufficient motors for axis group {}", motor_id, axis_name));
+            }
+
             axis_group.motor_ids.retain(|id| id != motor_id);
-            
+
             // Update master motor if it was removed
             if axis_group.master_motor.as_ref() == Some(&motor_id.to_string()) {
                 axis_group.master_motor = axis_group.motor_ids.first().cloned();
             }
-            
-            // Check if we still have enough motors
-            if axis_group.motor_ids.len() < axis_group.redundancy_level as usize {
-                return Err(format!("Removing motor {} would leave insufficient motors for axis group {}", motor_id, axis_name));
-            }
-            
+
             Ok(())
         } else {
             Err(format!("Axis group {} not found", axis_name))
@@ -491,6 +505,10 @@ impl MotorAssignmentManager {
         if let Some(axis_group) = self.axis_groups.get(axis_name) {
             if axis_group.motor_ids.len() < 2 {
                 return Ok(true); // Single motor is always synchronized
+            }
+            // These modes are meant to have motors at different positions
+            if matches!(axis_group.coordination_mode, CoordinationMode::Independent | CoordinationMode::Differential) {
+                return Ok(true);
             }
             
             // Get positions of all motors in the group
@@ -585,10 +603,16 @@ impl MotorAssignmentManager {
             self.create_servo_config("z_servo_4", MotorFunction::ZAxis(3), 500.0),
         ];
         
-        for config in configs {
+        // Each servo drive is its own slave on the bus
+        for (position, mut config) in configs.into_iter().enumerate() {
+            config.physical_connection = MotorConnection::EtherCat {
+                slave_position: position as u16,
+                vendor_id: 0x0000,
+                product_code: 0x0000,
+            };
             self.register_motor(config)?;
         }
-        
+
         // Create axis groups for coordinated control
         self.create_axis_group(
             "X".to_string(),
@@ -613,6 +637,13 @@ impl MotorAssignmentManager {
     }
     
     fn create_stepper_config(&self, id: &str, function: MotorFunction, step_pin: &str, dir_pin: &str, enable_pin: Option<&str>) -> MotorConfiguration {
+        // Typical values: belts for X/Y, a leadscrew for Z (5x as many steps per mm), and a
+        // geared extruder. One number for all of them would move Z and E the wrong distance.
+        let steps_per_unit = match function {
+            MotorFunction::ZAxis(_) => 400.0,
+            MotorFunction::Extruder(_) => 93.0,
+            _ => 80.0,
+        };
         MotorConfiguration {
             motor_id: id.to_string(),
             motor_type: MotorType::Stepper,
@@ -620,7 +651,7 @@ impl MotorAssignmentManager {
             capabilities: MotorCapabilities {
                 max_speed: 1000.0,
                 max_acceleration: 3000.0,
-                steps_per_unit: 80.0, // Steps per mm
+                steps_per_unit,
                 max_current: 1.5,
                 min_current: 0.1,
                 has_encoder: false,

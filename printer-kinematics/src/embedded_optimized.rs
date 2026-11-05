@@ -188,11 +188,12 @@ impl EmbeddedKinematics {
         let offset_x = offset * sin_b * cos_a;
         let offset_y = offset * sin_b * sin_a;
         let offset_z = offset * cos_b;
-        
+
+        // The tool tip hangs below the pivot
         Pose5D {
-            x: x_m + offset_x,
-            y: y_m + offset_y,
-            z: z_m + offset_z,
+            x: x_m - offset_x,
+            y: y_m - offset_y,
+            z: z_m - offset_z,
             a: a_deg,
             b_or_c: b_deg,
         }
@@ -222,9 +223,9 @@ impl EmbeddedKinematics {
         let offset_z = offset * cos_b;
         
         let joints = [
-            pose.x - offset_x,
-            pose.y - offset_y,
-            pose.z - offset_z,
+            pose.x + offset_x,
+            pose.y + offset_y,
+            pose.z + offset_z,
             a_deg,
             b_deg,
         ];
@@ -250,14 +251,14 @@ impl EmbeddedKinematics {
         let offset_z = offset * cos_a;
         
         Pose5D {
-            x: x_m + offset_x,
-            y: y_m + offset_y,
-            z: z_m + offset_z,
+            x: x_m - offset_x,
+            y: y_m - offset_y,
+            z: z_m - offset_z,
             a: a_deg,
             b_or_c: c_deg,
         }
     }
-    
+
     /// Inverse kinematics for toolhead AC configuration
     #[inline]
     fn ik_toolhead_ac(&self, pose: Pose5D) -> Option<JointArray> {
@@ -280,9 +281,9 @@ impl EmbeddedKinematics {
         let offset_z = offset * cos_a;
         
         Some([
-            pose.x - offset_x,
-            pose.y - offset_y,
-            pose.z - offset_z,
+            pose.x + offset_x,
+            pose.y + offset_y,
+            pose.z + offset_z,
             a_deg,
             c_deg,
         ])
@@ -332,9 +333,9 @@ impl EmbeddedKinematics {
         let offset_z = offset * cos_a;
         
         Pose5D {
-            x: x_corexy + offset_x,
-            y: y_corexy + offset_y,
-            z: z_m + offset_z,
+            x: x_corexy - offset_x,
+            y: y_corexy - offset_y,
+            z: z_m - offset_z,
             a: a_deg,
             b_or_c: c_deg,
         }
@@ -357,9 +358,9 @@ impl EmbeddedKinematics {
         let offset_y = offset * sin_a * sin_c;
         let offset_z = offset * cos_a;
         
-        let x_corexy = pose.x - offset_x;
-        let y_corexy = pose.y - offset_y;
-        let z_pos = pose.z - offset_z;
+        let x_corexy = pose.x + offset_x;
+        let y_corexy = pose.y + offset_y;
+        let z_pos = pose.z + offset_z;
         
         // CoreXY inverse transformation
         let motor_a = x_corexy + y_corexy;
@@ -381,8 +382,15 @@ impl EmbeddedKinematics {
     /// Check if joint positions are within machine limits
     #[inline]
     fn check_joint_limits(&self, joints: &JointArray) -> bool {
+        // Limits are in axis units. CoreXY joints 0 and 1 are belt motors (X+Y, X-Y),
+        // so convert them back to X and Y before comparing.
+        let mut axes = *joints;
+        if matches!(self.config.machine_type, MachineType::CoreXYRotary) {
+            axes[0] = (joints[0] + joints[1]) * 0.5;
+            axes[1] = (joints[0] - joints[1]) * 0.5;
+        }
         for i in 0..5 {
-            if joints[i] < self.config.axis_limits[i].min || joints[i] > self.config.axis_limits[i].max {
+            if axes[i] < self.config.axis_limits[i].min || axes[i] > self.config.axis_limits[i].max {
                 return false;
             }
         }
@@ -473,29 +481,19 @@ pub mod lookup_tables {
     use super::*;
     
     /// Generate sine lookup table with 0.1° resolution
-    pub const fn generate_sin_table() -> [f32; 3600] {
-        let table = [0.0f32; 3600];
-        let mut i = 0;
-        while i < 3600 {
-            let angle_deg = i as f32 * 0.1;
-            let _angle_rad = angle_deg * PI / 180.0;
-            // Note: Can't use sin() in const context, would need to be computed at build time
-            // table[i] = libm::sinf(angle_rad);
-            i += 1;
+    pub fn generate_sin_table() -> [f32; 3600] {
+        let mut table = [0.0f32; 3600];
+        for (i, entry) in table.iter_mut().enumerate() {
+            *entry = libm::sinf(i as f32 * 0.1 * PI / 180.0);
         }
         table
     }
-    
-    /// Generate cosine lookup table with 0.1° resolution  
-    pub const fn generate_cos_table() -> [f32; 3600] {
-        let table = [0.0f32; 3600];
-        let mut i = 0;
-        while i < 3600 {
-            let angle_deg = i as f32 * 0.1;
-            let _angle_rad = angle_deg * PI / 180.0;
-            // Note: Can't use cos() in const context, would need to be computed at build time
-            // table[i] = libm::cosf(angle_rad);
-            i += 1;
+
+    /// Generate cosine lookup table with 0.1° resolution
+    pub fn generate_cos_table() -> [f32; 3600] {
+        let mut table = [0.0f32; 3600];
+        for (i, entry) in table.iter_mut().enumerate() {
+            *entry = libm::cosf(i as f32 * 0.1 * PI / 180.0);
         }
         table
     }
@@ -509,14 +507,14 @@ mod tests {
     fn test_penta_axis_kinematics() {
         let kinematics = EmbeddedKinematics::new(EmbeddedMachineConfig::PENTA_AXIS);
         
-        // Test forward kinematics
-        let joints = [100.0, 100.0, 200.0, 30.0, 15.0];
+        // Test forward kinematics. Stays inside the +/-110 limits so IK can round-trip.
+        let joints = [50.0, 50.0, 200.0, 30.0, 15.0];
         let pose = kinematics.forward_kinematics(joints);
-        
-        // Verify reasonable result
-        assert!(pose.x > 90.0 && pose.x < 110.0);
-        assert!(pose.y > 90.0 && pose.y < 110.0);
-        assert!(pose.z > 190.0 && pose.z < 210.0);
+
+        // The tool hangs 45mm below the pivot, tilted 15 degrees
+        assert!((pose.x - (50.0 - 45.0 * 0.2588 * 0.8660)).abs() < 0.01);
+        assert!((pose.y - (50.0 - 45.0 * 0.2588 * 0.5)).abs() < 0.01);
+        assert!((pose.z - (200.0 - 45.0 * 0.9659)).abs() < 0.01);
         
         // Test inverse kinematics round-trip
         if let Some(recovered_joints) = kinematics.inverse_kinematics(pose) {

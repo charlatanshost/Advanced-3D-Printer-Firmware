@@ -336,22 +336,24 @@ impl ToolOrientationController {
                 let to_point = position - axis_point;
                 let axis_component = to_point.dot(&axis_direction.into_inner()) * axis_direction.into_inner();
                 let radial_component = to_point - axis_component;
-                Ok(Unit::new_normalize(radial_component))
+                // On the axis itself no direction is "outward"
+                Unit::try_new(radial_component, 1e-9).ok_or(KinematicsError::SolutionNotFound)
             },
             
             AnalyticalSurface::Sphere { center, .. } => {
                 let radial_vector = position - center;
-                Ok(Unit::new_normalize(radial_vector))
+                Unit::try_new(radial_vector, 1e-9).ok_or(KinematicsError::SolutionNotFound)
             },
             
             AnalyticalSurface::Cone { apex, axis_direction, half_angle } => {
                 let to_point = position - apex;
                 let axis_component = to_point.dot(&axis_direction.into_inner());
                 let radial_component = to_point - axis_component * axis_direction.into_inner();
-                
+                let radial = radial_component.try_normalize(1e-9).ok_or(KinematicsError::SolutionNotFound)?;
+
                 // Calculate cone surface normal
                 let cone_angle_rad = half_angle.to_radians();
-                let normal_direction = radial_component.normalize() * cone_angle_rad.cos() + 
+                let normal_direction = radial * cone_angle_rad.cos() +
                                      axis_direction.into_inner() * cone_angle_rad.sin();
                 Ok(Unit::new_normalize(normal_direction))
             },
@@ -359,6 +361,10 @@ impl ToolOrientationController {
     }
     
     fn interpolate_normal_from_point_cloud(&self, position: &Point3<f64>, points: &[Point3<f64>], normals: &[Unit<Vector3<f64>>]) -> Result<Unit<Vector3<f64>>, KinematicsError> {
+        if points.len() != normals.len() {
+            return Err(KinematicsError::InvalidConfiguration);
+        }
+
         // Find closest points and interpolate normal
         let mut closest_indices = Vec::new();
         let mut distances = Vec::new();
@@ -371,7 +377,7 @@ impl ToolOrientationController {
         
         // Sort by distance and take closest 3 points
         let mut indexed_distances: Vec<(usize, f64)> = closest_indices.iter().zip(distances.iter()).map(|(&i, &d)| (i, d)).collect();
-        indexed_distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        indexed_distances.sort_by(|a, b| a.1.total_cmp(&b.1));
         
         if indexed_distances.len() >= 3 {
             // Weighted average of closest normals
@@ -385,7 +391,8 @@ impl ToolOrientationController {
                 total_weight += weight;
             }
             
-            Ok(Unit::new_normalize(weighted_normal / total_weight))
+            // Opposing normals can cancel out
+            Unit::try_new(weighted_normal / total_weight, 1e-9).ok_or(KinematicsError::SolutionNotFound)
         } else {
             Ok(Unit::new_normalize(Vector3::z())) // Default to Z-up
         }
@@ -411,7 +418,7 @@ impl ToolOrientationController {
             }
         }
         
-        Ok(face_normals[closest_triangle])
+        face_normals.get(closest_triangle).copied().ok_or(KinematicsError::InvalidConfiguration)
     }
     
     fn apply_lead_and_tilt(&self, surface_normal: Unit<Vector3<f64>>, lead_angle: f64, tilt_angle: f64) -> Result<UnitQuaternion<f64>, KinematicsError> {
@@ -443,7 +450,8 @@ impl ToolOrientationController {
         };
         
         // Align tool with preferred cutting direction
-        let side_vector = cutting_direction.cross(&tool_axis).normalize();
+        // Cutting along the tool axis leaves no side direction to work with
+        let side_vector = cutting_direction.cross(&tool_axis).try_normalize(1e-9).ok_or(KinematicsError::SolutionNotFound)?;
         let adjusted_cutting_direction = tool_axis.cross(&side_vector);
         
         // Create rotation matrix
@@ -526,7 +534,10 @@ impl FiveAxisGCodeProcessor {
     
     pub fn process_gcode_line(&mut self, line: &str) -> Result<Option<MotionSegment>, KinematicsError> {
         let command = self.parse_gcode_line(line)?;
-        
+
+        // G0/G1/G2/G3 are modal: `X10` on its own line continues the last one
+        self.modal_state.motion_mode = command.motion_type.clone();
+
         match command.motion_type {
             MotionMode::Linear | MotionMode::Rapid => {
                 if let Some(target_pose) = command.target_pose {
@@ -561,7 +572,8 @@ impl FiveAxisGCodeProcessor {
     }
     
     fn parse_gcode_line(&self, line: &str) -> Result<FiveAxisCommand, KinematicsError> {
-        let cleaned_line = line.trim().to_uppercase();
+        // Comments must not be read as words: `G1 X10 ; Z5` is not a Z move
+        let cleaned_line = line.split(';').next().unwrap_or("").trim().to_uppercase();
         
         // Initialize command with current modal state
         let mut command = FiveAxisCommand {
@@ -589,8 +601,9 @@ impl FiveAxisGCodeProcessor {
                 continue;
             }
             
+            // Not byte 1: the first character may be more than one byte long
             let letter = word.chars().next().unwrap();
-            let value_str = &word[1..];
+            let value_str = &word[letter.len_utf8()..];
             
             match letter {
                 'G' => {
@@ -641,6 +654,42 @@ impl FiveAxisGCodeProcessor {
         }
         
         Ok(command)
+    }
+}
+
+#[cfg(test)]
+mod gcode_tests {
+    use super::*;
+    use crate::five_axis::FiveAxisConfiguration;
+
+    fn processor() -> FiveAxisGCodeProcessor {
+        let kinematics = FiveAxisKinematics::new(FiveAxisConfiguration::RotaryTable {
+            table_offset: Vector3::zeros(),
+            a_axis_position: Vector3::zeros(),
+            b_axis_position: Vector3::zeros(),
+            spindle_offset: Vector3::zeros(),
+            max_a_angle: 90.0,
+            max_b_angle: 180.0,
+            table_diameter: 300.0,
+        });
+        FiveAxisGCodeProcessor::new(ToolOrientationController::new(kinematics))
+    }
+
+    #[test]
+    fn comments_are_not_commands_and_do_not_crash_it() {
+        let mut p = processor();
+        let segment = p.process_gcode_line("G1 X10 Y10 Z10 F600 ; Z99 at 5°C °°").unwrap().unwrap();
+        assert_eq!(segment.end_pose.position.z, 10.0);
+        // A non-ASCII first character in a word must not panic
+        assert!(p.process_gcode_line("°").is_ok());
+    }
+
+    #[test]
+    fn motion_mode_is_modal() {
+        let mut p = processor();
+        p.process_gcode_line("G1 X10 Y10 Z10 F600").unwrap();
+        // No G word: continues as G1
+        assert!(p.process_gcode_line("X20").unwrap().is_some());
     }
 }
 

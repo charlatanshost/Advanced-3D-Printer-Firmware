@@ -17,10 +17,10 @@ pub struct GCodeCommand {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandType {
-    G(u8),  // G-commands (G0, G1, G2, etc.)
-    M(u8),  // M-commands (M104, M109, etc.)
-    T(u8),  // Tool commands (T0, T1, etc.)
-    Other(String), // Other commands (F, S, etc.)
+    G(u16),  // G-commands (G0, G1, G2, etc.)
+    M(u16),  // M-commands (M104, M109, M600, etc.)
+    T(u16),  // Tool commands (T0, T1, etc.)
+    Other(String), // Other commands (F, S, Klipper macros like START_PRINT, etc.)
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -36,6 +36,8 @@ pub struct Parameters {
     pub j: Option<f32>,  // Arc center J
     pub r: Option<f32>,  // Arc radius
     pub other: HashMap<char, f32>, // Other parameters
+    pub flags: Vec<char>,          // Letters with no value, as in `G28 X Y`
+    pub text: Option<String>,      // Free text, as in `M117 Hello` or `MACRO NAME=value`
 }
 
 #[derive(Debug)]
@@ -107,13 +109,17 @@ impl StreamingGCodeParser {
     /// Parse using parallel processing for large files
     fn parse_parallel(&mut self, buffer: &[u8]) -> Result<Vec<GCodeCommand>, ParseError> {
         // Split buffer into chunks, being careful about line boundaries
-        let chunk_size = buffer.len() / self.parallel_chunks;
+        let chunk_count = self.parallel_chunks.max(1);
+        let chunk_size = buffer.len() / chunk_count;
         let mut chunks = Vec::new();
         let mut start = 0;
-        
-        for _ in 0..self.parallel_chunks - 1 {
-            let mut end = start + chunk_size;
-            
+
+        for _ in 0..chunk_count - 1 {
+            if start >= buffer.len() {
+                break;
+            }
+            let mut end = (start + chunk_size).min(buffer.len());
+
             // Find the next newline to avoid splitting lines
             while end < buffer.len() && buffer[end] != b'\n' {
                 end += 1;
@@ -130,27 +136,35 @@ impl StreamingGCodeParser {
         if start < buffer.len() {
             chunks.push((start, buffer.len()));
         }
-        
-        // Parse chunks in parallel
+
+        // Each chunk's first line number is the number of lines before it. Chunks can hold
+        // any number of lines, so this has to be counted, not assumed.
+        let mut first_lines = Vec::with_capacity(chunks.len());
+        let mut lines_so_far = 0u32;
+        for &(start, end) in &chunks {
+            first_lines.push(lines_so_far);
+            lines_so_far += count_lines(&buffer[start..end]);
+        }
+        self.statistics.total_lines = lines_so_far;
+
+        // Parse chunks in parallel. collect() on an indexed parallel iterator keeps chunk
+        // order, so the results are already in file order.
         let results: Result<Vec<_>, _> = chunks
             .into_par_iter()
-            .enumerate()
-            .map(|(chunk_idx, (start, end))| {
+            .zip(first_lines.into_par_iter())
+            .map(|((start, end), first_line)| {
                 let chunk = &buffer[start..end];
-                let mut parser = FastLineParser::new(chunk_idx as u32 * 10000);
+                let mut parser = FastLineParser::new(first_line);
                 parser.parse_chunk(chunk)
             })
             .collect();
-        
+
         let mut all_commands = Vec::new();
         for chunk_commands in results? {
             self.statistics.parsed_commands += chunk_commands.len() as u32;
             all_commands.extend(chunk_commands);
         }
-        
-        // Sort by line number since parallel processing may have mixed them
-        all_commands.sort_by_key(|cmd| cmd.line_number);
-        
+
         Ok(all_commands)
     }
     
@@ -159,12 +173,19 @@ impl StreamingGCodeParser {
         let mut parser = FastLineParser::new(0);
         let commands = parser.parse_chunk(buffer)?;
         self.statistics.parsed_commands = commands.len() as u32;
+        self.statistics.total_lines = count_lines(buffer);
         Ok(commands)
     }
     
     pub fn get_statistics(&self) -> &ParseStatistics {
         &self.statistics
     }
+}
+
+/// Number of lines in a buffer, counting a last line with no newline
+fn count_lines(buffer: &[u8]) -> u32 {
+    let newlines = buffer.iter().filter(|&&b| b == b'\n').count() as u32;
+    newlines + u32::from(buffer.last().map_or(false, |&b| b != b'\n'))
 }
 
 /// Fast line-by-line parser using state machine approach
@@ -254,10 +275,32 @@ impl<'a> LineParserState<'a> {
     }
     
     fn parse(&mut self, line_number: u32) -> Result<GCodeCommand, ParseError> {
-        let command_type = self.parse_command_type()?;
         let mut parameters = Parameters::default();
         let mut comment = None;
-        
+
+        // Extended commands (START_PRINT, EXCLUDE_OBJECT_DEFINE NAME=a): a word of letters
+        // with free-form arguments that must not be read as G-code parameters.
+        let word_end = self.input.iter()
+            .position(|b| b.is_ascii_whitespace() || *b == b';')
+            .unwrap_or(self.input.len());
+        let is_extended = word_end >= 2
+            && self.input[0].is_ascii_alphabetic()
+            && self.input[1].is_ascii_alphabetic();
+        if is_extended {
+            let name = String::from_utf8_lossy(&self.input[..word_end]).into_owned();
+            self.pos = word_end;
+            parameters.text = self.parse_free_text(&mut comment);
+            return Ok(GCodeCommand { command_type: CommandType::Other(name), line_number, parameters, comment });
+        }
+
+        let command_type = self.parse_command_type()?;
+
+        // These take a free-text argument (a message or file name), not parameters.
+        if matches!(command_type, CommandType::M(23 | 28 | 29 | 30 | 32 | 117 | 118)) {
+            parameters.text = self.parse_free_text(&mut comment);
+            return Ok(GCodeCommand { command_type, line_number, parameters, comment });
+        }
+
         // Parse parameters
         while self.pos < self.input.len() {
             self.skip_whitespace();
@@ -299,26 +342,36 @@ impl<'a> LineParserState<'a> {
         self.pos += 1;
         
         match cmd_char {
-            'G' | 'g' => {
-                let number = self.parse_number_u8()?;
-                Ok(CommandType::G(number))
-            }
-            'M' | 'm' => {
-                let number = self.parse_number_u8()?;
-                Ok(CommandType::M(number))
-            }
-            'T' | 't' => {
-                let number = self.parse_number_u8()?;
-                Ok(CommandType::T(number))
-            }
+            'G' | 'g' => Ok(self.parse_number_u16().map_or_else(|_| CommandType::Other("G".to_string()), CommandType::G)),
+            'M' | 'm' => Ok(self.parse_number_u16().map_or_else(|_| CommandType::Other("M".to_string()), CommandType::M)),
+            'T' | 't' => Ok(self.parse_number_u16().map_or_else(|_| CommandType::Other("T".to_string()), CommandType::T)),
             _ => Ok(CommandType::Other(cmd_char.to_string())),
         }
     }
     
+    /// The rest of the line as text, stopping at a comment
+    fn parse_free_text(&mut self, comment: &mut Option<String>) -> Option<String> {
+        self.skip_whitespace();
+        let rest = &self.input[self.pos..];
+        let end = rest.iter().position(|&b| b == b';').unwrap_or(rest.len());
+        let text = String::from_utf8_lossy(&rest[..end]).trim().to_string();
+        self.pos += end;
+        if self.pos < self.input.len() {
+            *comment = Some(self.parse_comment());
+        }
+        if text.is_empty() { None } else { Some(text) }
+    }
+
     fn parse_parameter(&mut self, param_char: char, parameters: &mut Parameters) -> Result<(), ParseError> {
         self.pos += 1; // Skip the parameter character
-        let value = self.parse_number_f32()?;
-        
+        // A letter with no number is valid G-code (`G28 X`), so it is a flag and not an error.
+        let saved = self.pos;
+        let Ok(value) = self.parse_number_f32() else {
+            self.pos = saved;
+            parameters.flags.push(param_char.to_ascii_uppercase());
+            return Ok(());
+        };
+
         match param_char.to_ascii_uppercase() {
             'X' => parameters.x = Some(value),
             'Y' => parameters.y = Some(value),
@@ -339,16 +392,16 @@ impl<'a> LineParserState<'a> {
     }
     
     /// Fast integer parsing without allocation
-    fn parse_number_u8(&mut self) -> Result<u8, ParseError> {
+    fn parse_number_u16(&mut self) -> Result<u16, ParseError> {
         self.skip_whitespace();
-        
+
         let start = self.pos;
-        let mut result = 0u8;
-        
+        let mut result = 0u16;
+
         while self.pos < self.input.len() {
             let ch = self.input[self.pos];
             if ch.is_ascii_digit() {
-                let digit = (ch - b'0') as u8;
+                let digit = (ch - b'0') as u16;
                 result = result.saturating_mul(10).saturating_add(digit);
                 self.pos += 1;
             } else {
@@ -383,7 +436,7 @@ impl<'a> LineParserState<'a> {
         
         // Parse integer part
         while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
-            integer_part = integer_part * 10 + (self.input[self.pos] - b'0') as i64;
+            integer_part = integer_part.saturating_mul(10).saturating_add((self.input[self.pos] - b'0') as i64);
             self.pos += 1;
         }
         
@@ -395,6 +448,10 @@ impl<'a> LineParserState<'a> {
             while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() && decimal_places < 6 {
                 decimal_part = decimal_part * 10 + (self.input[self.pos] - b'0') as i64;
                 decimal_places += 1;
+                self.pos += 1;
+            }
+            // Precision past 6 places is dropped, and must not be read as a new word
+            while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
                 self.pos += 1;
             }
         }
@@ -410,10 +467,30 @@ impl<'a> LineParserState<'a> {
             result += decimal_part as f32 / divisor;
         }
         
+        // Scientific notation, lowercase only: an uppercase E after a number is the extruder
+        // word (`X1E5` is X=1, E=5), but `1e-2` is one value and not X=1 and a 2mm retract.
+        if self.pos < self.input.len() && self.input[self.pos] == b'e' {
+            let mut p = self.pos + 1;
+            let exponent_negative = p < self.input.len() && self.input[p] == b'-';
+            if p < self.input.len() && (self.input[p] == b'-' || self.input[p] == b'+') {
+                p += 1;
+            }
+            let digits_start = p;
+            let mut exponent = 0i32;
+            while p < self.input.len() && self.input[p].is_ascii_digit() {
+                exponent = exponent.saturating_mul(10).saturating_add((self.input[p] - b'0') as i32);
+                p += 1;
+            }
+            if p > digits_start {
+                result *= 10f32.powi(if exponent_negative { -exponent } else { exponent });
+                self.pos = p;
+            }
+        }
+
         if negative {
             result = -result;
         }
-        
+
         Ok(result)
     }
     
@@ -530,6 +607,8 @@ pub struct GeometryGenerator {
     previous_extrude_pos: f32,
     layer_height: f32,
     extrude_width: f32,
+    relative_xyz: bool,    // G91 / G90
+    relative_e: bool,      // M83 / M82, and G91 / G90 which set it too
 }
 
 impl GeometryGenerator {
@@ -540,6 +619,8 @@ impl GeometryGenerator {
             previous_extrude_pos: 0.0,
             layer_height: 0.2,
             extrude_width: 0.4,
+            relative_xyz: false,
+            relative_e: false,
         }
     }
     
@@ -582,9 +663,32 @@ impl GeometryGenerator {
                     // G2/G3 - Arc moves
                     self.handle_arc(command, geometry);
                 }
+                CommandType::G(90) => {
+                    self.relative_xyz = false;
+                    self.relative_e = false;
+                }
+                CommandType::G(91) => {
+                    self.relative_xyz = true;
+                    self.relative_e = true;
+                }
+                CommandType::M(82) => self.relative_e = false,
+                CommandType::M(83) => self.relative_e = true,
+                CommandType::G(92) => {
+                    // Set position, without moving
+                    let p = &command.parameters;
+                    self.current_position = [
+                        p.x.unwrap_or(self.current_position[0]),
+                        p.y.unwrap_or(self.current_position[1]),
+                        p.z.unwrap_or(self.current_position[2]),
+                    ];
+                    if let Some(e) = p.e {
+                        self.previous_extrude_pos = self.current_extrude_pos;
+                        self.current_extrude_pos = e;
+                    }
+                }
                 _ => {
-                    // Other commands don't affect geometry directly
-                    self.update_position(&command.parameters);
+                    // Nothing else moves the toolhead. In particular the E in M92, M201 or
+                    // M203 is a setting, not an extruder position.
                 }
             }
         }
@@ -613,7 +717,8 @@ impl GeometryGenerator {
     
     fn handle_arc(&mut self, command: &GCodeCommand, geometry: &mut ToolpathGeometry) {
         // Generate arc as series of line segments
-        let segments = self.generate_arc_segments(&command.parameters);
+        let clockwise = matches!(command.command_type, CommandType::G(2));
+        let segments = self.generate_arc_segments(&command.parameters, clockwise);
         
         let line_type = if self.is_extruding(&command.parameters) {
             LineType::Extrude
@@ -662,25 +767,34 @@ impl GeometryGenerator {
     }
     
     fn calculate_new_position(&self, params: &Parameters) -> [f32; 3] {
-        [
-            params.x.unwrap_or(self.current_position[0]),
-            params.y.unwrap_or(self.current_position[1]),
-            params.z.unwrap_or(self.current_position[2]),
-        ]
+        let current = self.current_position;
+        if self.relative_xyz {
+            [
+                current[0] + params.x.unwrap_or(0.0),
+                current[1] + params.y.unwrap_or(0.0),
+                current[2] + params.z.unwrap_or(0.0),
+            ]
+        } else {
+            [
+                params.x.unwrap_or(current[0]),
+                params.y.unwrap_or(current[1]),
+                params.z.unwrap_or(current[2]),
+            ]
+        }
     }
-    
+
     fn update_position(&mut self, params: &Parameters) {
         if let Some(e) = params.e {
             self.previous_extrude_pos = self.current_extrude_pos;
-            self.current_extrude_pos = e;
+            self.current_extrude_pos = if self.relative_e { self.current_extrude_pos + e } else { e };
         }
     }
-    
+
     fn is_extruding(&self, params: &Parameters) -> bool {
-        if let Some(e) = params.e {
-            e > self.current_extrude_pos
-        } else {
-            false
+        match params.e {
+            Some(e) if self.relative_e => e > 0.0,
+            Some(e) => e > self.current_extrude_pos,
+            None => false,
         }
     }
     
@@ -711,16 +825,63 @@ impl GeometryGenerator {
         }
     }
     
-    fn generate_arc_segments(&self, params: &Parameters) -> Vec<([f32; 3], [f32; 3])> {
-        // Simplified arc generation - in practice this would be more sophisticated
-        let segments = 16; // Number of segments per arc
+    fn generate_arc_segments(&self, params: &Parameters, clockwise: bool) -> Vec<([f32; 3], [f32; 3])> {
+        use std::f32::consts::TAU;
+        let start = self.current_position;
+        let end = self.calculate_new_position(params);
+        let straight = vec![(start, end)];
+
+        let center = match (params.i, params.j, params.r) {
+            (i, j, _) if i.is_some() || j.is_some() => {
+                [start[0] + i.unwrap_or(0.0), start[1] + j.unwrap_or(0.0)]
+            }
+            (_, _, Some(r)) => {
+                // Radius form: the center lies on the perpendicular bisector of the chord.
+                let (dx, dy) = (end[0] - start[0], end[1] - start[1]);
+                let chord = dx.hypot(dy);
+                if chord < 1e-6 || r.abs() < chord / 2.0 {
+                    return straight;
+                }
+                let height = (r * r - chord * chord / 4.0).sqrt();
+                // Negative R picks the long way round, which swaps the side for the same direction
+                let side = if clockwise == (r > 0.0) { 1.0 } else { -1.0 };
+                [
+                    (start[0] + end[0]) / 2.0 + side * height * dy / chord,
+                    (start[1] + end[1]) / 2.0 - side * height * dx / chord,
+                ]
+            }
+            _ => return straight,
+        };
+
+        let radius = (start[0] - center[0]).hypot(start[1] - center[1]);
+        if radius < 1e-6 {
+            return straight;
+        }
+        let start_angle = (start[1] - center[1]).atan2(start[0] - center[0]);
+        let end_angle = (end[1] - center[1]).atan2(end[0] - center[0]);
+        let same_point = (start[0] - end[0]).hypot(start[1] - end[1]) < 1e-5;
+        let ccw_sweep = if same_point { TAU } else { (end_angle - start_angle).rem_euclid(TAU) };
+        let sweep = if clockwise { ccw_sweep - TAU } else { ccw_sweep };
+
+        // About one segment per 5 degrees
+        let segments = ((sweep.abs() / 5f32.to_radians()).ceil() as usize).max(1);
         let mut result = Vec::with_capacity(segments);
-        
-        let end_pos = self.calculate_new_position(params);
-        
-        // For now, just create a straight line - proper arc math would go here
-        result.push((self.current_position, end_pos));
-        
+        let mut previous = start;
+        for n in 1..=segments {
+            let t = n as f32 / segments as f32;
+            let angle = start_angle + sweep * t;
+            let point = if n == segments {
+                end
+            } else {
+                [
+                    center[0] + radius * angle.cos(),
+                    center[1] + radius * angle.sin(),
+                    start[2] + (end[2] - start[2]) * t,
+                ]
+            };
+            result.push((previous, point));
+            previous = point;
+        }
         result
     }
 }
@@ -776,5 +937,88 @@ mod tests {
         
         assert!(!geometry.line_segments.is_empty());
         assert_eq!(geometry.vertices.len(), geometry.colors.len());
+    }
+
+    fn parse(text: &str) -> Vec<GCodeCommand> {
+        StreamingGCodeParser::new().parse_file(Cursor::new(text)).unwrap()
+    }
+
+    #[test]
+    fn test_valid_gcode_does_not_fail_the_file() {
+        for line in ["G28 X", "G28 X Y", "M84 X Y", "M117 Hello World", "EXCLUDE_OBJECT_DEFINE NAME=a", "G1 X", "M", "G1 X1O"] {
+            let commands = parse(&format!("G1 X1\n{}\nG1 X2\n", line));
+            assert_eq!(commands.len(), 3, "{}", line);
+        }
+        let commands = parse("G28 X Y\nM117 Hello\nSTART_PRINT BED=60 ; go\n");
+        assert_eq!(commands[0].parameters.flags, vec!['X', 'Y']);
+        assert_eq!(commands[1].parameters.text.as_deref(), Some("Hello"));
+        assert_eq!(commands[2].command_type, CommandType::Other("START_PRINT".to_string()));
+        assert_eq!(commands[2].parameters.text.as_deref(), Some("BED=60"));
+    }
+
+    #[test]
+    fn test_large_m_codes_stay_distinct() {
+        let commands = parse("M300 S1\nM400\nM600\nM900 K0.05\n");
+        let types: Vec<_> = commands.iter().map(|c| c.command_type.clone()).collect();
+        assert_eq!(types, vec![CommandType::M(300), CommandType::M(400), CommandType::M(600), CommandType::M(900)]);
+    }
+
+    #[test]
+    fn test_scientific_notation_vs_extruder_word() {
+        let commands = parse("G1 X1e-2\nG1 X1E5\n");
+        assert!((commands[0].parameters.x.unwrap() - 0.01).abs() < 1e-6);
+        assert_eq!(commands[0].parameters.e, None);
+        assert_eq!(commands[1].parameters.x, Some(1.0));
+        assert_eq!(commands[1].parameters.e, Some(5.0));
+    }
+
+    #[test]
+    fn test_parallel_parse_keeps_file_order() {
+        let mut text = String::new();
+        for i in 0..200_000u32 {
+            text.push_str(&format!("G1 X{}\n", i));
+        }
+        let mut parser = StreamingGCodeParser::new().with_parallel_chunks(8);
+        let commands = parser.parse_file(Cursor::new(text)).unwrap();
+        assert_eq!(commands.len(), 200_000);
+        assert_eq!(parser.get_statistics().total_lines, 200_000);
+        for (i, command) in commands.iter().enumerate() {
+            assert_eq!(command.line_number, i as u32);
+        }
+        assert!(commands.windows(2).all(|w| w[0].parameters.x < w[1].parameters.x));
+    }
+
+    fn line_types(text: &str) -> Vec<LineType> {
+        GeometryGenerator::new().generate_geometry(&parse(text)).line_segments.iter().map(|s| s.line_type).collect()
+    }
+
+    #[test]
+    fn test_extrusion_classification() {
+        // E in a settings command is not an extruder position
+        assert_eq!(line_types("M201 X500 E5000\nG1 X10 E1\n"), vec![LineType::Extrude]);
+        // Relative extrusion
+        assert_eq!(line_types("M83\nG1 X10 E0.5\nG1 X20 E0.5\n"), vec![LineType::Extrude, LineType::Extrude]);
+        // G92 resets the counter
+        assert_eq!(line_types("G1 X10 E5\nG92 E0\nG1 X20 E1\n"), vec![LineType::Extrude, LineType::Extrude]);
+    }
+
+    #[test]
+    fn test_arcs_follow_the_circle() {
+        // Quarter circle of radius 10 around the origin, counter-clockwise
+        let geometry = GeometryGenerator::new().generate_geometry(&parse("G1 X10 Y0\nG3 X0 Y10 I-10 J0\n"));
+        let arc = &geometry.line_segments[1..];
+        assert!(arc.len() > 5);
+        for segment in arc {
+            assert!((segment.end[0].hypot(segment.end[1]) - 10.0).abs() < 0.01, "{:?}", segment.end);
+            assert!(segment.end[0] >= -0.01 && segment.end[1] >= -0.01, "wrong way round: {:?}", segment.end);
+        }
+        // Same end points, clockwise, goes the long way through the other three quadrants
+        let geometry = GeometryGenerator::new().generate_geometry(&parse("G1 X10 Y0\nG2 X0 Y10 I-10 J0\n"));
+        assert!(geometry.line_segments.iter().any(|s| s.end[0] < -5.0 && s.end[1] < -5.0));
+        // Radius form, same quarter circle
+        let geometry = GeometryGenerator::new().generate_geometry(&parse("G1 X10 Y0\nG3 X0 Y10 R10\n"));
+        for segment in &geometry.line_segments[1..] {
+            assert!((segment.end[0].hypot(segment.end[1]) - 10.0).abs() < 0.01, "{:?}", segment.end);
+        }
     }
 }

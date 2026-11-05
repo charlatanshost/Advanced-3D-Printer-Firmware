@@ -13,6 +13,9 @@ pub const KLIPPER_CAN_ID_MASK: u32 = 0x1FFFFFFF;
 pub const KLIPPER_CAN_ID_SHIFT: u8 = 8;
 pub const KLIPPER_CAN_UUID_MASK: u32 = 0x00FFFFFF;
 
+/// How long a toolhead may stay silent before it is marked disconnected
+const TOOLHEAD_TIMEOUT: Duration = Duration::from_secs(5);
+
 // Klipper Command Types (based on src/generic/serial_can.c)
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -124,7 +127,7 @@ pub trait CanBusInterface: Send + Sync {
 }
 
 // Linux SocketCAN Implementation
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "can-toolheads"))]
 pub struct SocketCanInterface {
     socket: Option<socketcan::CANSocket>,
     interface_name: String,
@@ -132,7 +135,7 @@ pub struct SocketCanInterface {
     rx_error_count: u32,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "can-toolheads"))]
 impl SocketCanInterface {
     pub fn new(interface: &str) -> Self {
         Self {
@@ -146,6 +149,10 @@ impl SocketCanInterface {
     pub fn connect(&mut self) -> Result<(), String> {
         match socketcan::CANSocket::open(&self.interface_name) {
             Ok(socket) => {
+                // receive_frame is polled and must return None when nothing is waiting,
+                // not block with the manager's lock held.
+                socket.set_nonblocking(true)
+                    .map_err(|e| format!("Failed to configure CAN interface: {}", e))?;
                 self.socket = Some(socket);
                 info!("Connected to CAN interface: {}", self.interface_name);
                 Ok(())
@@ -155,7 +162,7 @@ impl SocketCanInterface {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "can-toolheads"))]
 impl CanBusInterface for SocketCanInterface {
     fn send_frame(&mut self, id: u32, data: &[u8]) -> Result<(), String> {
         if let Some(ref socket) = self.socket {
@@ -309,8 +316,9 @@ impl KlipperCanManager {
         // Set CAN bitrate (typically 250kbps for Klipper toolheads)
         self.can_interface.set_bitrate(250_000)?;
         
-        // Set filter for Klipper CAN IDs
-        self.can_interface.set_filter(0x100, 0xF00)?;
+        // Accept every ID. These IDs carry the toolhead UUID, so a fixed bit filter
+        // would silently drop replies from most toolheads.
+        self.can_interface.set_filter(0, 0)?;
         
         *self.running.lock().unwrap() = true;
         
@@ -358,6 +366,9 @@ impl KlipperCanManager {
     }
     
     pub fn send_toolhead_command(&mut self, uuid: u32, cmd: KlipperCanCmd, data: &[u8]) -> Result<(), String> {
+        if data.len() > 7 {
+            return Err(format!("CAN payload of {} bytes does not fit in one frame (max 7)", data.len()));
+        }
         let message = KlipperCanMessage {
             uuid,
             cmd,
@@ -376,16 +387,47 @@ impl KlipperCanManager {
     }
     
     pub fn move_extruder(&mut self, uuid: u32, distance: f32, speed: f32) -> Result<(), String> {
+        if !distance.is_finite() || !speed.is_finite() || speed < 0.0 {
+            return Err(format!("Invalid extruder move: {} mm at {} mm/s", distance, speed));
+        }
+        if let Some(config) = self.configurations.get(&uuid) {
+            if speed > config.max_extrude_speed {
+                return Err(format!("Extruder speed {} exceeds limit {}", speed, config.max_extrude_speed));
+            }
+            // Pushing filament through a cold nozzle grinds it and can jam the hotend.
+            if distance > 0.0 {
+                let temperature = self.toolheads.get(&uuid).map_or(0.0, |t| t.temperature);
+                if temperature < config.min_extrude_temp {
+                    return Err(format!("Cold extrusion refused: {}°C, minimum {}°C", temperature, config.min_extrude_temp));
+                }
+            }
+        }
+
+        // distance: f32 mm, speed: u16 in 0.01 mm/s. A float cut down to 3 bytes loses its
+        // exponent, so the speed has to be sent in a form that fits.
+        let centi_speed = (speed * 100.0).round().min(u16::MAX as f32) as u16;
         let mut data = Vec::new();
         data.extend_from_slice(&distance.to_le_bytes());
-        data.extend_from_slice(&speed.to_le_bytes()[..3]); // Truncate to fit in 7 bytes
-        
+        data.extend_from_slice(&centi_speed.to_le_bytes());
+
         self.send_toolhead_command(uuid, KlipperCanCmd::MoveExtruder, &data)
     }
-    
+
     pub fn set_temperature(&mut self, uuid: u32, temperature: f32) -> Result<(), String> {
+        if !temperature.is_finite() || temperature < 0.0 {
+            return Err(format!("Invalid temperature: {}", temperature));
+        }
+        if let Some(config) = self.configurations.get(&uuid) {
+            if temperature > config.max_temp {
+                return Err(format!("Temperature {}°C exceeds limit {}°C", temperature, config.max_temp));
+            }
+        }
         let data = temperature.to_le_bytes();
-        self.send_toolhead_command(uuid, KlipperCanCmd::SetTemperature, &data)
+        self.send_toolhead_command(uuid, KlipperCanCmd::SetTemperature, &data)?;
+        if let Some(toolhead) = self.toolheads.get_mut(&uuid) {
+            toolhead.target_temperature = temperature;
+        }
+        Ok(())
     }
     
     pub fn set_fan_speed(&mut self, uuid: u32, speed: u8) -> Result<(), String> {
@@ -427,6 +469,14 @@ impl KlipperCanManager {
         while let Some((id, data)) = self.can_interface.receive_frame() {
             if let Ok(msg) = self.parse_can_frame(id, &data) {
                 self.handle_received_message(msg);
+            }
+        }
+
+        // A toolhead that has gone quiet is no longer connected
+        for toolhead in self.toolheads.values_mut() {
+            if toolhead.connected && toolhead.last_command_time.elapsed() > TOOLHEAD_TIMEOUT {
+                warn!("Toolhead 0x{:06X} stopped responding", toolhead.uuid);
+                toolhead.connected = false;
             }
         }
     }
@@ -503,7 +553,8 @@ impl KlipperCanManager {
     fn handle_toolhead_response(&mut self, msg: KlipperCanMessage) {
         if let Some(toolhead) = self.toolheads.get_mut(&msg.uuid) {
             toolhead.last_command_time = Instant::now();
-            
+            toolhead.connected = true;
+
             // Parse response data based on original command
             match msg.len {
                 4 => {
@@ -599,8 +650,8 @@ impl KlipperCanManager {
     }
     
     fn encode_can_id(&self, uuid: u32, cmd: u8, seq: u8) -> u32 {
-        // Klipper CAN ID format: [Priority:3][UUID:24][CMD:3][SEQ:2]
-        (1u32 << 29) | ((uuid & 0xFFFFFF) << 5) | ((cmd as u32 & 0x07) << 2) | (seq as u32 & 0x03)
+        // 29-bit extended ID: [UUID:24][CMD:3][SEQ:2]. The full command is in the first data byte.
+        ((uuid & 0xFFFFFF) << 5) | ((cmd as u32 & 0x07) << 2) | (seq as u32 & 0x03)
     }
     
     fn decode_can_id(&self, can_id: u32) -> (u32, u8) {

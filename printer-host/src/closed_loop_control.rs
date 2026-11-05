@@ -70,6 +70,9 @@ pub struct EncoderState {
     pub max_position_error: f64,   // Maximum recorded position error
     pub connected: bool,           // Encoder communication status
     pub calibrated: bool,          // Whether encoder is calibrated/homed
+    /// Raw count (after direction) that corresponds to position 0. Set by homing.
+    #[serde(default)]
+    pub home_offset: i64,
 }
 
 impl Default for EncoderState {
@@ -85,6 +88,7 @@ impl Default for EncoderState {
             max_position_error: 0.0,
             connected: false,
             calibrated: false,
+            home_offset: 0,
         }
     }
 }
@@ -203,6 +207,7 @@ pub struct ClosedLoopAxis {
 
 impl ClosedLoopAxis {
     pub fn new(axis_name: String, encoder_config: EncoderConfig) -> Self {
+        let filter_samples = (encoder_config.filter_samples as usize).max(1);
         Self {
             axis_name,
             encoder_config,
@@ -212,7 +217,7 @@ impl ClosedLoopAxis {
             current_position: 0.0,
             enabled: false,
             homing_required: true,
-            position_filter: PositionFilter::new(5), // 5-sample moving average
+            position_filter: PositionFilter::new(filter_samples),
         }
     }
     
@@ -224,16 +229,20 @@ impl ClosedLoopAxis {
             return Ok(()); // Skip update if no time has passed
         }
         
-        // Update velocity calculation
-        let position_change = raw_position - self.encoder_state.last_position;
-        self.encoder_state.velocity = position_change as f64 / dt;
-        
-        // Update position with filtering
+        // Apply direction and the home position
+        let direction = if self.encoder_config.invert_direction { -1 } else { 1 };
+        let position = raw_position * direction - self.encoder_state.home_offset;
+
+        // Update velocity from the previous sample, over the time since that sample
+        self.encoder_state.velocity = (position - self.encoder_state.position) as f64 / dt;
         self.encoder_state.last_position = self.encoder_state.position;
-        self.encoder_state.position = raw_position;
-        
+        self.encoder_state.position = position;
+        self.encoder_state.last_update = now;
+        self.encoder_state.connected = true;
+        self.encoder_state.communication_errors = 0; // The link is working again
+
         // Convert to real-world units (mm or degrees)
-        let filtered_position = self.position_filter.update(raw_position as f64);
+        let filtered_position = self.position_filter.update(position as f64);
         self.current_position = filtered_position / self.encoder_config.counts_per_mm;
         
         // Calculate position error
@@ -252,15 +261,13 @@ impl ClosedLoopAxis {
                 abs_error, self.encoder_config.max_error_threshold, self.axis_name
             ));
         }
-        
-        self.encoder_state.last_update = now;
-        self.encoder_state.connected = true;
-        
+
         Ok(())
     }
     
     pub fn calculate_correction(&mut self) -> f64 {
-        if !self.enabled || !self.encoder_state.calibrated {
+        // No correction without live feedback: it would act on a stale position.
+        if !self.enabled || !self.encoder_state.calibrated || !self.encoder_state.connected {
             return 0.0;
         }
         
@@ -272,8 +279,13 @@ impl ClosedLoopAxis {
     }
     
     pub fn home_axis(&mut self) -> Result<(), String> {
-        // Reset position to zero (or known home position)
+        // Wherever the encoder is now becomes position zero, and stays that way for
+        // later readings because they are reported relative to this offset.
+        self.encoder_state.home_offset += self.encoder_state.position;
         self.encoder_state.position = 0;
+        self.encoder_state.last_position = 0;
+        self.encoder_state.velocity = 0.0;
+        self.position_filter.reset();
         self.current_position = 0.0;
         self.target_position = 0.0;
         self.encoder_state.calibrated = true;
@@ -339,6 +351,7 @@ pub struct PositionFilter {
 
 impl PositionFilter {
     pub fn new(max_samples: usize) -> Self {
+        let max_samples = max_samples.max(1);
         Self {
             samples: vec![0.0; max_samples],
             sample_index: 0,
@@ -509,11 +522,11 @@ impl ClosedLoopManager {
     pub fn process_update(&mut self) -> Result<HashMap<String, f64>, String> {
         let now = Instant::now();
         let dt = now.duration_since(self.last_update);
-        let expected_interval = Duration::from_secs_f64(1.0 / self.update_rate_hz as f64);
-        
+        let expected_interval = Duration::from_secs_f64(1.0 / self.update_rate_hz.max(1) as f64);
+
         if dt >= expected_interval {
             self.last_update = now;
-            
+
             // Calculate corrections for all axes
             let corrections = self.calculate_corrections();
             
@@ -530,6 +543,12 @@ impl ClosedLoopManager {
     
     fn handle_error_recovery(&mut self) -> Result<(), String> {
         for (axis_name, axis) in self.axes.iter_mut() {
+            // Only axes under closed-loop control can fault. An axis that has not been
+            // enabled yet is allowed to have no encoder data.
+            if !axis.enabled {
+                continue;
+            }
+
             // Check for communication timeout
             let time_since_update = Instant::now().duration_since(axis.encoder_state.last_update);
             if time_since_update > Duration::from_millis(100) { // 100ms timeout

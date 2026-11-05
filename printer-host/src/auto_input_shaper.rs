@@ -51,69 +51,64 @@ pub struct InputShaperType {
 }
 
 impl InputShaperType {
-    pub fn zv(frequency: f32) -> Self {
-        let omega = 2.0 * std::f32::consts::PI * frequency;
-        let k = (-std::f32::consts::PI / omega.sqrt()).exp();
-        let a1 = 1.0 / (1.0 + k);
-        let a2 = k / (1.0 + k);
+    /// Damping assumed when it has not been measured
+    const TYPICAL_DAMPING: f32 = 0.1;
 
+    /// Built from the one implementation of the impulse math in `input_shaping`, so
+    /// calibration recommends the same shapers that actually run.
+    fn from_shaper(name: &str, shaper_type: crate::input_shaping::ShaperType, frequency: f32, damping: f32, vibration_tolerance: f32, smoothing_factor: f32) -> Self {
+        let shaper = crate::input_shaping::InputShaper::new(crate::input_shaping::InputShaperConfig {
+            shaper_type,
+            frequency: frequency as f64,
+            damping_ratio: damping.clamp(0.0, 0.9) as f64,
+            ..Default::default()
+        });
+        let impulses = shaper.impulses();
         Self {
-            name: "ZV".to_string(),
-            coefficients: vec![a1, a2],
-            delays: vec![0.0, 0.5 / frequency],
-            vibration_tolerance: k / (1.0 + k),
-            smoothing_factor: 0.1,
+            name: name.to_string(),
+            coefficients: impulses.iter().map(|i| i.0 as f32).collect(),
+            delays: impulses.iter().map(|i| i.1 as f32).collect(),
+            vibration_tolerance,
+            smoothing_factor,
         }
+    }
+
+    pub fn zv(frequency: f32) -> Self {
+        Self::zv_damped(frequency, Self::TYPICAL_DAMPING)
     }
 
     pub fn zvd(frequency: f32) -> Self {
-        let omega = 2.0 * std::f32::consts::PI * frequency;
-        let k = (-std::f32::consts::PI / omega.sqrt()).exp();
-        let a1 = 1.0 / (1.0 + k).powi(2);
-        let a2 = 2.0 * k / (1.0 + k).powi(2);
-        let a3 = k.powi(2) / (1.0 + k).powi(2);
-
-        Self {
-            name: "ZVD".to_string(),
-            coefficients: vec![a1, a2, a3],
-            delays: vec![0.0, 0.5 / frequency, 1.0 / frequency],
-            vibration_tolerance: k.powi(2) / (1.0 + k).powi(2),
-            smoothing_factor: 0.2,
-        }
+        Self::zvd_damped(frequency, Self::TYPICAL_DAMPING)
     }
 
     pub fn mzv(frequency: f32) -> Self {
-        let omega = 2.0 * std::f32::consts::PI * frequency;
-        let k = (-0.75 * std::f32::consts::PI / omega.sqrt()).exp();
-        let a1 = 1.0 / (1.0 + 2.0 * k + k.powi(2));
-        let a2 = 2.0 * k / (1.0 + 2.0 * k + k.powi(2));
-        let a3 = k.powi(2) / (1.0 + 2.0 * k + k.powi(2));
-
-        Self {
-            name: "MZV".to_string(),
-            coefficients: vec![a1, a2, a3],
-            delays: vec![0.0, 0.375 / frequency, 0.75 / frequency],
-            vibration_tolerance: k.powi(2) / (1.0 + 2.0 * k + k.powi(2)),
-            smoothing_factor: 0.15,
-        }
+        Self::mzv_damped(frequency, Self::TYPICAL_DAMPING)
     }
 
     pub fn ei(frequency: f32) -> Self {
-        let omega = 2.0 * std::f32::consts::PI * frequency;
-        let k = 0.25;
-        let a1 = 0.25 * (1.0 + 3.0 * k);
-        let a2 = 0.5 * (1.0 - k);
-        let a3 = 0.25 * (1.0 + 3.0 * k);
+        Self::ei_damped(frequency, Self::TYPICAL_DAMPING)
+    }
 
-        Self {
-            name: "EI".to_string(),
-            coefficients: vec![a1, a2, a3],
-            delays: vec![0.0, 0.5 / frequency, 1.0 / frequency],
-            vibration_tolerance: k,
-            smoothing_factor: 0.25,
-        }
+    pub fn zv_damped(frequency: f32, damping: f32) -> Self {
+        Self::from_shaper("ZV", crate::input_shaping::ShaperType::ZV, frequency, damping, 0.2, 0.1)
+    }
+
+    pub fn zvd_damped(frequency: f32, damping: f32) -> Self {
+        Self::from_shaper("ZVD", crate::input_shaping::ShaperType::ZVD, frequency, damping, 0.05, 0.25)
+    }
+
+    pub fn mzv_damped(frequency: f32, damping: f32) -> Self {
+        Self::from_shaper("MZV", crate::input_shaping::ShaperType::MZV, frequency, damping, 0.05, 0.15)
+    }
+
+    pub fn ei_damped(frequency: f32, damping: f32) -> Self {
+        Self::from_shaper("EI", crate::input_shaping::ShaperType::EI, frequency, damping, 0.05, 0.25)
     }
 }
+
+/// The hardest a resonance test may shake the machine. At a fixed amplitude, acceleration
+/// grows with frequency squared: 1mm at 200Hz would be 1,600,000 mm/s².
+const MAX_TEST_ACCELERATION: f32 = 5000.0;
 
 #[derive(Debug, Clone)]
 pub struct ResonancePeak {
@@ -164,6 +159,11 @@ impl AutoInputShaperCalibrator {
         let mut config = self.current_config.clone();
         config.test_axis = axis;
 
+        // A zero step would loop forever below
+        if !(config.frequency_step > 0.0) || !(config.frequency_range.0 > 0.0) || config.frequency_range.0 > config.frequency_range.1 {
+            return Err(CalibrationError::InvalidConfig);
+        }
+
         // Generate test sequence
         let mut test_sequence = CalibrationTestSequence::new(config.clone());
 
@@ -197,7 +197,8 @@ impl AutoInputShaperCalibrator {
     pub fn analyze_results(&mut self, axis: char) -> Result<CalibrationResults, CalibrationError> {
         let start_time = Instant::now();
 
-        if self.accelerometer_buffer.is_empty() {
+        // One sample has no spectrum, and the window below would divide by zero
+        if self.accelerometer_buffer.len() < 2 {
             return Err(CalibrationError::NoData);
         }
 
@@ -320,7 +321,7 @@ impl AutoInputShaperCalibrator {
         }
 
         // Sort by magnitude (strongest peaks first)
-        peaks.sort_by(|a, b| b.magnitude.partial_cmp(&a.magnitude).unwrap());
+        peaks.sort_by(|a, b| b.magnitude.total_cmp(&a.magnitude));
 
         Ok(peaks)
     }
@@ -328,9 +329,9 @@ impl AutoInputShaperCalibrator {
     fn generate_shaper_recommendations(&self, peaks: &[ResonancePeak]) -> Result<Vec<(InputShaperType, f32)>, CalibrationError> {
         let mut recommendations = Vec::new();
 
+        // No resonance found means nothing to recommend. Inventing a frequency would look
+        // like a measured result.
         if peaks.is_empty() {
-            // No significant resonances detected, recommend light filtering
-            recommendations.push((InputShaperType::zv(50.0), 0.8));
             return Ok(recommendations);
         }
 
@@ -343,11 +344,12 @@ impl AutoInputShaperCalibrator {
             let freq = peak.frequency;
 
             // Generate different shaper types for this frequency
+            let damping = peak.damping_ratio;
             let shapers = vec![
-                InputShaperType::zv(freq),
-                InputShaperType::zvd(freq),
-                InputShaperType::mzv(freq),
-                InputShaperType::ei(freq),
+                InputShaperType::zv_damped(freq, damping),
+                InputShaperType::zvd_damped(freq, damping),
+                InputShaperType::mzv_damped(freq, damping),
+                InputShaperType::ei_damped(freq, damping),
             ];
 
             for shaper in shapers {
@@ -363,7 +365,7 @@ impl AutoInputShaperCalibrator {
         }
 
         // Sort by score (best first)
-        recommendations.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        recommendations.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         // Remove duplicates and keep top 5
         recommendations.truncate(5);
@@ -427,8 +429,12 @@ impl CalibrationTestSequence {
         // Generate G-code for sinusoidal motion
         let mut gcode_commands = Vec::new();
 
+        // Keep the peak acceleration (angular frequency squared * amplitude) inside the limit
+        let omega = 2.0 * std::f32::consts::PI * frequency;
+        let amplitude = amplitude.min(MAX_TEST_ACCELERATION / (omega * omega));
+
         // Set feedrate based on frequency and amplitude
-        let peak_speed = 2.0 * std::f32::consts::PI * frequency * amplitude; // mm/s
+        let peak_speed = omega * amplitude; // mm/s
         let feedrate = peak_speed * 60.0; // mm/min
 
         // Generate sinusoidal motion commands
@@ -437,18 +443,23 @@ impl CalibrationTestSequence {
         let total_steps = cycles * steps_per_cycle;
 
         gcode_commands.push(format!("G21")); // Metric units
-        gcode_commands.push(format!("G90")); // Absolute positioning
+        // Relative: the test shakes around wherever the axis is. Absolute would shake around
+        // machine zero, driving into the endstop at the start of the axis.
+        gcode_commands.push(format!("G91"));
         gcode_commands.push(format!("G1 F{:.0}", feedrate)); // Set feedrate
 
+        let mut previous = 0.0f32;
         for step in 0..total_steps {
             let t = step as f32 / (steps_per_cycle as f32 * frequency);
             let position = amplitude * (2.0 * std::f32::consts::PI * frequency * t).sin();
 
-            gcode_commands.push(format!("G1 {}{:.4}", axis, position));
+            gcode_commands.push(format!("G1 {}{:.4}", axis, position - previous));
+            previous = position;
         }
 
         // Return to center
-        gcode_commands.push(format!("G1 {}0", axis));
+        gcode_commands.push(format!("G1 {}{:.4}", axis, -previous));
+        gcode_commands.push(format!("G90")); // Back to absolute positioning
         gcode_commands.push(format!("G4 P{}", settle_time.as_millis())); // Dwell
 
         let test_move = TestMove {
@@ -658,6 +669,39 @@ mod tests {
         assert_eq!(zvd.name, "ZVD");
         assert_eq!(zvd.coefficients.len(), 3);
         assert_eq!(zvd.delays.len(), 3);
+
+        // Weights sum to 1 for all of them, or the axis overshoots
+        for shaper in [InputShaperType::zv(50.0), zvd, InputShaperType::mzv(50.0), InputShaperType::ei(50.0)] {
+            let total: f32 = shaper.coefficients.iter().sum();
+            assert!((total - 1.0).abs() < 1e-5, "{} sums to {}", shaper.name, total);
+        }
+    }
+
+    #[test]
+    fn test_sequences_stay_gentle_and_near_the_start_point() {
+        let mut sequence = CalibrationTestSequence::new(ResonanceTestConfig::default());
+        sequence.add_frequency_test(200.0, 1.0);
+        let commands = &sequence.test_moves[0].gcode_commands;
+        assert!(commands.iter().any(|c| c == "G91"));
+
+        // Follow the relative moves: always close to the start, and back there at the end
+        let mut position = 0.0f32;
+        let mut furthest = 0.0f32;
+        for command in commands.iter().filter(|c| c.starts_with("G1 X")) {
+            position += command[4..].parse::<f32>().unwrap();
+            furthest = furthest.max(position.abs());
+        }
+        assert!(position.abs() < 0.001, "ended {} from the start", position);
+        let omega = 2.0 * std::f32::consts::PI * 200.0;
+        // Tolerance: at this frequency the amplitude is only a few steps of G-code's 0.0001mm
+        assert!(furthest * omega * omega <= MAX_TEST_ACCELERATION * 1.15, "shakes at {} mm/s²", furthest * omega * omega);
+    }
+
+    #[tokio::test]
+    async fn test_bad_config_is_refused_rather_than_hanging() {
+        let mut calibrator = AutoInputShaperCalibrator::new();
+        calibrator.set_test_config(ResonanceTestConfig { frequency_step: 0.0, ..Default::default() });
+        assert!(calibrator.start_calibration('X').await.is_err());
     }
 
     #[test]

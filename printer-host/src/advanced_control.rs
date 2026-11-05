@@ -23,6 +23,7 @@ pub struct StateSpaceController {
     reference: Vector4<f64>,         // Reference trajectory
     integral_state: Vector4<f64>,    // Integral state for steady-state error elimination
     previous_error: Vector4<f64>,    // For derivative term
+    last_control: Vector2<f64>,      // Output of the previous update
     dt: f64,                    // Sample time
 }
 
@@ -105,9 +106,17 @@ impl StateSpaceModel {
         // B_d = A^(-1) * (A_d - I) * B
         
         let a_matrix = (a_continuous * dt).exp();
-        let identity = Matrix4::identity();
-        let a_inv = a_continuous.try_inverse().unwrap_or(Matrix4::identity());
-        let b_matrix = a_inv * (a_matrix - identity) * b_continuous;
+
+        // A motion model has integrators, so A is singular and A^(-1) does not exist. (Falling
+        // back to an identity gave a wrong input matrix.) The series form needs no inverse:
+        // B_d = (I*dt + A*dt²/2! + A²*dt³/3! + ...) * B
+        let mut term = Matrix4::identity() * dt;
+        let mut sum = term;
+        for k in 2..16 {
+            term = term * a_continuous * (dt / k as f64);
+            sum += term;
+        }
+        let b_matrix = sum * b_continuous;
         
         // Output matrix - we can measure position and velocity
         let c_matrix = Matrix4::new(
@@ -169,10 +178,11 @@ impl StateSpaceController {
             reference: Vector4::zeros(),
             integral_state: Vector4::zeros(),
             previous_error: Vector4::zeros(),
+            last_control: Vector2::zeros(),
             dt,
         }
     }
-    
+
     fn solve_lqr(a: &Matrix4<f64>, b: &Matrix4x2, q: &Matrix4<f64>, r: &Matrix2<f64>) -> Matrix2x4<f64> {
         // Simplified LQR solution using iterative method
         // In practice, use a proper DARE solver like from the `control` crate
@@ -229,20 +239,23 @@ impl StateSpaceController {
     pub fn update(&mut self, measurement: Vector4<f64>, reference: Vector4<f64>) -> Vector2<f64> {
         // Update reference
         self.reference = reference;
-        
+
         // Kalman filter update (observer)
         let innovation = measurement - &self.model.c_matrix * &self.state_estimate;
         self.state_estimate += &self.observer_gain * innovation;
-        
-        // Predict next state
-        self.state_estimate = &self.model.a_matrix * &self.state_estimate;
-        
+
+        // Predict next state, including the effect of the last control output. Leaving that
+        // out means the observer never expects the motion it is itself commanding.
+        self.state_estimate = &self.model.a_matrix * &self.state_estimate + &self.model.b_matrix * self.last_control;
+
         // Calculate control input using LQR
         let error = self.reference - self.state_estimate;
         let control_input = &self.control_gain * error;
         
-        // Update integral state for steady-state error elimination
+        // Update integral state for steady-state error elimination, limited against windup
+        const INTEGRAL_LIMIT: f64 = 100.0;
         self.integral_state += error * self.dt;
+        self.integral_state = self.integral_state.map(|v| v.clamp(-INTEGRAL_LIMIT, INTEGRAL_LIMIT));
         let integral_gain = Matrix2x4::new(0.1, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0);
         let integral_control = integral_gain * self.integral_state;
         
@@ -252,8 +265,10 @@ impl StateSpaceController {
         let derivative_control = derivative_gain * derivative_error;
         
         self.previous_error = error;
-        
-        control_input + integral_control + derivative_control
+
+        let output = control_input + integral_control + derivative_control;
+        self.last_control = output;
+        output
     }
 }
 
