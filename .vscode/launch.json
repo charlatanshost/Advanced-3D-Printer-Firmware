@@ -1,7 +1,19 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
-    "configurations": []
+    "configurations": [
+        {
+            "name": "Printer Host GUI",
+            "type": "node-terminal",
+            "request": "launch",
+            "command": "cargo run",
+            "cwd": "${workspaceFolder}/printer-host"
+        },
+        {
+            "name": "Simulate example print",
+            "type": "node-terminal",
+            "request": "launch",
+            "command": "cargo run -- --simulate ../gcode/example.gcode",
+            "cwd": "${workspaceFolder}/printer-host"
+        }
+    ]
 }

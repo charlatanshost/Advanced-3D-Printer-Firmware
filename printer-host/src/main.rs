@@ -1,4 +1,6 @@
-use eframe::egui::{self, FontDefinitions, FontData, Color32, Visuals};
+mod ui_shell;
+
+use eframe::egui::{self, Color32};
 use std::sync::Arc;
 // use egui_plot::{Line, Plot, PlotPoints, Points}; // Commented out for now
 
@@ -318,8 +320,21 @@ async fn main() -> eframe::Result<()> {
         (Arc::new(DummySlaveGroup), tokio::sync::mpsc::channel::<[f32; 5]>(64).0)
     };
 
+    // Optional: open on a given page and theme, for example --page "bed mesh" --theme light
+    let option_value = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    let start_page = option_value("--page").and_then(|name| {
+        let tab = ui_shell::tab_from_name(&name);
+        if tab.is_none() {
+            eprintln!("No page called '{}': opening the Overview", name);
+        }
+        tab
+    });
+    let start_dark = option_value("--theme").map(|theme| theme != "light");
+
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size(egui::vec2(1280.0, 720.0)),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size(egui::vec2(1440.0, 900.0))
+            .with_min_inner_size(egui::vec2(1000.0, 640.0)),
         renderer: eframe::Renderer::Wgpu, // Reverted to wgpu
         ..Default::default()
     };
@@ -330,56 +345,17 @@ async fn main() -> eframe::Result<()> {
         "3D Printer Host",
         native_options,
         Box::new(move |cc| {
-            // Load fonts with emoji support
-            let mut fonts = FontDefinitions::default();
-            
-            // Keep the default system fonts which usually have better emoji support
-            // Only add Arial as a fallback, not as primary
-            let font_data = FontData::from_static(include_bytes!("resources/arial.ttf"));
-            let arc_font_data = Arc::new(font_data);
-            fonts.font_data.insert("arial".to_owned(), arc_font_data.clone());
-            
-            // Add Arial as a fallback (after default system fonts)
-            fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap().push("arial".to_owned());
-            fonts.families.get_mut(&egui::FontFamily::Monospace).unwrap().push("arial".to_owned());
-            
-            // Keep default font configuration which already includes system emoji fonts
-            // The default fonts are usually sufficient for emoji display
-            // We only add Arial as a text fallback, not replacing the system fonts
-            cc.egui_ctx.set_fonts(fonts);
-            
-            // Set smaller text size globally
-            let mut style = egui::Style::default();
-            style.text_styles.insert(
-                egui::TextStyle::Body,
-                egui::FontId::new(12.0, egui::FontFamily::Proportional),
-            );
-            style.text_styles.insert(
-                egui::TextStyle::Button,
-                egui::FontId::new(11.0, egui::FontFamily::Proportional),
-            );
-            style.text_styles.insert(
-                egui::TextStyle::Heading,
-                egui::FontId::new(16.0, egui::FontFamily::Proportional),
-            );
-            style.text_styles.insert(
-                egui::TextStyle::Small,
-                egui::FontId::new(10.0, egui::FontFamily::Proportional),
-            );
-            cc.egui_ctx.set_style(style);
-            println!("Loaded Arial font successfully");
-
-            // Set dark theme with high-contrast text
-            cc.egui_ctx.set_visuals(Visuals {
-                dark_mode: true,
-                override_text_color: Some(Color32::WHITE),
-                panel_fill: Color32::from_rgb(30, 30, 30), // Dark gray background
-                ..Visuals::default()
-            });
+            ui_shell::install(&cc.egui_ctx);
             cc.egui_ctx.set_debug_on_hover(false); // Disable debug rendering
             println!("UI initialized with wgpu renderer");
             let mut app = MyApp::new(kinematics, group, tx, gcode, vec![]); // Empty plot_points for now
             app.initialize_machine_config(); // Load machine config from saved settings
+            if let Some(tab) = start_page {
+                app.selected_tab = tab;
+            }
+            if let Some(dark) = start_dark {
+                app.dark_mode = dark;
+            }
             Ok(Box::new(app))
         }),
     )
@@ -697,8 +673,10 @@ impl Default for MockMPCStatus {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Tab {
+    Overview,
+
     // Motion & Kinematics
     Kinematics,
     MotionControl,
@@ -711,24 +689,20 @@ enum Tab {
     PressureAdvance,
 
     // Hardware Configuration
-    Hardware,
     MotorAssignment,
     ClosedLoop,
     Temperature,
 
     // Communication & Protocols
-    Communication,
     FieldbusConfig,
     CanToolheads,
 
     // G-code & Operations
     Gcode,
-    Operations,
     Macros,
     GcodeImport,
 
     // System & Configuration
-    System,
     Settings,
     PrinterConfig,
     RuntimeConfig,
@@ -1234,6 +1208,8 @@ struct MyApp {
     parsed_result_receiver: Option<mpsc::Receiver<(String, Option<GCodeFile>, Vec<[f64; 2]>)>>,
     is_parsing: bool,
     selected_tab: Tab,
+    nav_filter: String,
+    status_panel_open: bool,
     // Rendering cache for performance
     cached_3d_points: Vec<(egui::Pos2, f32)>,
     cached_2d_points: Vec<egui::Pos2>,
@@ -1460,6 +1436,9 @@ struct MyApp {
     five_axis_pose: Pose6DOF,
     five_axis_joints: JointConfiguration,
     machine_config_dirty: bool,
+    /// False until the machine type from startup has been applied. That first pass only sets up
+    /// the kinematics: saving belongs to a choice the user makes.
+    machine_type_loaded: bool,
     inverse_solutions: Vec<JointConfiguration>,
     forward_pose_result: Option<Result<Pose6DOF, String>>,
     show_5axis_config_dialog: bool,
@@ -1500,7 +1479,9 @@ impl MyApp {
             parsed_gcode: None,
             plot_points,
             selected_gcode_line: None,
-            selected_tab: Tab::Kinematics,
+            selected_tab: Tab::Overview,
+            nav_filter: String::new(),
+            status_panel_open: true,
             show_status_panel: true,
             show_add_motor_dialog: false,
             new_motor_id: "motor_1".to_string(),
@@ -1945,7 +1926,7 @@ impl MyApp {
                     commands: vec!["M104 S0".to_string(), "M140 S0".to_string(), "M107".to_string()],
                     enabled: true,
                     category: "Maintenance".to_string(),
-                    icon: "❄️".to_string(),
+                    icon: "❄".to_string(),
                 },
                 MacroDefinition {
                     name: "Disable Motors".to_string(),
@@ -1963,6 +1944,7 @@ impl MyApp {
             five_axis_pose: Pose6DOF::new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
             five_axis_joints: JointConfiguration::new(0.0, 0.0, 0.0, 0.0, 0.0),
             machine_config_dirty: true,
+            machine_type_loaded: false,
             inverse_solutions: vec![],
             forward_pose_result: None,
             show_5axis_config_dialog: false,
@@ -1988,6 +1970,11 @@ impl MyApp {
 
     /// Initialize machine configuration from saved config
     fn initialize_machine_config(&mut self) {
+        // Read the saved file. If it can't be used, keep the defaults and say so: the file is
+        // left alone unless the user saves something.
+        if let Err(e) = self.config_manager.load_config() {
+            eprintln!("Could not load the saved printer configuration, using defaults: {}", e);
+        }
         // Load machine type from configuration if available
         if let Some(saved_machine_type) = &self.config_manager.get_config().kinematics.five_axis_machine_type {
             self.selected_machine_type = saved_machine_type.clone();
@@ -2351,7 +2338,7 @@ impl MyApp {
             ui.label("🎮 3D Kinematics Visualizer");
 
             // Visualization controls
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.checkbox(&mut self.show_machine_structure, "🏭 Machine");
                 ui.checkbox(&mut self.show_workspace_bounds, "📏 Workspace");
                 ui.checkbox(&mut self.show_tool_path, "📍 Tool Path");
@@ -2362,7 +2349,7 @@ impl MyApp {
                     self.visualizer_3d_offset = (0.0, 0.0);
                 }
 
-                if ui.button("🗑️ Clear Path").clicked() {
+                if ui.button("🗑 Clear Path").clicked() {
                     self.tool_path_history.clear();
                 }
             });
@@ -2450,17 +2437,17 @@ impl MyApp {
                 // Bottom face
                 for i in 0..4 {
                     painter.line_segment([corners[i], corners[(i + 1) % 4]],
-                        egui::Stroke::new(1.0, egui::Color32::BLUE));
+                        egui::Stroke::new(1.0, ui_shell::info()));
                 }
                 // Top face
                 for i in 4..8 {
                     painter.line_segment([corners[i], corners[4 + (i - 4 + 1) % 4]],
-                        egui::Stroke::new(1.0, egui::Color32::BLUE));
+                        egui::Stroke::new(1.0, ui_shell::info()));
                 }
                 // Vertical edges
                 for i in 0..4 {
                     painter.line_segment([corners[i], corners[i + 4]],
-                        egui::Stroke::new(1.0, egui::Color32::BLUE));
+                        egui::Stroke::new(1.0, ui_shell::info()));
                 }
             }
 
@@ -2472,9 +2459,9 @@ impl MyApp {
                 let y_axis = project_3d(0.0, 50.0, 0.0);
                 let z_axis = project_3d(0.0, 0.0, 50.0);
 
-                painter.line_segment([origin, x_axis], egui::Stroke::new(3.0, egui::Color32::RED));
-                painter.line_segment([origin, y_axis], egui::Stroke::new(3.0, egui::Color32::GREEN));
-                painter.line_segment([origin, z_axis], egui::Stroke::new(3.0, egui::Color32::BLUE));
+                painter.line_segment([origin, x_axis], egui::Stroke::new(3.0, ui_shell::danger()));
+                painter.line_segment([origin, y_axis], egui::Stroke::new(3.0, ui_shell::good()));
+                painter.line_segment([origin, z_axis], egui::Stroke::new(3.0, ui_shell::info()));
 
                 // Draw base platform
                 let base_size = 100.0;
@@ -2487,7 +2474,7 @@ impl MyApp {
 
                 for i in 0..4 {
                     painter.line_segment([base_corners[i], base_corners[(i + 1) % 4]],
-                        egui::Stroke::new(2.0, egui::Color32::GRAY));
+                        egui::Stroke::new(2.0, ui_shell::muted()));
                 }
 
                 // Draw rotary table (simplified)
@@ -2505,7 +2492,7 @@ impl MyApp {
             );
 
             // Tool position indicator
-            painter.circle_filled(tool_pos, 8.0, egui::Color32::YELLOW);
+            painter.circle_filled(tool_pos, 8.0, ui_shell::warning());
             painter.circle_stroke(tool_pos, 8.0, egui::Stroke::new(2.0, egui::Color32::ORANGE));
 
             // Tool orientation vector
@@ -2522,7 +2509,7 @@ impl MyApp {
             );
 
             painter.line_segment([tool_pos, tool_tip],
-                egui::Stroke::new(3.0, egui::Color32::YELLOW));
+                egui::Stroke::new(3.0, ui_shell::warning()));
 
             // Update tool path history
             let current_tool_pos = (
@@ -2575,7 +2562,7 @@ impl MyApp {
 
             // Instructions
             ui.separator();
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("🎮 Controls:");
                 ui.label("Drag to rotate • Shift+Drag to pan • Scroll to zoom");
             });
@@ -2640,6 +2627,142 @@ impl MyApp {
     }
 
 }
+
+impl MyApp {
+    /// Always on screen, whichever page is open: printer state and the emergency stop.
+    fn show_top_bar(&mut self, ctx: &egui::Context) {
+        let (state_text, state_color) = match &self.printer_state {
+            PrinterState::Idle => ("Idle".to_string(), ui_shell::good()),
+            PrinterState::Printing => ("Printing".to_string(), ui_shell::info()),
+            PrinterState::Paused => ("Paused".to_string(), ui_shell::warning()),
+            PrinterState::Homing => ("Homing".to_string(), ui_shell::warning()),
+            PrinterState::Emergency => ("Emergency stop".to_string(), ui_shell::danger()),
+            PrinterState::Error(msg) => (msg.clone(), ui_shell::danger()),
+        };
+        let connected = !self.group.is_empty();
+        let palette = ui_shell::palette();
+        let bar = egui::Frame::new()
+            .fill(palette.surface)
+            .stroke(egui::Stroke::new(1.0, palette.border))
+            .inner_margin(egui::Margin::symmetric(16, 8));
+
+        egui::TopBottomPanel::top("top_bar").frame(bar).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui_shell::pill(ui, &state_text, state_color);
+                if connected {
+                    ui_shell::pill(ui, "Connected", ui_shell::good());
+                } else {
+                    ui_shell::pill(ui, "No printer connected", ui_shell::muted());
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (label, fill) = if self.emergency_stop_triggered {
+                        ("STOPPED", ui_shell::ESTOP_LATCHED)
+                    } else {
+                        ("EMERGENCY STOP", ui_shell::ESTOP)
+                    };
+                    let estop = egui::Button::new(egui::RichText::new(label).strong().color(Color32::WHITE))
+                        .fill(fill)
+                        .min_size(egui::vec2(160.0, 34.0));
+                    if ui.add(estop).clicked() && !self.emergency_stop_triggered {
+                        self.emergency_stop();
+                    }
+                    if self.emergency_stop_triggered && ui.button("Reset").clicked() {
+                        self.reset_emergency_stop();
+                    }
+
+                    ui.add_space(8.0);
+                    let panel_label = if self.status_panel_open { "Hide printer panel" } else { "Show printer panel" };
+                    if ui.button(panel_label).clicked() {
+                        self.status_panel_open = !self.status_panel_open;
+                    }
+                    let (icon, tip) = if self.dark_mode { ("☀", "Switch to light theme") } else { ("🌙", "Switch to dark theme") };
+                    if ui.button(icon).on_hover_text(tip).clicked() {
+                        self.dark_mode = !self.dark_mode;
+                    }
+                });
+            });
+        });
+    }
+
+    /// The landing page: where things stand, and the shortest way to the common tasks.
+    fn show_overview(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Overview");
+        ui.add_space(6.0);
+        egui::ScrollArea::vertical().id_salt("overview_scroll").auto_shrink([false, false]).show(ui, |ui| {
+            if self.group.is_empty() {
+                ui_shell::card(ui, |ui| {
+                    ui.label(egui::RichText::new("No printer connected").strong());
+                    ui.label(egui::RichText::new(
+                        "You can explore every page, but nothing here moves a machine yet and Start only previews a file. \
+                         To test a whole print in the simulator, run this in a terminal:",
+                    ).color(ui_shell::muted()));
+                    ui.monospace("cargo run -- --simulate ../gcode/example.gcode");
+                });
+                ui.add_space(8.0);
+            }
+
+            ui.columns(2, |columns| {
+                ui_shell::card(&mut columns[0], |ui| {
+                    ui_shell::section_title(ui, "PRINT JOB");
+                    match &self.gcode_file_path {
+                        Some(path) => {
+                            let name = std::path::Path::new(path)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.clone());
+                            ui.label(egui::RichText::new(name).strong());
+                            ui.label(format!("{:?}, line {}", self.execution_state, self.current_line));
+                        }
+                        None => {
+                            ui.label("No file loaded");
+                            ui.label(egui::RichText::new("Open a G-code file to preview its toolpath").color(ui_shell::muted()));
+                        }
+                    }
+                });
+                ui_shell::card(&mut columns[1], |ui| {
+                    ui_shell::section_title(ui, "MACHINE");
+                    ui.label(format!(
+                        "{}, {:?}",
+                        if self.printer_settings.enable_5axis_mode { "5-axis" } else { "3-axis" },
+                        self.communication_mode,
+                    ));
+                    ui.label(egui::RichText::new(format!("Z offset {:.3} mm", self.printer_settings.z_offset)).color(ui_shell::muted()));
+                });
+            });
+
+            ui.add_space(12.0);
+            ui_shell::section_title(ui, "JUMP TO");
+            let shortcuts = [
+                [
+                    (Tab::GcodeImport, "📁", "Open a file", "Load G-code to preview"),
+                    (Tab::Gcode, "📄", "G-code", "Toolpath and run controls"),
+                    (Tab::Kinematics, "🎯", "Move the machine", "Position and axes"),
+                ],
+                [
+                    (Tab::Temperature, "🌡", "Temperature", "Hotend and bed heaters"),
+                    (Tab::BedMesh, "📐", "Bed Mesh", "Leveling and probing"),
+                    (Tab::InputShaping, "📊", "Input Shaping", "Reduce ringing"),
+                ],
+                [
+                    (Tab::PrinterConfig, "🖨", "Printer", "Machine configuration"),
+                    (Tab::MotorAssignment, "🔩", "Motors", "Drivers and axes"),
+                    (Tab::FieldbusConfig, "🌐", "Fieldbus", "Connect to hardware"),
+                ],
+            ];
+            for row in shortcuts {
+                ui.columns(3, |columns| {
+                    for (column, (tab, icon, title, subtitle)) in columns.iter_mut().zip(row) {
+                        if ui_shell::tile(column, icon, title, subtitle).clicked() {
+                            self.selected_tab = tab;
+                        }
+                    }
+                });
+            }
+        });
+    }
+}
+
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -2724,100 +2847,60 @@ impl eframe::App for MyApp {
             }
         }
         
-        ctx.set_visuals(if self.dark_mode {
-            Visuals {
-                dark_mode: true,
-                override_text_color: Some(Color32::WHITE),
-                panel_fill: Color32::from_rgb(30, 30, 30),
-                ..Visuals::default()
-            }
-        } else {
-            Visuals {
-                dark_mode: false,
-                override_text_color: Some(Color32::BLACK),
-                panel_fill: Color32::from_rgb(240, 240, 240),
-                ..Visuals::default()
-            }
-        });
-        ctx.set_pixels_per_point(1.2); // Further reduced from 1.5 to make UI less cluttered
+        ui_shell::apply_theme(ctx, self.dark_mode);
 
-        egui::SidePanel::right("status_panel").show(ctx, |ui| {
-            ui.heading("Printer Status");
-            ui.separator();
-            
-            // Always-visible Emergency Stop button
-            let emergency_color = if self.emergency_stop_triggered { Color32::DARK_RED } else { Color32::from_rgb(200, 0, 0) };
-            ui.vertical_centered(|ui| {
-                let emergency_button = egui::Button::new("🚨 EMERGENCY STOP 🚨")
-                    .fill(emergency_color)
-                    .min_size(egui::vec2(180.0, 40.0));
-                
-                if ui.add(emergency_button).clicked() && !self.emergency_stop_triggered {
-                    self.emergency_stop();
+        ui_shell::sidebar(ctx, &mut self.selected_tab, &mut self.nav_filter);
+        self.show_top_bar(ctx);
+
+        // Emergency stop lives in the top bar, so hiding this panel can't hide it.
+        let status_panel_open = self.status_panel_open;
+        let status_panel_frame = egui::Frame::new()
+            .fill(ui_shell::palette().surface)
+            .stroke(egui::Stroke::new(1.0, ui_shell::palette().border))
+            .inner_margin(14);
+        egui::SidePanel::right("status_panel").default_width(250.0).frame(status_panel_frame).show_animated(ctx, status_panel_open, |ui| {
+            ui_shell::section_title(ui, "POSITION");
+            egui::Grid::new("status_position").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
+                let mut axes = vec![("X", self.x, "mm"), ("Y", self.y, "mm"), ("Z", self.z, "mm")];
+                if self.printer_settings.enable_5axis_mode {
+                    axes.push(("A", self.a, "°"));
+                    axes.push(("B", self.b, "°"));
                 }
-                
-                if self.emergency_stop_triggered {
-                    ui.separator();
-                    if ui.button("Reset Emergency Stop").clicked() {
-                        self.reset_emergency_stop();
-                    }
+                for (axis, value, unit) in axes {
+                    ui.label(egui::RichText::new(axis).color(ui_shell::muted()));
+                    ui.monospace(format!("{:8.2} {}", value, unit));
+                    ui.end_row();
                 }
             });
-            
-            ui.separator();
-            
-            // Printer state with color coding
-            let (state_text, state_color) = match &self.printer_state {
-                PrinterState::Idle => ("Idle", Color32::GREEN),
-                PrinterState::Printing => ("Printing", Color32::BLUE),
-                PrinterState::Paused => ("Paused", Color32::YELLOW),
-                PrinterState::Homing => ("Homing", Color32::from_rgb(255, 165, 0)), // Orange
-                PrinterState::Emergency => ("EMERGENCY STOP", Color32::RED),
-                PrinterState::Error(msg) => (msg.as_str(), Color32::RED),
-            };
-            
-            ui.horizontal(|ui| {
-                ui.label("State:");
-                ui.colored_label(state_color, state_text);
-            });
-            
-            ui.label(format!("Comm: {}", if self.group.is_empty() { "Disconnected" } else { "Connected" }));
-            
-            // Show linear position
-            ui.label(format!("Position: X:{:.1}, Y:{:.1}, Z:{:.1}", self.x, self.y, self.z));
-            
-            // Show rotary axes if 5-axis mode is enabled
             if self.printer_settings.enable_5axis_mode {
-                ui.label(format!("Rotary: A:{:.1}°, B:{:.1}°", self.a, self.b));
                 ui.label(format!("TCP: {}", if self.printer_settings.tool_point_control { "ON" } else { "OFF" }));
             }
-            
-            ui.label(format!("Protocol: {:?}", self.communication_mode));
-            
-            // Fieldbus Connection Status
-            ui.group(|ui| {
-                ui.label("📡 Fieldbus Status");
+
+            ui.separator();
+
+            egui::CollapsingHeader::new("Connection details").id_salt("status_connection").show(ui, |ui| {
+                ui.label(format!("Protocol: {:?}", self.communication_mode));
                 
                 // Show connection status for current protocol
                 let (status_text, status_color) = if let Some(status) = self.fieldbus_connection_status.get(&self.communication_mode) {
                     match status.as_str() {
-                        "Connected" => ("🟢 Connected", Color32::GREEN),
-                        "Connecting" => ("🟡 Connecting", Color32::YELLOW),
-                        "Disconnected" => ("🔴 Disconnected", Color32::RED),
-                        "Error" => ("❌ Error", Color32::RED),
-                        _ => (status.as_str(), Color32::GRAY),
+                        "Connected" => ("🟢 Connected", ui_shell::good()),
+                        "Connecting" => ("🟡 Connecting", ui_shell::warning()),
+                        "Disconnected" => ("🔴 Disconnected", ui_shell::danger()),
+                        "Error" => ("❌ Error", ui_shell::danger()),
+                        _ => (status.as_str(), ui_shell::muted()),
                     }
                 } else {
-                    ("⚫ Unknown", Color32::GRAY)
+                    ("⚫ Unknown", ui_shell::muted())
                 };
                 
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.colored_label(status_color, status_text);
                     
                     // Show error count if any
                     if let Some(&error_count) = self.fieldbus_error_counts.get(&self.communication_mode) {
                         if error_count > 0 {
-                            ui.colored_label(Color32::RED, format!("⚠ {} errors", error_count));
+                            ui.colored_label(ui_shell::danger(), format!("⚠ {} errors", error_count));
                         }
                     }
                 });
@@ -2834,7 +2917,7 @@ impl eframe::App for MyApp {
                     };
                     ui.label(format!("Last activity: {}", time_text));
                 } else {
-                    ui.colored_label(Color32::GRAY, "No activity recorded");
+                    ui.colored_label(ui_shell::muted(), "No activity recorded");
                 }
                 
                 // Protocol-specific status information
@@ -2843,13 +2926,13 @@ impl eframe::App for MyApp {
                         #[cfg(target_os = "linux")]
                         ui.label(format!("Slaves: {}", if self.group.is_empty() { 0 } else { self.group.len() }));
                         #[cfg(not(target_os = "linux"))]
-                        ui.colored_label(Color32::YELLOW, "⚠ Platform not supported");
+                        ui.colored_label(ui_shell::warning(), "⚠ Platform not supported");
                     },
                     CommunicationMode::BACnet => {
                         if let Some(diag) = self.protocol_manager.get_diagnostics(CommunicationMode::BACnet) {
                             ui.label(format!("Packets: {} sent, {} received", diag.packets_sent, diag.packets_received));
                             if diag.error_count > 0 {
-                                ui.colored_label(Color32::RED, format!("⚠ {} protocol errors", diag.error_count));
+                                ui.colored_label(ui_shell::danger(), format!("⚠ {} protocol errors", diag.error_count));
                             }
                         }
                     },
@@ -2862,9 +2945,9 @@ impl eframe::App for MyApp {
                     CommunicationMode::CODESYS => {
                         if let Some(diag) = self.protocol_manager.get_diagnostics(CommunicationMode::CODESYS) {
                             if diag.connected {
-                                ui.colored_label(Color32::GREEN, "✓ Authenticated");
+                                ui.colored_label(ui_shell::good(), "✓ Authenticated");
                             } else {
-                                ui.colored_label(Color32::RED, "❌ Not authenticated");
+                                ui.colored_label(ui_shell::danger(), "❌ Not authenticated");
                             }
                         }
                     },
@@ -2883,9 +2966,9 @@ impl eframe::App for MyApp {
                         if let Ok(can_manager) = self.can_manager.try_lock() {
                             let toolhead_count = can_manager.get_toolheads().len();
                             if toolhead_count > 0 {
-                                ui.colored_label(Color32::GREEN, format!("🔗 {} CAN toolheads", toolhead_count));
+                                ui.colored_label(ui_shell::good(), format!("🔗 {} CAN toolheads", toolhead_count));
                             } else {
-                                ui.colored_label(Color32::YELLOW, "⚠ No toolheads detected");
+                                ui.colored_label(ui_shell::warning(), "⚠ No toolheads detected");
                             }
                         }
                     },
@@ -2895,13 +2978,13 @@ impl eframe::App for MyApp {
                     CommunicationMode::Serial => {
                         ui.label(format!("Port: {} @ {} baud", self.serial_port_name, self.serial_baud_rate));
                         if let Some(_) = &self.serial_port {
-                            ui.colored_label(Color32::GREEN, "✓ Port open");
+                            ui.colored_label(ui_shell::good(), "✓ Port open");
                         } else {
-                            ui.colored_label(Color32::RED, "❌ Port closed");
+                            ui.colored_label(ui_shell::danger(), "❌ Port closed");
                         }
                     },
                     _ => {
-                        ui.colored_label(Color32::YELLOW, "⚠ Protocol status not implemented");
+                        ui.colored_label(ui_shell::warning(), "⚠ Protocol status not implemented");
                     }
                 }
                 
@@ -2917,23 +3000,23 @@ impl eframe::App for MyApp {
                         .count();
                     
                     if enabled_axes > 0 {
-                        ui.colored_label(Color32::GREEN, format!("🎯 Input shaping: {}/5 axes", enabled_axes));
+                        ui.colored_label(ui_shell::good(), format!("🎯 Input shaping: {}/5 axes", enabled_axes));
                     } else {
-                        ui.colored_label(Color32::YELLOW, "🎯 Input shaping enabled (no axes)");
+                        ui.colored_label(ui_shell::warning(), "🎯 Input shaping enabled (no axes)");
                     }
                 } else {
-                    ui.colored_label(Color32::GRAY, "🎯 Input shaping disabled");
+                    ui.colored_label(ui_shell::muted(), "🎯 Input shaping disabled");
                 }
             });
             
             ui.separator();
             
             // Z Offset Controls
-            ui.label("Z Offset Controls:");
-            ui.horizontal(|ui| {
+            ui_shell::section_title(ui, "Z OFFSET");
+            ui.horizontal_wrapped(|ui| {
                 ui.label(format!("Current: {:.3}mm", self.printer_settings.z_offset));
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.small_button("-0.1").clicked() && !self.emergency_stop_triggered {
                     self.adjust_z_offset(-0.1);
                 }
@@ -2944,7 +3027,7 @@ impl eframe::App for MyApp {
                     self.adjust_z_offset(-0.01);
                 }
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.small_button("+0.01").clicked() && !self.emergency_stop_triggered {
                     self.adjust_z_offset(0.01);
                 }
@@ -2962,8 +3045,8 @@ impl eframe::App for MyApp {
             ui.separator();
             
             // Quick controls
-            ui.label("Quick Controls:");
-            ui.horizontal(|ui| {
+            ui_shell::section_title(ui, "QUICK CONTROLS");
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("🏠 Home All").clicked() && !self.emergency_stop_triggered {
                     self.printer_state = PrinterState::Homing;
                     println!("Homing all axes...");
@@ -2972,11 +3055,11 @@ impl eframe::App for MyApp {
                     println!("Motors disabled");
                 }
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("🔍 Probe Z").clicked() && !self.emergency_stop_triggered {
                     self.start_probe_sequence();
                 }
-                if ui.button("⚙️ Auto Level").clicked() && !self.emergency_stop_triggered {
+                if ui.button("⚙ Auto Level").clicked() && !self.emergency_stop_triggered {
                     println!("Starting auto bed leveling...");
                     self.printer_state = PrinterState::Homing;
                 }
@@ -3124,81 +3207,14 @@ impl eframe::App for MyApp {
             }
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Scrollable tab navigation to handle overflow
-            egui::ScrollArea::horizontal()
-                .id_salt("tab_navigation_scroll")
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.style_mut().visuals.selection.bg_fill = Color32::DARK_BLUE;
-                        ui.style_mut().visuals.selection.stroke.color = Color32::WHITE;
-                        ui.style_mut().spacing.button_padding = egui::vec2(8.0, 6.0);
-
-                // Use compact icons instead of text to save space
-                // Motion & Kinematics Group
-                ui.label("🎯 Motion & Kinematics");
-                ui.selectable_value(&mut self.selected_tab, Tab::Kinematics, "⚙️ Kinematics");
-                ui.selectable_value(&mut self.selected_tab, Tab::MotionControl, "🔄 Motion Control");
-                ui.selectable_value(&mut self.selected_tab, Tab::InputShaping, "📊 Input Shaping");
-                ui.selectable_value(&mut self.selected_tab, Tab::AutoInputShaper, "🎯 Auto Calibration");
-                ui.selectable_value(&mut self.selected_tab, Tab::VolumetricCompensation, "📐 Volume Compensation");
-                ui.selectable_value(&mut self.selected_tab, Tab::SensorFusion, "🔗 Sensor Fusion");
-                ui.selectable_value(&mut self.selected_tab, Tab::StateSpaceControl, "🎚️ State-Space Control");
-                ui.selectable_value(&mut self.selected_tab, Tab::ModelPredictiveControl, "🔮 Model Predictive Control");
-                ui.selectable_value(&mut self.selected_tab, Tab::PressureAdvance, "💨 Pressure Advance");
-
-                ui.separator();
-
-                // Hardware Configuration Group
-                ui.label("🔧 Hardware Configuration");
-                ui.selectable_value(&mut self.selected_tab, Tab::Hardware, "🖨️ Hardware");
-                ui.selectable_value(&mut self.selected_tab, Tab::MotorAssignment, "🔩 Motors");
-                ui.selectable_value(&mut self.selected_tab, Tab::ClosedLoop, "🔄 Closed Loop");
-                ui.selectable_value(&mut self.selected_tab, Tab::Temperature, "🌡️ Temperature");
-
-                ui.separator();
-
-                // Communication & Protocols Group
-                ui.label("🔌 Communication");
-                ui.selectable_value(&mut self.selected_tab, Tab::Communication, "🔌 Protocols");
-                ui.selectable_value(&mut self.selected_tab, Tab::FieldbusConfig, "🌐 Fieldbus");
-                ui.selectable_value(&mut self.selected_tab, Tab::CanToolheads, "🚛 CAN Bus");
-
-                ui.separator();
-
-                // G-code & Operations Group
-                ui.label("📄 G-code & Operations");
-                ui.selectable_value(&mut self.selected_tab, Tab::Gcode, "📄 G-code");
-                ui.selectable_value(&mut self.selected_tab, Tab::Operations, "🎯 Operations");
-                ui.selectable_value(&mut self.selected_tab, Tab::Macros, "🎯 Macros");
-                ui.selectable_value(&mut self.selected_tab, Tab::GcodeImport, "📁 Import");
-
-                ui.separator();
-
-                // System & Configuration Group
-                ui.label("🔧 System & Config");
-                ui.selectable_value(&mut self.selected_tab, Tab::System, "⚙️ System");
-                ui.selectable_value(&mut self.selected_tab, Tab::Settings, "🔧 Settings");
-                ui.selectable_value(&mut self.selected_tab, Tab::PrinterConfig, "🖨️ Printer");
-                ui.selectable_value(&mut self.selected_tab, Tab::RuntimeConfig, "⚙️ Runtime");
-
-                ui.separator();
-
-                // Utilities & Diagnostics Group
-                ui.label("🔍 Utilities");
-                ui.selectable_value(&mut self.selected_tab, Tab::BedMesh, "📐 Bed Mesh");
-                ui.selectable_value(&mut self.selected_tab, Tab::FanControl, "🌪️ Fans");
-                ui.selectable_value(&mut self.selected_tab, Tab::Webcam, "📷 Webcam");
-                ui.selectable_value(&mut self.selected_tab, Tab::PowerLoss, "⚡ Power Loss");
-                        ui.selectable_value(&mut self.selected_tab, Tab::Terminal, "💻 Terminal");
-                    });
-                });
-            ui.separator();
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(24, 18)))
+            .show(ctx, |ui| {
 
             match self.selected_tab {
+                Tab::Overview => self.show_overview(ui),
                 Tab::Kinematics => {
-                    ui.heading("⚙️ Kinematics - Motion Control & Configuration");
+                    ui.heading("⚙ Kinematics - Motion Control & Configuration");
 
                     egui::ScrollArea::vertical()
                         .id_salt("kinematics_scroll")
@@ -3208,7 +3224,7 @@ impl eframe::App for MyApp {
                         // Kinematics Type Selection
                         ui.group(|ui| {
                             ui.label("🎯 Kinematics Type");
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.radio_value(&mut self.printer_settings.enable_5axis_mode, false, "Standard 3-Axis");
                                 ui.radio_value(&mut self.printer_settings.enable_5axis_mode, true, "5-Axis Advanced");
                             });
@@ -3270,7 +3286,7 @@ impl eframe::App for MyApp {
                             ui.label(format!("Motor Positions: {:?}", positions));
                             
                             if self.input_shaping_enabled {
-                                ui.colored_label(Color32::GREEN, "🎯 Input Shaping Applied");
+                                ui.colored_label(ui_shell::good(), "🎯 Input Shaping Applied");
                             }
                             
                             ui.label(format!("Scene Entities: {}", self.scene.entities.len()));
@@ -3278,20 +3294,22 @@ impl eframe::App for MyApp {
                         } else {
                             // 5-Axis Advanced Controls with 3D Visualization
                             // Split layout: Controls on left, 3D visualizer on right
+                            let page_height = ui.available_height();
                             ui.horizontal(|ui| {
                                 // Left panel: Controls (40% width)
                                 ui.allocate_ui_with_layout(
-                                    egui::vec2(ui.available_width() * 0.4, ui.available_height()),
+                                    egui::vec2(ui.available_width() * 0.4, page_height),
                                     egui::Layout::top_down(egui::Align::LEFT),
                                     |ui| {
                                         egui::ScrollArea::vertical()
                                             .id_salt("kinematics_5axis_controls_scroll")
+                                            .max_height(page_height)
                                             .auto_shrink([false, true])
                                             .show(ui, |ui| {
                             // Machine Type Selection
                             ui.group(|ui| {
                                 ui.label("🏭 Machine Type Configuration");
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     if ui.button("Penta Axis Style").clicked() {
                                         self.selected_machine_type = PracticalMachineType::penta_axis_style();
                                         self.machine_config_dirty = true;
@@ -3306,7 +3324,7 @@ impl eframe::App for MyApp {
                                     }
                                 });
 
-                                if ui.button("⚙️ Configure Machine").clicked() {
+                                if ui.button("⚙ Configure Machine").clicked() {
                                     self.show_5axis_config_dialog = true;
                                 }
 
@@ -3314,10 +3332,13 @@ impl eframe::App for MyApp {
                                 if self.machine_config_dirty {
                                     self.five_axis_kinematics = Some(PracticalKinematics::new(self.selected_machine_type.clone()));
                                     // Save machine type to configuration
-                                    self.config_manager.get_config_mut().kinematics.five_axis_machine_type = Some(self.selected_machine_type.clone());
-                                    if let Err(e) = self.config_manager.save_config() {
-                                        println!("⚠️ Failed to save machine configuration: {}", e);
+                                    if self.machine_type_loaded {
+                                        self.config_manager.get_config_mut().kinematics.five_axis_machine_type = Some(self.selected_machine_type.clone());
+                                        if let Err(e) = self.config_manager.save_config() {
+                                            println!("⚠ Failed to save machine configuration: {}", e);
+                                        }
                                     }
+                                    self.machine_type_loaded = true;
                                     self.machine_config_dirty = false;
                                 }
 
@@ -3367,7 +3388,7 @@ impl eframe::App for MyApp {
                             // Target Pose Input
                             ui.group(|ui| {
                                 ui.label("🎯 Target Pose");
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Position (mm):");
                                     ui.push_id("pose_position", |ui| {
                                         ui.add(egui::DragValue::new(&mut self.five_axis_pose.position.x).prefix("X: ").speed(1.0));
@@ -3375,7 +3396,7 @@ impl eframe::App for MyApp {
                                         ui.add(egui::DragValue::new(&mut self.five_axis_pose.position.z).prefix("Z: ").speed(1.0));
                                     });
                                 });
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Orientation (deg):");
                                     let (mut roll, mut pitch, mut yaw) = self.five_axis_pose.euler_angles();
                                     roll = roll.to_degrees();
@@ -3405,35 +3426,35 @@ impl eframe::App for MyApp {
                             // Workspace Limits
                             ui.group(|ui| {
                                 ui.label("📏 Workspace Limits");
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("X:");
                                     ui.push_id("workspace_x", |ui| {
                                         ui.add(egui::DragValue::new(&mut self.workspace_limits.x_limits.0).prefix("Min: ").speed(10.0));
                                         ui.add(egui::DragValue::new(&mut self.workspace_limits.x_limits.1).prefix("Max: ").speed(10.0));
                                     });
                                 });
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Y:");
                                     ui.push_id("workspace_y", |ui| {
                                         ui.add(egui::DragValue::new(&mut self.workspace_limits.y_limits.0).prefix("Min: ").speed(10.0));
                                         ui.add(egui::DragValue::new(&mut self.workspace_limits.y_limits.1).prefix("Max: ").speed(10.0));
                                     });
                                 });
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Z:");
                                     ui.push_id("workspace_z", |ui| {
                                         ui.add(egui::DragValue::new(&mut self.workspace_limits.z_limits.0).prefix("Min: ").speed(10.0));
                                         ui.add(egui::DragValue::new(&mut self.workspace_limits.z_limits.1).prefix("Max: ").speed(10.0));
                                     });
                                 });
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("A (tilt):");
                                     ui.push_id("workspace_a", |ui| {
                                         ui.add(egui::DragValue::new(&mut self.workspace_limits.a_limits.0).prefix("Min: ").speed(1.0).suffix("°"));
                                         ui.add(egui::DragValue::new(&mut self.workspace_limits.a_limits.1).prefix("Max: ").speed(1.0).suffix("°"));
                                     });
                                 });
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("B/C (rotation):");
                                     ui.push_id("workspace_bc", |ui| {
                                         ui.add(egui::DragValue::new(&mut self.workspace_limits.b_or_c_limits.0).prefix("Min: ").speed(1.0).suffix("°"));
@@ -3469,21 +3490,23 @@ impl eframe::App for MyApp {
                     ui.heading("🔄 Motion Control & Advanced Features");
                     
                     // Split layout: Controls on left, 3D visualizer on right
+                    let page_height = ui.available_height();
                     ui.horizontal(|ui| {
                         // Left panel: Controls (40% width)
                         ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width() * 0.4, ui.available_height()),
+                            egui::vec2(ui.available_width() * 0.4, page_height),
                             egui::Layout::top_down(egui::Align::LEFT),
                             |ui| {
                                 egui::ScrollArea::vertical()
                                     .id_salt("fiveaxis_controls_scroll")
+                                    .max_height(page_height)
                                     .auto_shrink([false, true])
                                     .show(ui, |ui| {
                         
                         // Machine Type Selection
                         ui.group(|ui| {
                             ui.label("🏭 Machine Type Configuration");
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 if ui.button("Penta Axis Style").clicked() {
                                     self.selected_machine_type = PracticalMachineType::penta_axis_style();
                                     self.machine_config_dirty = true;
@@ -3498,7 +3521,7 @@ impl eframe::App for MyApp {
                                 }
                             });
                             
-                            if ui.button("⚙️ Configure Machine").clicked() {
+                            if ui.button("⚙ Configure Machine").clicked() {
                                 self.show_5axis_config_dialog = true;
                             }
                             
@@ -3506,10 +3529,13 @@ impl eframe::App for MyApp {
                             if self.machine_config_dirty {
                                 self.five_axis_kinematics = Some(PracticalKinematics::new(self.selected_machine_type.clone()));
                                 // Save machine type to configuration
-                                self.config_manager.get_config_mut().kinematics.five_axis_machine_type = Some(self.selected_machine_type.clone());
-                                if let Err(e) = self.config_manager.save_config() {
-                                    println!("⚠️ Failed to save machine configuration: {}", e);
+                                if self.machine_type_loaded {
+                                    self.config_manager.get_config_mut().kinematics.five_axis_machine_type = Some(self.selected_machine_type.clone());
+                                    if let Err(e) = self.config_manager.save_config() {
+                                        println!("⚠ Failed to save machine configuration: {}", e);
+                                    }
                                 }
+                                self.machine_type_loaded = true;
                                 self.machine_config_dirty = false;
                             }
 
@@ -3559,7 +3585,7 @@ impl eframe::App for MyApp {
                         // Target Pose Input
                         ui.group(|ui| {
                             ui.label("🎯 Target Pose");
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Position (mm):");
                                 ui.push_id("pose_position", |ui| {
                                     ui.add(egui::DragValue::new(&mut self.five_axis_pose.position.x).prefix("X: ").speed(1.0));
@@ -3567,7 +3593,7 @@ impl eframe::App for MyApp {
                                     ui.add(egui::DragValue::new(&mut self.five_axis_pose.position.z).prefix("Z: ").speed(1.0));
                                 });
                             });
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Orientation (deg):");
                                 let (mut roll, mut pitch, mut yaw) = self.five_axis_pose.euler_angles();
                                 roll = roll.to_degrees();
@@ -3599,7 +3625,7 @@ impl eframe::App for MyApp {
                             ui.group(|ui| {
                                 ui.label("🔢 Kinematics Calculation");
                                 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     if ui.button("🔍 Solve Inverse Kinematics").clicked() {
                                         match kinematics.inverse_kinematics_analytical(&self.five_axis_pose) {
                                             Ok(solutions) => {
@@ -3612,7 +3638,7 @@ impl eframe::App for MyApp {
                                         }
                                     }
                                     
-                                    if ui.button("➡️ Solve Forward Kinematics").clicked() {
+                                    if ui.button("➡ Solve Forward Kinematics").clicked() {
                                         match kinematics.forward_kinematics_fast(&self.five_axis_joints) {
                                             Ok(pose) => {
                                                 self.forward_pose_result = Some(Ok(pose));
@@ -3627,7 +3653,7 @@ impl eframe::App for MyApp {
                                 // Joint Configuration Input
                                 ui.group(|ui| {
                                     ui.label("🔧 Joint Configuration");
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.push_id("joint_config", |ui| {
                                             ui.add(egui::DragValue::new(&mut self.five_axis_joints.x).prefix("X: ").speed(1.0).suffix(" mm"));
                                             ui.add(egui::DragValue::new(&mut self.five_axis_joints.y).prefix("Y: ").speed(1.0).suffix(" mm"));
@@ -3643,7 +3669,7 @@ impl eframe::App for MyApp {
                                     ui.group(|ui| {
                                         ui.label("✅ Inverse Kinematics Solutions:");
                                         for (i, solution) in self.inverse_solutions.iter().enumerate() {
-                                            ui.horizontal(|ui| {
+                                            ui.horizontal_wrapped(|ui| {
                                                 ui.label(format!("Solution {}:", i + 1));
                                                 ui.label(format!("X:{:.1} Y:{:.1} Z:{:.1} A:{:.1}° B:{:.1}°", 
                                                     solution.x, solution.y, solution.z, solution.a, solution.b_or_c));
@@ -3674,7 +3700,7 @@ impl eframe::App for MyApp {
                                 }
                             });
                         } else {
-                            ui.label("⚠️ No 5-axis kinematics configured. Select a machine type above.");
+                            ui.label("⚠ No 5-axis kinematics configured. Select a machine type above.");
                         }
                         
                         ui.separator();
@@ -3682,35 +3708,35 @@ impl eframe::App for MyApp {
                         // Workspace Limits
                         ui.group(|ui| {
                             ui.label("📏 Workspace Limits");
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("X:");
                                 ui.push_id("workspace_x", |ui| {
                                     ui.add(egui::DragValue::new(&mut self.workspace_limits.x_limits.0).prefix("Min: ").speed(10.0));
                                     ui.add(egui::DragValue::new(&mut self.workspace_limits.x_limits.1).prefix("Max: ").speed(10.0));
                                 });
                             });
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Y:");
                                 ui.push_id("workspace_y", |ui| {
                                     ui.add(egui::DragValue::new(&mut self.workspace_limits.y_limits.0).prefix("Min: ").speed(10.0));
                                     ui.add(egui::DragValue::new(&mut self.workspace_limits.y_limits.1).prefix("Max: ").speed(10.0));
                                 });
                             });
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Z:");
                                 ui.push_id("workspace_z", |ui| {
                                     ui.add(egui::DragValue::new(&mut self.workspace_limits.z_limits.0).prefix("Min: ").speed(10.0));
                                     ui.add(egui::DragValue::new(&mut self.workspace_limits.z_limits.1).prefix("Max: ").speed(10.0));
                                 });
                             });
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("A (tilt):");
                                 ui.push_id("workspace_a", |ui| {
                                     ui.add(egui::DragValue::new(&mut self.workspace_limits.a_limits.0).prefix("Min: ").speed(1.0).suffix("°"));
                                     ui.add(egui::DragValue::new(&mut self.workspace_limits.a_limits.1).prefix("Max: ").speed(1.0).suffix("°"));
                                 });
                             });
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("B/C (rotation):");
                                 ui.push_id("workspace_bc", |ui| {
                                     ui.add(egui::DragValue::new(&mut self.workspace_limits.b_or_c_limits.0).prefix("Min: ").speed(1.0).suffix("°"));
@@ -3738,7 +3764,7 @@ impl eframe::App for MyApp {
                     ui.heading("G-code Viewer");
                     
                     if self.is_parsing {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.spinner();
                             ui.label("Loading and parsing G-code file...");
                         });
@@ -3747,12 +3773,12 @@ impl eframe::App for MyApp {
                     
                     if let Some(path) = &self.gcode_file_path {
                         let path_display = path.clone(); // Clone to avoid borrow checker issues
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label(format!("File: {}", path_display));
                             ui.separator();
                             
                             // Add cancel/clear G-code functionality
-                            if ui.button("🗑️ Clear G-code").clicked() {
+                            if ui.button("🗑 Clear G-code").clicked() {
                                 self.gcode_file_path = None;
                                 self.parsed_gcode = None;
                                 self.plot_points.clear();
@@ -3782,7 +3808,7 @@ impl eframe::App for MyApp {
                             
                             ui.separator();
                             if self.test_mode {
-                                ui.colored_label(Color32::YELLOW, "🧪 TEST MODE");
+                                ui.colored_label(ui_shell::warning(), "🧪 TEST MODE");
                                 ui.separator();
                                 ui.label(format!("State: {:?}", self.test_execution_state));
                                 if self.parsed_gcode.is_some() {
@@ -3790,7 +3816,7 @@ impl eframe::App for MyApp {
                                     ui.label(format!("Line: {}/{}", self.test_current_line + 1, self.gcode.lines().count()));
                                 }
                             } else {
-                                ui.colored_label(Color32::RED, "🔧 REAL MODE");
+                                ui.colored_label(ui_shell::danger(), "🔧 REAL MODE");
                                 ui.separator();
                                 ui.label(format!("State: {:?}", self.execution_state));
                                 if self.parsed_gcode.is_some() {
@@ -3801,13 +3827,13 @@ impl eframe::App for MyApp {
                         });
                         
                         if let Some(parsed) = &self.parsed_gcode {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(format!("Commands: {}", parsed.commands.len()));
                                 ui.separator();
                                 ui.label(format!("Plot points: {}", self.plot_points.len()));
                             });
                             
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 if self.test_mode {
                                     let can_start = self.test_execution_state == ExecutionState::Idle || self.test_execution_state == ExecutionState::Completed;
                                     let can_pause = self.test_execution_state == ExecutionState::Running;
@@ -3893,7 +3919,7 @@ impl eframe::App for MyApp {
                             
                             ui.columns(2, |columns| {
                                 columns[0].vertical(|ui| {
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.heading("Toolpath Preview");
                                         ui.separator();
                                         if ui.selectable_label(!self.view_3d, "2D").clicked() {
@@ -3994,7 +4020,7 @@ impl eframe::App for MyApp {
                                             }
                                         }
                                         
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             if self.view_3d {
                                                 ui.colored_label(Color32::from_rgb(255, 255, 100), "🟡 High Z");
                                                 ui.colored_label(Color32::from_rgb(0, 255, 0), "🟢 Low Z / Executed");
@@ -4016,7 +4042,7 @@ impl eframe::App for MyApp {
                                 });
                                 
                                 columns[1].vertical(|ui| {
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.heading("G-code");
                                         ui.separator();
                                         if ui.button("🔄 View Full Path").clicked() {
@@ -4046,23 +4072,23 @@ impl eframe::App for MyApp {
                                                 let is_executed = line_num < current_line && *exec_state != ExecutionState::Idle;
                                                 let is_selected = self.selected_gcode_line == Some(line_num);
                                                 
-                                                let response = ui.horizontal(|ui| {
+                                                let response = ui.horizontal_wrapped(|ui| {
                                                     let line_num_color = if is_selected {
-                                                        Color32::LIGHT_BLUE
+                                                        ui_shell::info()
                                                     } else if is_current {
-                                                        Color32::YELLOW
+                                                        ui_shell::warning()
                                                     } else if is_executed {
                                                         Color32::from_rgb(0, 200, 0)
                                                     } else {
-                                                        Color32::GRAY
+                                                        ui_shell::muted()
                                                     };
                                                     
                                                     ui.colored_label(line_num_color, format!("{:4}", line_num + 1));
                                                     
                                                     let line_color = if is_selected {
-                                                        Color32::LIGHT_BLUE
+                                                        ui_shell::info()
                                                     } else if is_current {
-                                                        Color32::YELLOW
+                                                        ui_shell::warning()
                                                     } else if is_executed {
                                                         Color32::from_rgb(100, 255, 100)
                                                     } else if line.trim().starts_with(';') {
@@ -4110,102 +4136,8 @@ impl eframe::App for MyApp {
                             });
                         }
                     } else {
-                        ui.label("No G-code file loaded. Use the 'Gcode Import' tab to load a file.");
+                        ui.label("No G-code file loaded. Use the Import page to load a file.");
                     }
-                }
-                Tab::Hardware => {
-                    ui.heading("🖨️ Hardware Configuration");
-
-                    egui::ScrollArea::vertical()
-                        .id_salt("hardware_scroll")
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-
-                        ui.label("Hardware settings combined here - Motor Assignment, Closed Loop, Temperature");
-                        ui.label("Select the specific hardware tab from the sidebar for detailed configuration.");
-
-                        // Quick links to specific hardware tabs
-                        ui.horizontal(|ui| {
-                            if ui.button("🔩 Configure Motors").clicked() {
-                                self.selected_tab = Tab::MotorAssignment;
-                            }
-                            if ui.button("🔄 Closed Loop Control").clicked() {
-                                self.selected_tab = Tab::ClosedLoop;
-                            }
-                            if ui.button("🌡️ Temperature Control").clicked() {
-                                self.selected_tab = Tab::Temperature;
-                            }
-                        });
-                    });
-                }
-                Tab::Operations => {
-                    ui.heading("🎯 Operations & Automation");
-
-                    egui::ScrollArea::vertical()
-                        .id_salt("operations_scroll")
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-
-                        ui.label("Operations settings combined here - Macros, G-code Import, etc.");
-                        ui.label("Select the specific operations tab from the sidebar for detailed configuration.");
-
-                        // Quick links to specific operations tabs
-                        ui.horizontal(|ui| {
-                            if ui.button("🎯 Configure Macros").clicked() {
-                                self.selected_tab = Tab::Macros;
-                            }
-                            if ui.button("📁 G-code Import").clicked() {
-                                self.selected_tab = Tab::GcodeImport;
-                            }
-                        });
-                    });
-                }
-                Tab::Communication => {
-                    ui.heading("🔌 Communication & Protocols");
-
-                    egui::ScrollArea::vertical()
-                        .id_salt("communication_scroll")
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-
-                        ui.label("Communication settings combined here - Fieldbus, CAN Bus, etc.");
-                        ui.label("Select the specific communication tab from the sidebar for detailed configuration.");
-
-                        // Quick links to specific communication tabs
-                        ui.horizontal(|ui| {
-                            if ui.button("🌐 Configure Fieldbus").clicked() {
-                                self.selected_tab = Tab::FieldbusConfig;
-                            }
-                            if ui.button("🚛 CAN Bus Toolheads").clicked() {
-                                self.selected_tab = Tab::CanToolheads;
-                            }
-                        });
-                    });
-                }
-                Tab::System => {
-                    ui.heading("⚙️ System Configuration");
-
-                    egui::ScrollArea::vertical()
-                        .id_salt("system_scroll")
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-
-                        ui.label("System settings combined here - Settings, Printer Config, Runtime Config, etc.");
-                        ui.label("Select the specific system tab from the sidebar for detailed configuration.");
-
-                        // Quick links to specific system tabs
-                        ui.horizontal(|ui| {
-                            if ui.button("🔧 General Settings").clicked() {
-                                self.selected_tab = Tab::Settings;
-                            }
-                            if ui.button("🖨️ Printer Configuration").clicked() {
-                                self.selected_tab = Tab::PrinterConfig;
-                            }
-                            if ui.button("⚙️ Runtime Configuration").clicked() {
-                                self.selected_tab = Tab::RuntimeConfig;
-                            }
-                        });
-                    });
                 }
                 Tab::Settings => {
                     ui.heading("Settings");
@@ -4216,7 +4148,7 @@ impl eframe::App for MyApp {
                         .show(ui, |ui| {
                         ui.group(|ui| {
                             ui.label("🎨 Appearance");
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Theme:");
                                 if ui.selectable_label(self.dark_mode, "🌙 Dark").clicked() {
                                     self.dark_mode = true;
@@ -4230,8 +4162,8 @@ impl eframe::App for MyApp {
                         ui.separator();
                         
                         ui.group(|ui| {
-                            ui.label("⚙️ G-code Execution");
-                            ui.horizontal(|ui| {
+                            ui.label("⚙ G-code Execution");
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Mode:");
                                 if ui.selectable_label(!self.test_mode, "🔧 Real Mode").clicked() {
                                     self.test_mode = false;
@@ -4261,13 +4193,13 @@ impl eframe::App for MyApp {
                         ui.group(|ui| {
                             ui.label("📡 Communication Protocol");
                             ui.label(format!("Current: {:?}", self.communication_mode));
-                            ui.label("Configure detailed fieldbus settings in the 'Fieldbus Config' tab");
+                            ui.label("Configure detailed fieldbus settings on the Fieldbus page");
                         });
                         
                         ui.separator();
                         
                         if let Some(error) = &self.last_file_error {
-                            ui.colored_label(Color32::RED, format!("Error: {}", error));
+                            ui.colored_label(ui_shell::danger(), format!("Error: {}", error));
                         }
                     });
                 }
@@ -4277,7 +4209,7 @@ impl eframe::App for MyApp {
                     
                     egui::ScrollArea::vertical().id_salt("printer_config_scroll").show(ui, |ui| {
                         ui.group(|ui| {
-                            ui.label("🌡️ Temperature Settings");
+                            ui.label("🌡 Temperature Settings");
                             ui.add(egui::Slider::new(&mut self.printer_settings.extruder_max_temp, 180.0..=400.0).text("Max Extruder Temp (°C)"));
                             ui.add(egui::Slider::new(&mut self.printer_settings.bed_max_temp, 60.0..=150.0).text("Max Bed Temp (°C)"));
                             ui.add(egui::Slider::new(&mut self.printer_settings.extruder_min_extrude_temp, 160.0..=200.0).text("Min Extrude Temp (°C)"));
@@ -4306,17 +4238,17 @@ impl eframe::App for MyApp {
                         
                         ui.group(|ui| {
                             ui.label("📏 Print Area Limits");
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("X min/max:");
                                 ui.add(egui::DragValue::new(&mut self.printer_settings.position_min[0]).speed(1.0));
                                 ui.add(egui::DragValue::new(&mut self.printer_settings.position_max[0]).speed(1.0));
                             });
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Y min/max:");
                                 ui.add(egui::DragValue::new(&mut self.printer_settings.position_min[1]).speed(1.0));
                                 ui.add(egui::DragValue::new(&mut self.printer_settings.position_max[1]).speed(1.0));
                             });
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Z min/max:");
                                 ui.add(egui::DragValue::new(&mut self.printer_settings.position_min[2]).speed(1.0));
                                 ui.add(egui::DragValue::new(&mut self.printer_settings.position_max[2]).speed(1.0));
@@ -4326,11 +4258,11 @@ impl eframe::App for MyApp {
                         ui.separator();
                         
                         ui.group(|ui| {
-                            ui.label("⚙️ Motor Configuration");
+                            ui.label("⚙ Motor Configuration");
                             let motor_labels = ["X-Axis", "Y-Axis", "Z-Axis", "Extruder 0", "Extruder 1"];
                             
                             for (i, label) in motor_labels.iter().enumerate() {
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label(format!("{}:", label));
                                     egui::ComboBox::from_id_salt(format!("motor_{}", i))
                                         .selected_text(format!("{:?}", self.printer_settings.motor_types[i]))
@@ -4367,7 +4299,7 @@ impl eframe::App for MyApp {
                             ui.add(egui::Slider::new(&mut self.printer_settings.servo_max_pulse, 1500..=3000).text("Max Pulse Width (µs)"));
                             ui.add(egui::Slider::new(&mut self.printer_settings.servo_max_angle, 90.0..=360.0).text("Max Angle (degrees)"));
                             ui.label("Common servo types:");
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 if ui.button("Standard (500-2500µs)").clicked() {
                                     self.printer_settings.servo_min_pulse = 500;
                                     self.printer_settings.servo_max_pulse = 2500;
@@ -4400,7 +4332,7 @@ impl eframe::App for MyApp {
                         ui.group(|ui| {
                             ui.label("🔍 Z Probe Settings");
                             ui.add(egui::Slider::new(&mut self.printer_settings.probe_z_offset, -5.0..=5.0).text("Probe Z Offset (mm)"));
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Probe XY Offset:");
                                 ui.add(egui::DragValue::new(&mut self.printer_settings.probe_xy_offset[0]).prefix("X:").speed(0.1));
                                 ui.add(egui::DragValue::new(&mut self.printer_settings.probe_xy_offset[1]).prefix("Y:").speed(0.1));
@@ -4418,19 +4350,19 @@ impl eframe::App for MyApp {
                             ui.checkbox(&mut self.printer_settings.enable_5axis_mode, "Enable 5-Axis Mode");
                             if self.printer_settings.enable_5axis_mode {
                                 ui.checkbox(&mut self.printer_settings.tool_point_control, "Tool Center Point (TCP) Control");
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("A-Axis Max Velocity:");
                                     ui.add(egui::DragValue::new(&mut self.printer_settings.rotary_axis_max_velocity[0]).suffix("°/s").speed(1.0));
                                 });
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("B-Axis Max Velocity:");
                                     ui.add(egui::DragValue::new(&mut self.printer_settings.rotary_axis_max_velocity[1]).suffix("°/s").speed(1.0));
                                 });
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("A-Axis Acceleration:");
                                     ui.add(egui::DragValue::new(&mut self.printer_settings.rotary_axis_acceleration[0]).suffix("°/s²").speed(10.0));
                                 });
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("B-Axis Acceleration:");
                                     ui.add(egui::DragValue::new(&mut self.printer_settings.rotary_axis_acceleration[1]).suffix("°/s²").speed(10.0));
                                 });
@@ -4450,7 +4382,7 @@ impl eframe::App for MyApp {
                         
                         ui.separator();
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if ui.button("💾 Save Configuration").clicked() {
                                 println!("Configuration saved to memory");
                                 // Here you would typically save to printer.toml or similar
@@ -4508,7 +4440,7 @@ impl eframe::App for MyApp {
                     
                     egui::ScrollArea::vertical().id_salt("bed_mesh_scroll").show(ui, |ui| {
                     
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("Active Profile:");
                         egui::ComboBox::from_label("Mesh Profile")
                             .selected_text(&self.selected_mesh_profile)
@@ -4524,7 +4456,7 @@ impl eframe::App for MyApp {
                     
                     ui.separator();
                     
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         if ui.button("🔄 Start Bed Mesh").clicked() && !self.emergency_stop_triggered {
                             println!("Starting bed mesh calibration...");
                             self.printer_state = PrinterState::Homing;
@@ -4551,7 +4483,7 @@ impl eframe::App for MyApp {
                             }
                         }
                         
-                        if ui.button("🗑️ Delete Profile").clicked() {
+                        if ui.button("🗑 Delete Profile").clicked() {
                             if let Some(index) = self.saved_bed_meshes.iter().position(|m| m.name == self.selected_mesh_profile) {
                                 if index > 0 { // Don't delete default profile
                                     self.saved_bed_meshes.remove(index);
@@ -4573,13 +4505,13 @@ impl eframe::App for MyApp {
                         ui.checkbox(&mut self.adaptive_settings.enable_adaptive_z_height, "Enable Adaptive Z Height");
                         ui.checkbox(&mut self.adaptive_settings.kamp_style_probing, "KAMP Style Probe Pattern");
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Margins:");
                             ui.add(egui::DragValue::new(&mut self.adaptive_settings.margin_x).prefix("X:").suffix("mm").speed(0.5));
                             ui.add(egui::DragValue::new(&mut self.adaptive_settings.margin_y).prefix("Y:").suffix("mm").speed(0.5));
                         });
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Probe Count Range:");
                             ui.add(egui::DragValue::new(&mut self.adaptive_settings.min_probe_count).prefix("Min:").range(9..=225));
                             ui.add(egui::DragValue::new(&mut self.adaptive_settings.max_probe_count).prefix("Max:").range(9..=225));
@@ -4728,12 +4660,12 @@ impl eframe::App for MyApp {
                                 }
                                 
                                 // Scale labels
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.add_space(45.0);
                                     ui.vertical(|ui| {
-                                        ui.colored_label(Color32::RED, format!("High: {:.3}mm", mesh.max_height));
+                                        ui.colored_label(ui_shell::danger(), format!("High: {:.3}mm", mesh.max_height));
                                         ui.add_space(160.0);
-                                        ui.colored_label(Color32::BLUE, format!("Low: {:.3}mm", mesh.min_height));
+                                        ui.colored_label(ui_shell::info(), format!("Low: {:.3}mm", mesh.min_height));
                                         ui.label(format!("Range: {:.3}mm", mesh.max_height - mesh.min_height));
                                     });
                                 });
@@ -4768,32 +4700,32 @@ impl eframe::App for MyApp {
                     ui.group(|ui| {
                         ui.label("💨 Manual Fan Controls");
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Part Cooling:");
                             ui.add(egui::Slider::new(&mut self.fan_control.part_cooling_speed, 0..=100).suffix("%"));
                             ui.checkbox(&mut self.fan_control.auto_part_cooling, "Auto");
                         });
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Auxiliary Fan:");
                             ui.add(egui::Slider::new(&mut self.fan_control.auxiliary_fan_speed, 0..=100).suffix("%"));
                         });
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Exhaust Fan:");
                             ui.add(egui::Slider::new(&mut self.fan_control.exhaust_fan_speed, 0..=100).suffix("%"));
                             ui.checkbox(&mut self.fan_control.auto_exhaust, "Auto");
                         });
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Chamber Fan:");
                             ui.add(egui::Slider::new(&mut self.fan_control.chamber_fan_speed, 0..=100).suffix("%"));
                         });
                         
                         ui.separator();
                         
-                        ui.horizontal(|ui| {
-                            if ui.button("🌪️ All Fans 100%").clicked() && !self.emergency_stop_triggered {
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("🌪 All Fans 100%").clicked() && !self.emergency_stop_triggered {
                                 self.fan_control.part_cooling_speed = 100;
                                 self.fan_control.auxiliary_fan_speed = 100;
                                 self.fan_control.exhaust_fan_speed = 100;
@@ -4818,7 +4750,7 @@ impl eframe::App for MyApp {
                         
                         ui.checkbox(&mut self.fan_control.part_cooling_layer_fan, "Enable Layer Fan Control");
                         if self.fan_control.part_cooling_layer_fan {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Start Layer:");
                                 ui.add(egui::DragValue::new(&mut self.fan_control.layer_fan_start_layer).range(1..=100));
                             });
@@ -4828,7 +4760,7 @@ impl eframe::App for MyApp {
                         
                         ui.checkbox(&mut self.fan_control.auto_exhaust, "Enable Auto Exhaust");
                         if self.fan_control.auto_exhaust {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Temperature Threshold:");
                                 ui.add(egui::DragValue::new(&mut self.fan_control.exhaust_temp_threshold).suffix("°C").range(20.0..=80.0));
                             });
@@ -4842,19 +4774,19 @@ impl eframe::App for MyApp {
                     ui.group(|ui| {
                         ui.label("📊 Fan Status");
                         
-                        ui.horizontal(|ui| {
-                            let part_color = if self.fan_control.part_cooling_speed > 0 { Color32::GREEN } else { Color32::GRAY };
+                        ui.horizontal_wrapped(|ui| {
+                            let part_color = if self.fan_control.part_cooling_speed > 0 { ui_shell::good() } else { ui_shell::muted() };
                             ui.colored_label(part_color, format!("Part Cooling: {}%", self.fan_control.part_cooling_speed));
                             
-                            let aux_color = if self.fan_control.auxiliary_fan_speed > 0 { Color32::BLUE } else { Color32::GRAY };
+                            let aux_color = if self.fan_control.auxiliary_fan_speed > 0 { ui_shell::info() } else { ui_shell::muted() };
                             ui.colored_label(aux_color, format!("Auxiliary: {}%", self.fan_control.auxiliary_fan_speed));
                         });
                         
-                        ui.horizontal(|ui| {
-                            let exhaust_color = if self.fan_control.exhaust_fan_speed > 0 { Color32::YELLOW } else { Color32::GRAY };
+                        ui.horizontal_wrapped(|ui| {
+                            let exhaust_color = if self.fan_control.exhaust_fan_speed > 0 { ui_shell::warning() } else { ui_shell::muted() };
                             ui.colored_label(exhaust_color, format!("Exhaust: {}%", self.fan_control.exhaust_fan_speed));
                             
-                            let chamber_color = if self.fan_control.chamber_fan_speed > 0 { Color32::from_rgb(255, 165, 0) } else { Color32::GRAY };
+                            let chamber_color = if self.fan_control.chamber_fan_speed > 0 { Color32::from_rgb(255, 165, 0) } else { ui_shell::muted() };
                             ui.colored_label(chamber_color, format!("Chamber: {}%", self.fan_control.chamber_fan_speed));
                         });
                     });
@@ -4873,18 +4805,18 @@ impl eframe::App for MyApp {
                         ui.checkbox(&mut self.webcam_settings.enabled, "Enable Webcam");
                         
                         if self.webcam_settings.enabled {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("URL:");
                                 ui.text_edit_singleline(&mut self.webcam_settings.url);
                             });
                             
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Refresh Rate:");
                                 ui.add(egui::DragValue::new(&mut self.webcam_settings.refresh_rate).suffix("ms").range(50..=5000));
                                 ui.label(format!("({:.1} FPS)", 1000.0 / self.webcam_settings.refresh_rate as f32));
                             });
                             
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Resolution:");
                                 ui.add(egui::DragValue::new(&mut self.webcam_settings.resolution.0).range(160..=1920));
                                 ui.label("×");
@@ -4928,7 +4860,7 @@ impl eframe::App for MyApp {
                                     egui::Align2::LEFT_TOP,
                                     &self.webcam_settings.overlay_text,
                                     egui::FontId::proportional(12.0),
-                                    Color32::YELLOW
+                                    ui_shell::warning()
                                 );
                                 
                                 // Time stamp
@@ -4949,22 +4881,22 @@ impl eframe::App for MyApp {
                         
                         // Webcam controls and overlay settings
                         ui.group(|ui| {
-                            ui.label("🎛️ Display Controls");
+                            ui.label("🎛 Display Controls");
                             
                             ui.checkbox(&mut self.webcam_settings.show_overlay, "Show Overlay");
                             if self.webcam_settings.show_overlay {
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Overlay Text:");
                                     ui.text_edit_singleline(&mut self.webcam_settings.overlay_text);
                                 });
                             }
                             
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.checkbox(&mut self.webcam_settings.flip_horizontal, "Flip Horizontal");
                                 ui.checkbox(&mut self.webcam_settings.flip_vertical, "Flip Vertical");
                             });
                             
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Rotation:");
                                 egui::ComboBox::from_label("Degrees")
                                     .selected_text(format!("{}°", self.webcam_settings.rotation))
@@ -4982,8 +4914,8 @@ impl eframe::App for MyApp {
                         // Webcam presets
                         ui.group(|ui| {
                             ui.label("📋 Common Presets");
-                            ui.horizontal(|ui| {
-                                if ui.button("🖥️ OctoPrint Default").clicked() {
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("🖥 OctoPrint Default").clicked() {
                                     self.webcam_settings.url = "http://octopi.local:8080/?action=stream".to_string();
                                     self.webcam_settings.resolution = (640, 480);
                                     self.webcam_settings.refresh_rate = 100;
@@ -5022,11 +4954,11 @@ impl eframe::App for MyApp {
                                 for line in &self.terminal.history {
                                     // Color code different types of messages
                                     let color = if line.starts_with('>') {
-                                        Color32::YELLOW  // Commands
+                                        ui_shell::warning()  // Commands
                                     } else if line.contains("error") || line.contains("Error") {
-                                        Color32::RED     // Errors
+                                        ui_shell::danger()     // Errors
                                     } else if line.contains("OK") || line.contains("ok") {
-                                        Color32::GREEN   // Success
+                                        ui_shell::good()   // Success
                                     } else {
                                         Color32::WHITE   // Normal output
                                     };
@@ -5035,7 +4967,7 @@ impl eframe::App for MyApp {
                                 }
                             });
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.checkbox(&mut self.terminal.auto_scroll, "Auto-scroll");
                             
                             if ui.button("Clear").clicked() {
@@ -5050,9 +4982,9 @@ impl eframe::App for MyApp {
                     
                     // Command input
                     ui.group(|ui| {
-                        ui.label("⌨️ Command Input");
+                        ui.label("⌨ Command Input");
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             let response = ui.text_edit_singleline(&mut self.terminal.input_buffer);
                             
                             let send_button = ui.button("Send");
@@ -5068,7 +5000,7 @@ impl eframe::App for MyApp {
                             }
                         });
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Quick Commands:");
                             if ui.small_button("G28 (Home)").clicked() {
                                 self.terminal.execute_command("G28".to_string());
@@ -5109,7 +5041,7 @@ impl eframe::App for MyApp {
                             ui.heading("Available Macros");
                             
                             // Category filter buttons
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Filter:");
                                 if ui.small_button("All").clicked() { /* Filter logic here */ }
                                 if ui.small_button("Homing").clicked() { /* Filter logic here */ }
@@ -5164,17 +5096,17 @@ impl eframe::App for MyApp {
                             
                             if let Some(selected_macro) = self.macros.iter_mut().find(|m| m.name == self.selected_macro) {
                                 ui.group(|ui| {
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Name:");
                                         ui.text_edit_singleline(&mut selected_macro.name);
                                     });
                                     
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Icon:");
                                         ui.text_edit_singleline(&mut selected_macro.icon);
                                     });
                                     
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Category:");
                                         egui::ComboBox::from_id_salt("macro_category")
                                             .selected_text(&selected_macro.category)
@@ -5199,7 +5131,7 @@ impl eframe::App for MyApp {
                                     
                                     ui.separator();
                                     
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.checkbox(&mut selected_macro.enabled, "Enabled");
                                         
                                         if ui.button("▶ Test Macro").clicked() && !self.emergency_stop_triggered {
@@ -5238,14 +5170,14 @@ impl eframe::App for MyApp {
                                         commands: vec!["# Enter your commands here".to_string()],
                                         enabled: true,
                                         category: "Custom".to_string(),
-                                        icon: "⚙️".to_string(),
+                                        icon: "⚙".to_string(),
                                     });
                                     self.selected_macro = "New Custom Macro".to_string();
                                 }
                                 
                                 ui.separator();
                                 
-                                if ui.button("🗑️ Delete Selected Macro").clicked() {
+                                if ui.button("🗑 Delete Selected Macro").clicked() {
                                     if let Some(index) = self.macros.iter().position(|m| m.name == self.selected_macro) {
                                         if self.macros.len() > 1 { // Keep at least one macro
                                             self.macros.remove(index);
@@ -5313,13 +5245,13 @@ impl eframe::App for MyApp {
                                     ui.selectable_value(&mut self.communication_mode, CommunicationMode::ModbusTCP, "🌐 Modbus TCP");
                                     ui.selectable_value(&mut self.communication_mode, CommunicationMode::ModbusRTU, "📡 Modbus RTU");
                                     ui.selectable_value(&mut self.communication_mode, CommunicationMode::DeviceNet, "🔗 DeviceNet");
-                                    ui.selectable_value(&mut self.communication_mode, CommunicationMode::ControlNet, "🎛️ ControlNet");
+                                    ui.selectable_value(&mut self.communication_mode, CommunicationMode::ControlNet, "🎛 ControlNet");
                                     
                                     ui.separator();
                                     
                                     // Modern Industrial Protocols
                                     ui.selectable_value(&mut self.communication_mode, CommunicationMode::BACnet, "🏢 BACnet/IP");
-                                    ui.selectable_value(&mut self.communication_mode, CommunicationMode::ADS, "⚙️ ADS (TwinCAT)");
+                                    ui.selectable_value(&mut self.communication_mode, CommunicationMode::ADS, "⚙ ADS (TwinCAT)");
                                     ui.selectable_value(&mut self.communication_mode, CommunicationMode::CODESYS, "💻 CODESYS");
                                     ui.selectable_value(&mut self.communication_mode, CommunicationMode::CIP, "🔧 CIP (Common Industrial)");
                                     ui.selectable_value(&mut self.communication_mode, CommunicationMode::OPC_UA, "🌍 OPC UA");
@@ -5332,7 +5264,7 @@ impl eframe::App for MyApp {
                                     ui.selectable_value(&mut self.communication_mode, CommunicationMode::S7, "🔩 Siemens S7");
                                     ui.selectable_value(&mut self.communication_mode, CommunicationMode::Fins, "🎯 OMRON FINS");
                                     ui.selectable_value(&mut self.communication_mode, CommunicationMode::CC_Link, "🔗 CC-Link");
-                                    ui.selectable_value(&mut self.communication_mode, CommunicationMode::Foundation, "🏗️ Foundation FB");
+                                    ui.selectable_value(&mut self.communication_mode, CommunicationMode::Foundation, "🏗 Foundation FB");
                                 });
                             
                             ui.label(format!("✓ Current: {:?}", self.communication_mode));
@@ -5361,7 +5293,7 @@ impl eframe::App for MyApp {
                                     ui.label("🌐 EtherCAT Network Connection");
 
                                     // Connection status indicator
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         let status_text = if self.ethercat_master_connected {
                                             "🟢 Connected"
                                         } else {
@@ -5424,10 +5356,10 @@ impl eframe::App for MyApp {
                                     });
 
                                     // Network configuration
-                                    ui.collapsing("⚙️ Network Configuration", |ui| {
+                                    ui.collapsing("⚙ Network Configuration", |ui| {
                                         #[cfg(windows)]
                                         {
-                                            ui.horizontal(|ui| {
+                                            ui.horizontal_wrapped(|ui| {
                                                 ui.label("Network Adapter:");
                                                 if ui.button("🔍 Scan Adapters").clicked() {
                                                     // Discover Windows adapters using configured Npcap settings
@@ -5448,7 +5380,7 @@ impl eframe::App for MyApp {
                                             if !self.available_adapters.is_empty() {
                                                 ui.label("Available Adapters:");
                                                 for adapter in &self.available_adapters {
-                                                    ui.horizontal(|ui| {
+                                                    ui.horizontal_wrapped(|ui| {
                                                         if ui.selectable_label(
                                                             self.ethercat_network_config.network_interface == adapter.name,
                                                             &adapter.description
@@ -5464,18 +5396,18 @@ impl eframe::App for MyApp {
 
                                         #[cfg(not(windows))]
                                         {
-                                            ui.horizontal(|ui| {
+                                            ui.horizontal_wrapped(|ui| {
                                                 ui.label("Interface:");
                                                 ui.text_edit_singleline(&mut self.ethercat_network_config.network_interface);
                                             });
                                         }
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.label("Cycle Time (μs):");
                                             ui.add(egui::DragValue::new(&mut self.ethercat_network_config.cycle_time_us).range(100..=10000));
                                         });
                                         ui.checkbox(&mut self.ethercat_network_config.sync_master_enabled, "Distributed Clock Sync");
                                         ui.checkbox(&mut self.ethercat_network_config.topology_check, "Topology Verification");
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.label("Recovery Timeout (ms):");
                                             ui.add(egui::DragValue::new(&mut self.ethercat_network_config.recovery_timeout_ms).range(1000..=30000));
                                         });
@@ -5488,7 +5420,7 @@ impl eframe::App for MyApp {
                                             ui.checkbox(&mut self.ethercat_network_config.use_npcap, "Use Npcap for real hardware (requires Npcap installation)");
 
                                             if self.ethercat_network_config.use_npcap {
-                                                ui.horizontal(|ui| {
+                                                ui.horizontal_wrapped(|ui| {
                                                     ui.label("Npcap Path:");
                                                     ui.text_edit_singleline(&mut self.ethercat_network_config.npcap_path);
                                                     if ui.button("📁 Browse").clicked() {
@@ -5502,7 +5434,7 @@ impl eframe::App for MyApp {
                                                 });
 
                                                 // Check if Npcap path exists and show status
-                                                ui.horizontal(|ui| {
+                                                ui.horizontal_wrapped(|ui| {
                                                     let npcap_exists = std::path::Path::new(&self.ethercat_network_config.npcap_path).exists();
                                                     if npcap_exists {
                                                         ui.label("✅ Npcap directory found");
@@ -5513,7 +5445,7 @@ impl eframe::App for MyApp {
                                                            std::path::Path::new(&wpcap_dll_path).exists() {
                                                             ui.label("📦 Npcap libraries detected");
                                                         } else {
-                                                            ui.label("⚠️ Npcap libraries not found in directory");
+                                                            ui.label("⚠ Npcap libraries not found in directory");
                                                         }
                                                     } else {
                                                         ui.label("❌ Npcap directory not found");
@@ -5521,7 +5453,7 @@ impl eframe::App for MyApp {
                                                 });
 
                                                 // Quick setup buttons for common Npcap locations
-                                                ui.horizontal(|ui| {
+                                                ui.horizontal_wrapped(|ui| {
                                                     ui.label("Quick Setup:");
                                                     if ui.small_button("System32\\Npcap").clicked() {
                                                         self.ethercat_network_config.npcap_path = "C:\\Windows\\System32\\Npcap".to_string();
@@ -5539,7 +5471,7 @@ impl eframe::App for MyApp {
                                         {
                                             if self.ethercat_master_connected {
                                                 ui.separator();
-                                                ui.horizontal(|ui| {
+                                                ui.horizontal_wrapped(|ui| {
                                                     if ui.button("🔍 Scan for Slaves").clicked() {
                                                         println!("EtherCAT slave scan requested by user");
                                                         // Trigger a new scan through the existing slave group
@@ -5576,7 +5508,7 @@ impl eframe::App for MyApp {
                                 ui.group(|ui| {
                                     ui.label("📦 EtherCAT Module Configuration");
 
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Configured Modules:");
                                         if ui.button("➕ Add Beckhoff Module").clicked() {
                                             // Add dropdown for module selection
@@ -5585,7 +5517,7 @@ impl eframe::App for MyApp {
                                             self.ethercat_modules.push(EtherCATModule::new_beckhoff(EtherCATModuleType::Custom,
                                                 self.ethercat_modules.len() as u16 + 1));
                                         }
-                                        if ui.button("🗑️ Remove Last Module").clicked() && !self.ethercat_modules.is_empty() {
+                                        if ui.button("🗑 Remove Last Module").clicked() && !self.ethercat_modules.is_empty() {
                                             if let Some(removed) = self.ethercat_modules.pop() {
                                                 println!("Removed EtherCAT module: {}", removed.name);
                                             }
@@ -5597,7 +5529,7 @@ impl eframe::App for MyApp {
                                         }
                                     });
 
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         if ui.button("💾 Save Configuration").clicked() {
                                             match self.save_ethercat_configuration() {
                                                 Ok(_) => println!("✅ EtherCAT configuration saved successfully"),
@@ -5636,15 +5568,15 @@ impl eframe::App for MyApp {
                                                 ui.group(|ui| {
                                                     ui.horizontal(|ui| {
                                                         // Module status indicator (enabled/disabled)
-                                                        let enabled_color = if module.enabled { Color32::GREEN } else { Color32::RED };
+                                                        let enabled_color = if module.enabled { ui_shell::good() } else { ui_shell::danger() };
                                                         ui.colored_label(enabled_color, "●");
 
                                                         // Connection status indicator
                                                         let (conn_color, conn_symbol) = match &module.connection_status {
-                                                            EtherCATConnectionStatus::Connected => (Color32::LIGHT_GREEN, "🟢"),
-                                                            EtherCATConnectionStatus::Connecting => (Color32::YELLOW, "🟡"),
-                                                            EtherCATConnectionStatus::Disconnected => (Color32::GRAY, "⚫"),
-                                                            EtherCATConnectionStatus::Error(_) => (Color32::RED, "🔴"),
+                                                            EtherCATConnectionStatus::Connected => (ui_shell::good(), "🟢"),
+                                                            EtherCATConnectionStatus::Connecting => (ui_shell::warning(), "🟡"),
+                                                            EtherCATConnectionStatus::Disconnected => (ui_shell::muted(), "⚫"),
+                                                            EtherCATConnectionStatus::Error(_) => (ui_shell::danger(), "🔴"),
                                                             EtherCATConnectionStatus::ConfigError => (Color32::DARK_RED, "❌"),
                                                         };
                                                         ui.colored_label(conn_color, conn_symbol);
@@ -5653,11 +5585,11 @@ impl eframe::App for MyApp {
                                                         ui.label(&module.name);
                                                         
                                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                            if ui.small_button("🗑️").clicked() {
+                                                            if ui.small_button("🗑").clicked() {
                                                                 module_to_remove = Some(i);
                                                             }
                                                             
-                                                            if ui.small_button("⚙️").clicked() {
+                                                            if ui.small_button("⚙").clicked() {
                                                                 self.selected_module_index = Some(i);
                                                             }
                                                             
@@ -5692,28 +5624,28 @@ impl eframe::App for MyApp {
                                                         ui.separator();
                                                         ui.label("📝 Module Configuration");
                                                         
-                                                        ui.horizontal(|ui| {
+                                                        ui.horizontal_wrapped(|ui| {
                                                             ui.label("Name:");
                                                             ui.text_edit_singleline(&mut module.name);
                                                         });
                                                         
-                                                        ui.horizontal(|ui| {
+                                                        ui.horizontal_wrapped(|ui| {
                                                             ui.label("Station Address:");
                                                             ui.add(egui::DragValue::new(&mut module.station_address).range(1..=65535));
                                                         });
                                                         
                                                         if module.module_type == EtherCATModuleType::Custom {
-                                                            ui.horizontal(|ui| {
+                                                            ui.horizontal_wrapped(|ui| {
                                                                 ui.label("Vendor ID:");
                                                                 ui.add(egui::DragValue::new(&mut module.vendor_id).hexadecimal(8, false, true));
                                                             });
                                                             
-                                                            ui.horizontal(|ui| {
+                                                            ui.horizontal_wrapped(|ui| {
                                                                 ui.label("Product Code:");
                                                                 ui.add(egui::DragValue::new(&mut module.product_code).hexadecimal(8, false, true));
                                                             });
                                                             
-                                                            ui.horizontal(|ui| {
+                                                            ui.horizontal_wrapped(|ui| {
                                                                 ui.label("Input Size:");
                                                                 ui.add(egui::DragValue::new(&mut module.input_size).suffix(" bytes"));
                                                                 ui.label("Output Size:");
@@ -5732,7 +5664,7 @@ impl eframe::App for MyApp {
 
                                                         if module.input_size > 0 {
                                                             ui.collapsing("📥 Input Data", |ui| {
-                                                                ui.horizontal(|ui| {
+                                                                ui.horizontal_wrapped(|ui| {
                                                                     ui.label("Raw Data (hex):");
                                                                     let input_hex = module.input_data.iter()
                                                                         .map(|b| format!("{:02X}", b))
@@ -5752,7 +5684,7 @@ impl eframe::App for MyApp {
                                                                             for bit_idx in 0..8 {
                                                                                 let bit_set = (byte_val >> bit_idx) & 1 == 1;
                                                                                 let channel = byte_idx * 8 + bit_idx + 1;
-                                                                                let color = if bit_set { Color32::GREEN } else { Color32::GRAY };
+                                                                                let color = if bit_set { ui_shell::good() } else { ui_shell::muted() };
                                                                                 ui.colored_label(color, format!("CH{}", channel));
                                                                             }
                                                                         }
@@ -5763,7 +5695,7 @@ impl eframe::App for MyApp {
 
                                                         if module.output_size > 0 {
                                                             ui.collapsing("📤 Output Data", |ui| {
-                                                                ui.horizontal(|ui| {
+                                                                ui.horizontal_wrapped(|ui| {
                                                                     ui.label("Raw Data (hex):");
                                                                     let output_hex = module.output_data.iter()
                                                                         .map(|b| format!("{:02X}", b))
@@ -5815,7 +5747,7 @@ impl eframe::App for MyApp {
                                     ui.separator();
                                     ui.label("Quick Add Beckhoff Modules:");
                                     ui.label("🔌 Bus Couplers:");
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         if ui.small_button("BK1120 (Bus Coupler)").clicked() {
                                             self.ethercat_modules.push(EtherCATModule::new_beckhoff(
                                                 EtherCATModuleType::BeckhoffBK1120,
@@ -5828,7 +5760,7 @@ impl eframe::App for MyApp {
                                         }
                                     });
                                     ui.label("📥 Digital Inputs:");
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         if ui.small_button("EL1008 (8Ch DI)").clicked() {
                                             self.ethercat_modules.push(EtherCATModule::new_beckhoff(
                                                 EtherCATModuleType::BeckhoffEL1008,
@@ -5846,7 +5778,7 @@ impl eframe::App for MyApp {
                                         }
                                     });
                                     ui.label("📤 Digital Outputs:");
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         if ui.small_button("EL2008 (8Ch DO)").clicked() {
                                             self.ethercat_modules.push(EtherCATModule::new_beckhoff(
                                                 EtherCATModuleType::BeckhoffEL2008,
@@ -5859,7 +5791,7 @@ impl eframe::App for MyApp {
                                         }
                                     });
                                     ui.label("📊 Analog I/O:");
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         if ui.small_button("EL3008 (8Ch AI)").clicked() {
                                             self.ethercat_modules.push(EtherCATModule::new_beckhoff(
                                                 EtherCATModuleType::BeckhoffEL3008,
@@ -5872,7 +5804,7 @@ impl eframe::App for MyApp {
                                         }
                                     });
                                     ui.label("🚀 Motor Control:");
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         if ui.small_button("EL7031 (Stepper)").clicked() {
                                             self.ethercat_modules.push(EtherCATModule::new_beckhoff(
                                                 EtherCATModuleType::BeckhoffEL7031,
@@ -5894,7 +5826,7 @@ impl eframe::App for MyApp {
                             CommunicationMode::Serial => {
                                 ui.group(|ui| {
                                     ui.label("📟 Serial Communication Settings");
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Port:");
                                         ui.text_edit_singleline(&mut self.serial_port_name);
                                     });
@@ -5939,7 +5871,7 @@ impl eframe::App for MyApp {
                                 ui.group(|ui| {
                                     ui.label("🌐 Modbus TCP Settings");
                                     ui.add(egui::Slider::new(&mut self.modbus_device_id, 1..=247).text("Device ID"));
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("IP Address:");
                                         ui.text_edit_singleline(&mut self.modbus_tcp_ip);
                                     });
@@ -5950,7 +5882,7 @@ impl eframe::App for MyApp {
                                 ui.group(|ui| {
                                     ui.label("📡 Modbus RTU Settings");
                                     ui.add(egui::Slider::new(&mut self.modbus_device_id, 1..=247).text("Device ID"));
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Serial Port:");
                                         ui.text_edit_singleline(&mut self.serial_port_name);
                                     });
@@ -5972,7 +5904,7 @@ impl eframe::App for MyApp {
                             }
                             CommunicationMode::ControlNet => {
                                 ui.group(|ui| {
-                                    ui.label("🎛️ ControlNet Settings");
+                                    ui.label("🎛 ControlNet Settings");
                                     ui.label("⚠ ControlNet configuration requires additional setup");
                                     ui.label("Please configure through manufacturer-specific software");
                                 });
@@ -5980,19 +5912,19 @@ impl eframe::App for MyApp {
                             CommunicationMode::BACnet => {
                                 ui.group(|ui| {
                                     ui.label("🏢 BACnet/IP Settings");
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Device ID:");
                                         ui.add(egui::DragValue::new(&mut self.bacnet_config.device_id).range(1..=4194303));
                                     });
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Port:");
                                         ui.add(egui::DragValue::new(&mut self.bacnet_config.port).range(1..=65535));
                                     });
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Network Number:");
                                         ui.add(egui::DragValue::new(&mut self.bacnet_config.network_number).range(0..=65535));
                                     });
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Max APDU Length:");
                                         ui.add(egui::DragValue::new(&mut self.bacnet_config.max_apdu_length).range(50..=8192));
                                     });
@@ -6001,20 +5933,20 @@ impl eframe::App for MyApp {
                             }
                             CommunicationMode::ADS => {
                                 ui.group(|ui| {
-                                    ui.label("⚙️ ADS (TwinCAT) Settings");
-                                    ui.horizontal(|ui| {
+                                    ui.label("⚙ ADS (TwinCAT) Settings");
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Target AMS NetId:");
                                         ui.text_edit_singleline(&mut self.ads_config.target_ams_net_id);
                                     });
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Target AMS Port:");
                                         ui.add(egui::DragValue::new(&mut self.ads_config.target_ams_port).range(1..=65535));
                                     });
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Source AMS Port:");
                                         ui.add(egui::DragValue::new(&mut self.ads_config.source_ams_port).range(1..=65535));
                                     });
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Timeout (seconds):");
                                         let mut timeout_secs = self.ads_config.timeout.as_secs() as u64;
                                         ui.add(egui::DragValue::new(&mut timeout_secs).range(1..=60));
@@ -6025,7 +5957,7 @@ impl eframe::App for MyApp {
                             CommunicationMode::CODESYS => {
                                 ui.group(|ui| {
                                     ui.label("💻 CODESYS Settings");
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Target IP:");
                                         let mut ip_string = self.codesys_config.target_ip.to_string();
                                         ui.text_edit_singleline(&mut ip_string);
@@ -6033,19 +5965,19 @@ impl eframe::App for MyApp {
                                             self.codesys_config.target_ip = parsed_ip;
                                         }
                                     });
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Port:");
                                         ui.add(egui::DragValue::new(&mut self.codesys_config.port).range(1..=65535));
                                     });
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Username:");
                                         ui.text_edit_singleline(&mut self.codesys_config.username);
                                     });
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Password:");
                                         ui.add(egui::TextEdit::singleline(&mut self.codesys_config.password).password(true));
                                     });
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Project Name:");
                                         ui.text_edit_singleline(&mut self.codesys_config.project_name);
                                     });
@@ -6054,7 +5986,7 @@ impl eframe::App for MyApp {
                             CommunicationMode::CIP => {
                                 ui.group(|ui| {
                                     ui.label("🔧 CIP (Common Industrial Protocol) Settings");
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Connection Type:");
                                         egui::ComboBox::from_label("CIP Type")
                                             .selected_text(format!("{:?}", self.cip_config.connection_type))
@@ -6064,7 +5996,7 @@ impl eframe::App for MyApp {
                                                 ui.selectable_value(&mut self.cip_config.connection_type, CIPConnectionType::ControlNet, "ControlNet");
                                             });
                                     });
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Target IP:");
                                         let mut ip_string = self.cip_config.target_ip.to_string();
                                         ui.text_edit_singleline(&mut ip_string);
@@ -6072,17 +6004,17 @@ impl eframe::App for MyApp {
                                             self.cip_config.target_ip = parsed_ip;
                                         }
                                     });
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Port:");
                                         ui.add(egui::DragValue::new(&mut self.cip_config.port).range(1..=65535));
                                     });
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Vendor ID:");
                                         ui.add(egui::DragValue::new(&mut self.cip_config.vendor_id).hexadecimal(4, false, true));
                                         ui.label("Device Type:");
                                         ui.add(egui::DragValue::new(&mut self.cip_config.device_type).hexadecimal(4, false, true));
                                     });
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Product Code:");
                                         ui.add(egui::DragValue::new(&mut self.cip_config.product_code).hexadecimal(4, false, true));
                                     });
@@ -6091,11 +6023,11 @@ impl eframe::App for MyApp {
                             CommunicationMode::OPC_UA => {
                                 ui.group(|ui| {
                                     ui.label("🌍 OPC UA Settings");
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Endpoint URL:");
                                         ui.text_edit_singleline(&mut self.opcua_config.endpoint_url);
                                     });
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Security Policy:");
                                         egui::ComboBox::from_label("Security")
                                             .selected_text(&self.opcua_config.security_policy)
@@ -6105,7 +6037,7 @@ impl eframe::App for MyApp {
                                                 ui.selectable_value(&mut self.opcua_config.security_policy, "Basic256Sha256".to_string(), "Basic256Sha256");
                                             });
                                     });
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Message Security:");
                                         egui::ComboBox::from_label("Message Sec")
                                             .selected_text(&self.opcua_config.message_security_mode)
@@ -6116,13 +6048,13 @@ impl eframe::App for MyApp {
                                             });
                                     });
                                     if let Some(ref mut username) = self.opcua_config.username {
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.label("Username:");
                                             ui.text_edit_singleline(username);
                                         });
                                     }
                                     if let Some(ref mut password) = self.opcua_config.password {
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.label("Password:");
                                             ui.add(egui::TextEdit::singleline(password).password(true));
                                         });
@@ -6186,13 +6118,13 @@ impl eframe::App for MyApp {
                         // Connection status and testing
                         ui.group(|ui| {
                             ui.label("🔌 Connection Status & Testing");
-                            ui.horizontal(|ui| {
-                                let status_color = if self.ethercat_initialized { Color32::GREEN } else { Color32::RED };
+                            ui.horizontal_wrapped(|ui| {
+                                let status_color = if self.ethercat_initialized { ui_shell::good() } else { ui_shell::danger() };
                                 ui.colored_label(status_color, "●");
                                 ui.label(format!("Status: {}", if self.ethercat_initialized { "Connected" } else { "Disconnected" }));
                             });
                             
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 if ui.button("🔄 Test Connection").clicked() {
                                     // Test connection based on current protocol
                                 }
@@ -6212,20 +6144,20 @@ impl eframe::App for MyApp {
                             ui.label("🔍 Protocol Discovery & Network Scanning");
                             ui.checkbox(&mut self.protocol_discovery.enabled, "Enable automatic protocol discovery");
                             
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Scan Range:");
                                 ui.text_edit_singleline(&mut self.protocol_discovery.scan_range);
                                 ui.label("(e.g., 192.168.1.0/24)");
                             });
                             
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Scan Interval (seconds):");
                                 let mut interval_secs = self.protocol_discovery.scan_interval.as_secs() as u64;
                                 ui.add(egui::DragValue::new(&mut interval_secs).range(10..=300));
                                 self.protocol_discovery.scan_interval = Duration::from_secs(interval_secs);
                             });
                             
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 if ui.button("🔍 Start Discovery Scan").clicked() {
                                     // Trigger manual discovery scan
                                     println!("Starting protocol discovery scan on {}", self.protocol_discovery.scan_range);
@@ -6246,16 +6178,16 @@ impl eframe::App for MyApp {
                                     .show(ui, |ui| {
                                         for (ip, device) in &self.protocol_discovery.discovered_devices {
                                             ui.group(|ui| {
-                                                ui.horizontal(|ui| {
-                                                    ui.colored_label(Color32::GREEN, "●");
-                                                    ui.label(format!("🖥️ {}", ip));
+                                                ui.horizontal_wrapped(|ui| {
+                                                    ui.colored_label(ui_shell::good(), "●");
+                                                    ui.label(format!("🖥 {}", ip));
                                                     if let Some(hostname) = &device.hostname {
                                                         ui.label(format!("({})", hostname));
                                                     }
                                                 });
                                                 
                                                 if !device.detected_protocols.is_empty() {
-                                                    ui.horizontal(|ui| {
+                                                    ui.horizontal_wrapped(|ui| {
                                                         ui.label("🔌 Protocols:");
                                                         for protocol in &device.detected_protocols {
                                                             ui.label(format!("{:?}", protocol));
@@ -6263,7 +6195,7 @@ impl eframe::App for MyApp {
                                                     });
                                                 }
                                                 
-                                                ui.label(format!("🕰️ Response: {:.1}ms", device.response_time.as_millis()));
+                                                ui.label(format!("🕰 Response: {:.1}ms", device.response_time.as_millis()));
                                             });
                                         }
                                     });
@@ -6278,7 +6210,7 @@ impl eframe::App for MyApp {
                         ui.group(|ui| {
                             ui.label("🔒 Protocol Security & Authentication");
                             
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Security Level:");
                                 let mut security_level = "Basic".to_string();
                                 egui::ComboBox::from_label("Security")
@@ -6295,7 +6227,7 @@ impl eframe::App for MyApp {
                             
                             ui.group(|ui| {
                                 ui.label("🗝 Certificate Management");
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     if ui.button("📥 Load Certificate").clicked() {
                                         // Load certificate file
                                     }
@@ -6310,7 +6242,7 @@ impl eframe::App for MyApp {
                                 });
                                 
                                 ui.label("📊 Security Statistics:");
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("🔒 Encrypted connections: 0");
                                     ui.label("⚠ Authentication failures: 0");
                                     ui.label("🚫 Blocked attempts: 0");
@@ -6327,24 +6259,24 @@ impl eframe::App for MyApp {
                             if !self.protocol_diagnostics.is_empty() {
                                 for (protocol, diagnostics) in &self.protocol_diagnostics {
                                     ui.group(|ui| {
-                                        ui.horizontal(|ui| {
-                                            let status_color = if diagnostics.connected { Color32::GREEN } else { Color32::RED };
+                                        ui.horizontal_wrapped(|ui| {
+                                            let status_color = if diagnostics.connected { ui_shell::good() } else { ui_shell::danger() };
                                             ui.colored_label(status_color, "●");
                                             ui.label(format!("{:?}", protocol));
                                         });
                                         
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.label(format!("📤 TX: {} packets ({} bytes)", diagnostics.packets_sent, diagnostics.bytes_sent));
                                             ui.label(format!("📥 RX: {} packets ({} bytes)", diagnostics.packets_received, diagnostics.bytes_received));
                                         });
                                         
-                                        ui.horizontal(|ui| {
-                                            ui.label(format!("🕰️ Latency: {:.1}ms", diagnostics.latency_ms));
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(format!("🕰 Latency: {:.1}ms", diagnostics.latency_ms));
                                             ui.label(format!("⚠ Errors: {}", diagnostics.error_count));
                                         });
                                         
                                         if let Some(error) = &diagnostics.last_error {
-                                            ui.colored_label(Color32::RED, format!("❌ Last Error: {}", error));
+                                            ui.colored_label(ui_shell::danger(), format!("❌ Last Error: {}", error));
                                         }
                                     });
                                 }
@@ -6361,15 +6293,15 @@ impl eframe::App for MyApp {
                     egui::ScrollArea::vertical().id_salt("can_toolheads_scroll").show(ui, |ui| {
                         // CAN Interface Configuration
                         ui.group(|ui| {
-                            ui.label("⚙️ CAN Interface Configuration");
+                            ui.label("⚙ CAN Interface Configuration");
                             
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("CAN Interface:");
                                 ui.text_edit_singleline(&mut self.can_interface_name);
                                 ui.label("(e.g., can0, vcan0)");
                             });
                             
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Bitrate:");
                                 egui::ComboBox::from_label("CAN Bitrate")
                                     .selected_text(format!("{} bps", self.can_bitrate))
@@ -6381,7 +6313,7 @@ impl eframe::App for MyApp {
                                     });
                             });
                             
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 if ui.button("🔌 Connect CAN Bus").clicked() {
                                     // Initialize CAN connection
                                     println!("Connecting to CAN interface: {}", self.can_interface_name);
@@ -6415,7 +6347,7 @@ impl eframe::App for MyApp {
                                     for (uuid, toolhead) in toolheads {
                                         ui.group(|ui| {
                                             ui.horizontal(|ui| {
-                                                let status_color = if toolhead.connected { Color32::GREEN } else { Color32::RED };
+                                                let status_color = if toolhead.connected { ui_shell::good() } else { ui_shell::danger() };
                                                 ui.colored_label(status_color, "●");
                                                 ui.label(format!("UUID: 0x{:06X}", uuid));
                                                 
@@ -6424,10 +6356,10 @@ impl eframe::App for MyApp {
                                                 }
                                                 
                                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                    if ui.small_button("⚙️ Config").clicked() {
+                                                    if ui.small_button("⚙ Config").clicked() {
                                                         self.selected_toolhead_uuid = Some(*uuid);
                                                     }
-                                                    if ui.small_button("🌡️ Status").clicked() {
+                                                    if ui.small_button("🌡 Status").clicked() {
                                                         // Get toolhead status
                                                     }
                                                     if ui.small_button("⛔ Stop").clicked() {
@@ -6437,8 +6369,8 @@ impl eframe::App for MyApp {
                                             });
                                             
                                             // Toolhead Status Info
-                                            ui.horizontal(|ui| {
-                                                ui.label(format!("🌡️ {:.1}°C/{:.1}°C", 
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.label(format!("🌡 {:.1}°C/{:.1}°C", 
                                                     toolhead.temperature, toolhead.target_temperature));
                                                 ui.label(format!("💨 Fan: {}%", (toolhead.fan_speed as f32 / 2.55) as u8));
                                                 ui.label(format!("📍 Pos: [{:.2}, {:.2}, {:.2}, {:.3}]", 
@@ -6447,12 +6379,12 @@ impl eframe::App for MyApp {
                                             });
                                             
                                             if let Some(stats) = can_manager.get_toolhead_stats(*uuid) {
-                                                ui.horizontal(|ui| {
+                                                ui.horizontal_wrapped(|ui| {
                                                     ui.label(format!("📤 TX: {}", stats.messages_sent));
                                                     ui.label(format!("📥 RX: {}", stats.messages_received));
-                                                    ui.label(format!("🕰️ {:.1}ms", stats.average_latency_ms));
+                                                    ui.label(format!("🕰 {:.1}ms", stats.average_latency_ms));
                                                     if stats.error_count > 0 {
-                                                        ui.colored_label(Color32::RED, format!("⚠ {} errors", stats.error_count));
+                                                        ui.colored_label(ui_shell::danger(), format!("⚠ {} errors", stats.error_count));
                                                     }
                                                 });
                                             }
@@ -6471,7 +6403,7 @@ impl eframe::App for MyApp {
                             ui.group(|ui| {
                                 ui.label(format!("🎯 Toolhead Control (UUID: 0x{:06X})", selected_uuid));
                                 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Temperature:");
                                     let mut target_temp = 200.0f32;
                                     ui.add(egui::Slider::new(&mut target_temp, 0.0..=300.0).suffix("°C"));
@@ -6480,7 +6412,7 @@ impl eframe::App for MyApp {
                                     }
                                 });
                                 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Fan Speed:");
                                     let mut fan_speed = 128u8;
                                     ui.add(egui::Slider::new(&mut fan_speed, 0..=255).suffix("%"));
@@ -6489,7 +6421,7 @@ impl eframe::App for MyApp {
                                     }
                                 });
                                 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Extruder:");
                                     let mut extrude_distance = 10.0f32;
                                     ui.add(egui::DragValue::new(&mut extrude_distance).suffix("mm"));
@@ -6501,7 +6433,7 @@ impl eframe::App for MyApp {
                                     }
                                 });
                                 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     if ui.button("🏠 Home").clicked() {
                                         self.home_toolhead(selected_uuid);
                                     }
@@ -6523,24 +6455,24 @@ impl eframe::App for MyApp {
                         // 5-Axis Integration Status
                         ui.group(|ui| {
                             ui.label("🔄 5-Axis Integration Status");
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Current Position:");
                                 ui.label(format!("X:{:.2} Y:{:.2} Z:{:.2} A:{:.1}° B:{:.1}°", 
                                     self.x, self.y, self.z, self.a, self.b));
                             });
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Kinematics:");
                                 ui.label("5-axis coordinated motion enabled");
                                 if self.printer_settings.enable_5axis_mode {
-                                    ui.colored_label(Color32::GREEN, "✓ 5-Axis Active");
+                                    ui.colored_label(ui_shell::good(), "✓ 5-Axis Active");
                                 } else {
-                                    ui.colored_label(Color32::GRAY, "3-Axis Mode");
+                                    ui.colored_label(ui_shell::muted(), "3-Axis Mode");
                                 }
                             });
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Toolhead Sync:");
                                 ui.label("Real-time position updates to CAN toolheads");
-                                ui.colored_label(Color32::GREEN, "✓ Synchronized");
+                                ui.colored_label(ui_shell::good(), "✓ Synchronized");
                             });
                         });
                         
@@ -6556,14 +6488,14 @@ impl eframe::App for MyApp {
                                     .map(|s| s.messages_sent + s.messages_received)
                                     .sum::<u64>();
                                 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label(format!("Total CAN Messages: {}", total_messages));
                                     ui.label(format!("Active Toolheads: {}", toolheads.len()));
                                     ui.label("Bus Status: OK");
                                 });
                             }
                             
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 if ui.button("📊 Export Diagnostics").clicked() {
                                     // Export CAN diagnostics
                                 }
@@ -6584,21 +6516,21 @@ impl eframe::App for MyApp {
                     egui::ScrollArea::vertical().id_salt("input_shaping_scroll").show(ui, |ui| {
                         // Global Input Shaping Controls
                         ui.group(|ui| {
-                            ui.label("⚙️ Global Input Shaping Settings");
+                            ui.label("⚙ Global Input Shaping Settings");
                             
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.checkbox(&mut self.input_shaping_enabled, "Enable Input Shaping");
                                 if self.input_shaping_enabled {
-                                    ui.colored_label(Color32::GREEN, "✓ Active");
+                                    ui.colored_label(ui_shell::good(), "✓ Active");
                                 } else {
-                                    ui.colored_label(Color32::RED, "⚠ Disabled");
+                                    ui.colored_label(ui_shell::danger(), "⚠ Disabled");
                                 }
                             });
                             
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.checkbox(&mut self.resonance_testing_active, "Resonance Testing Mode");
                                 if self.resonance_testing_active {
-                                    ui.colored_label(Color32::YELLOW, "🔬 Testing");
+                                    ui.colored_label(ui_shell::warning(), "🔬 Testing");
                                 }
                             });
                         });
@@ -6609,7 +6541,7 @@ impl eframe::App for MyApp {
                         ui.group(|ui| {
                             ui.label("🎯 Axis Configuration");
                             
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Configure axis:");
                                 egui::ComboBox::from_label("Axis Selection")
                                     .selected_text(format!("{} Axis", self.selected_shaper_axis))
@@ -6632,16 +6564,16 @@ impl eframe::App for MyApp {
                             ui.group(|ui| {
                                 ui.label(format!("📋 {} Axis Input Shaper Configuration", self.selected_shaper_axis));
                                 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.checkbox(&mut config_clone.enabled, "Enable for this axis");
                                     if config_clone.enabled {
-                                        ui.colored_label(Color32::GREEN, "✓ Enabled");
+                                        ui.colored_label(ui_shell::good(), "✓ Enabled");
                                     } else {
-                                        ui.colored_label(Color32::RED, "⚠ Disabled");
+                                        ui.colored_label(ui_shell::danger(), "⚠ Disabled");
                                     }
                                 });
                                 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Shaper Type:");
                                     egui::ComboBox::from_label("Algorithm")
                                         .selected_text(format!("{:?}", config_clone.shaper_type))
@@ -6655,7 +6587,7 @@ impl eframe::App for MyApp {
                                         });
                                 });
                                 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Resonance Frequency:");
                                     ui.add(egui::DragValue::new(&mut config_clone.frequency)
                                         .range(5.0..=200.0)
@@ -6667,7 +6599,7 @@ impl eframe::App for MyApp {
                                     }
                                 });
                                 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Damping Ratio:");
                                     ui.add(egui::DragValue::new(&mut config_clone.damping_ratio)
                                         .range(0.01..=0.3)
@@ -6676,7 +6608,7 @@ impl eframe::App for MyApp {
                                     ui.label("(0.1 = 10% damping)");
                                 });
                                 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Max Acceleration:");
                                     ui.add(egui::DragValue::new(&mut config_clone.max_acceleration)
                                         .range(100.0..=20000.0)
@@ -6684,7 +6616,7 @@ impl eframe::App for MyApp {
                                         .speed(10.0));
                                 });
                                 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Smoothing Time:");
                                     ui.add(egui::DragValue::new(&mut config_clone.smoothing_time)
                                         .range(0.01..=0.2)
@@ -6695,7 +6627,7 @@ impl eframe::App for MyApp {
                                 
                                 ui.separator();
                                 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     if ui.button("💾 Apply Configuration").clicked() {
                                         self.input_shaper_manager.update_axis_config(self.selected_shaper_axis, config_clone.clone());
                                         println!("Applied input shaper config for {} axis", self.selected_shaper_axis);
@@ -6741,7 +6673,7 @@ impl eframe::App for MyApp {
                             ui.label("🔬 Resonance Testing & Calibration");
                             
                             if !self.resonance_testing_active {
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     if ui.button("📊 Start Frequency Sweep").clicked() {
                                         self.resonance_testing_active = true;
                                         // Start resonance testing for current axis
@@ -6757,8 +6689,8 @@ impl eframe::App for MyApp {
                                 
                                 ui.label("Run resonance tests to automatically determine optimal shaper frequencies");
                             } else {
-                                ui.horizontal(|ui| {
-                                    ui.colored_label(Color32::YELLOW, "🔬 Resonance test in progress...");
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.colored_label(ui_shell::warning(), "🔬 Resonance test in progress...");
                                     if ui.button("⏹ Stop Test").clicked() {
                                         self.resonance_testing_active = false;
                                         self.input_shaper_manager.stop_resonance_test();
@@ -6774,7 +6706,7 @@ impl eframe::App for MyApp {
                             
                             ui.separator();
                             
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 if ui.button("📈 View Response Graph").clicked() {
                                     // Show frequency response graph
                                 }
@@ -6793,7 +6725,7 @@ impl eframe::App for MyApp {
                         ui.group(|ui| {
                             ui.label("📊 Input Shaper Status Summary");
                             
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 let enabled_axes = ['X', 'Y', 'Z', 'A', 'B']
                                     .iter()
                                     .filter(|&&axis| {
@@ -6806,9 +6738,9 @@ impl eframe::App for MyApp {
                                 ui.label(format!("Active Axes: {}/5", enabled_axes));
                                 
                                 if enabled_axes > 0 {
-                                    ui.colored_label(Color32::GREEN, "✓ Input shaping active");
+                                    ui.colored_label(ui_shell::good(), "✓ Input shaping active");
                                 } else {
-                                    ui.colored_label(Color32::RED, "⚠ No axes configured");
+                                    ui.colored_label(ui_shell::danger(), "⚠ No axes configured");
                                 }
                             });
                             
@@ -6836,7 +6768,7 @@ impl eframe::App for MyApp {
                                 ui.label("🎯 Motor Configuration");
                                 
                                 // Quick setup buttons
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     if ui.button("📐 Cartesian Setup").clicked() {
                                         if let Err(e) = self.motor_manager.create_standard_cartesian_setup() {
                                             // Show error - could implement error display
@@ -6851,8 +6783,9 @@ impl eframe::App for MyApp {
                                         self.show_add_motor_dialog = true;
                                     }
                                     
-                                    ui.horizontal(|ui| {
-                                        if ui.button("🗑️ Remove Selected").clicked() {
+                                    ui.end_row();
+                                    ui.horizontal_wrapped(|ui| {
+                                        if ui.button("🗑 Remove Selected").clicked() {
                                             if let Some(selected_id) = &self.selected_motor_id {
                                                 match self.motor_manager.remove_motor(selected_id) {
                                                     Ok(removed_config) => {
@@ -6893,7 +6826,7 @@ impl eframe::App for MyApp {
                                     for (motor_id, config) in self.motor_manager.get_all_motors() {
                                         let is_selected = self.selected_motor_id.as_ref() == Some(motor_id);
                                         
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             if ui.selectable_label(is_selected, motor_id).clicked() {
                                                 self.selected_motor_id = Some(motor_id.clone());
                                             }
@@ -6908,11 +6841,11 @@ impl eframe::App for MyApp {
                                             };
                                             
                                             let color = if config.function == MotorFunction::Unassigned {
-                                                Color32::YELLOW
+                                                ui_shell::warning()
                                             } else if config.enabled {
-                                                Color32::GREEN
+                                                ui_shell::good()
                                             } else {
-                                                Color32::GRAY
+                                                ui_shell::muted()
                                             };
                                             
                                             ui.colored_label(color, function_text);
@@ -6932,42 +6865,42 @@ impl eframe::App for MyApp {
                                         ui.separator();
                                         ui.label("🔧 Motor Details");
                                         
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.label("ID:");
                                             ui.label(&config.motor_id);
                                         });
                                         
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.label("Type:");
                                             ui.label(format!("{:?}", config.motor_type));
                                         });
                                         
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.label("Function:");
                                             ui.label(format!("{:?}", config.function));
                                         });
                                         
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.label("Max Speed:");
                                             ui.label(format!("{:.1}", config.capabilities.max_speed));
                                         });
                                         
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.label("Steps/mm:");
                                             ui.label(format!("{:.1}", config.capabilities.steps_per_unit));
                                         });
                                         
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.label("Current:");
                                             ui.label(format!("{:.2}A", config.current_setting));
                                         });
                                         
                                         if config.capabilities.has_encoder {
-                                            ui.colored_label(Color32::GREEN, "🔄 Encoder Available");
+                                            ui.colored_label(ui_shell::good(), "🔄 Encoder Available");
                                         }
                                         
                                         if config.capabilities.stall_detection {
-                                            ui.colored_label(Color32::BLUE, "⚠ Stall Detection");
+                                            ui.colored_label(ui_shell::info(), "⚠ Stall Detection");
                                         }
                                     }
                                 }
@@ -7010,21 +6943,21 @@ impl eframe::App for MyApp {
                                                 };
                                                 
                                                 let color = if state.enabled && state.homed {
-                                                    Color32::GREEN
+                                                    ui_shell::good()
                                                 } else if state.enabled {
-                                                    Color32::YELLOW
+                                                    ui_shell::warning()
                                                 } else {
-                                                    Color32::RED
+                                                    ui_shell::danger()
                                                 };
                                                 
                                                 ui.colored_label(color, status);
                                             } else {
-                                                ui.colored_label(Color32::GRAY, "No State");
+                                                ui.colored_label(ui_shell::muted(), "No State");
                                             }
                                             }
                                         } else {
-                                            ui.colored_label(Color32::RED, "Unassigned");
-                                            ui.colored_label(Color32::RED, "❌");
+                                            ui.colored_label(ui_shell::danger(), "Unassigned");
+                                            ui.colored_label(ui_shell::danger(), "❌");
                                         }
                                         
                                         ui.end_row();
@@ -7041,10 +6974,10 @@ impl eframe::App for MyApp {
                                     .auto_shrink([false, true])
                                     .show(ui, |ui| {
                                     for event in self.motor_manager.get_assignment_history().iter().rev().take(10) {
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.label(format!("{}", event.motor_id));
                                             ui.label("→");
-                                            ui.colored_label(Color32::GREEN, format!("{:?}", event.new_function));
+                                            ui.colored_label(ui_shell::good(), format!("{:?}", event.new_function));
                                             ui.label(format!("({})", event.reason));
                                         });
                                     }
@@ -7055,7 +6988,7 @@ impl eframe::App for MyApp {
                                 // Quick actions for selected motor
                                 if let Some(selected_id) = self.selected_motor_id.clone() {
                                     ui.label("🔧 Quick Actions");
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         if ui.button("🏠 Home").clicked() {
                                             // Home motor - could implement actual homing
                                         }
@@ -7092,7 +7025,7 @@ impl eframe::App for MyApp {
                                     });
                                     
                                     // Function reassignment
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.label("Assign to:");
                                         egui::ComboBox::from_label("")
                                             .selected_text("Select Function")
@@ -7133,26 +7066,26 @@ impl eframe::App for MyApp {
                                 ui.label("🎯 Encoder Configuration");
                                 
                                 // Global closed-loop controls
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     let status = self.closed_loop_manager.get_status_summary();
                                     
                                     if status.global_enabled {
                                         if ui.button("⏸ Disable Global").clicked() {
                                             self.closed_loop_manager.disable_global();
                                         }
-                                        ui.colored_label(Color32::GREEN, "✓ Enabled");
+                                        ui.colored_label(ui_shell::good(), "✓ Enabled");
                                     } else {
                                         if ui.button("▶ Enable Global").clicked() {
                                             self.closed_loop_manager.enable_global();
                                         }
-                                        ui.colored_label(Color32::RED, "❌ Disabled");
+                                        ui.colored_label(ui_shell::danger(), "❌ Disabled");
                                     }
                                 });
                                 
                                 ui.separator();
                                 
                                 // Quick setup actions
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     if ui.button("🏠 Home All Axes").clicked() {
                                         if let Err(e) = self.closed_loop_manager.home_all_axes() {
                                             // Could implement error display
@@ -7162,8 +7095,9 @@ impl eframe::App for MyApp {
                                         // Could implement add encoder dialog
                                     }
                                     
-                                    ui.horizontal(|ui| {
-                                        if ui.button("🗑️ Remove Selected Axis").clicked() {
+                                    ui.end_row();
+                                    ui.horizontal_wrapped(|ui| {
+                                        if ui.button("🗑 Remove Selected Axis").clicked() {
                                             if let Some(selected_axis) = &self.selected_encoder_axis {
                                                 let result = self.closed_loop_manager.remove_axis(selected_axis);
                                                 if result.is_ok() {
@@ -7203,42 +7137,42 @@ impl eframe::App for MyApp {
                                     for (axis_name, diag) in diagnostics.iter() {
                                         let is_selected = self.selected_encoder_axis.as_ref() == Some(axis_name);
                                         
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             if ui.selectable_label(is_selected, axis_name).clicked() {
                                                 self.selected_encoder_axis = Some(axis_name.clone());
                                             }
                                             
                                             // Connection status
                                             if diag.connected {
-                                                ui.colored_label(Color32::GREEN, "🔗 Connected");
+                                                ui.colored_label(ui_shell::good(), "🔗 Connected");
                                             } else {
-                                                ui.colored_label(Color32::RED, "❌ Disconnected");
+                                                ui.colored_label(ui_shell::danger(), "❌ Disconnected");
                                             }
                                             
                                             // Calibration status
                                             if diag.calibrated {
-                                                ui.colored_label(Color32::GREEN, "📐 Calibrated");
+                                                ui.colored_label(ui_shell::good(), "📐 Calibrated");
                                             } else {
-                                                ui.colored_label(Color32::YELLOW, "⚠ Not Calibrated");
+                                                ui.colored_label(ui_shell::warning(), "⚠ Not Calibrated");
                                             }
                                             
                                             // Enabled status
                                             if diag.enabled {
-                                                ui.colored_label(Color32::BLUE, "🔄 Active");
+                                                ui.colored_label(ui_shell::info(), "🔄 Active");
                                             } else {
-                                                ui.colored_label(Color32::GRAY, "⏸ Inactive");
+                                                ui.colored_label(ui_shell::muted(), "⏸ Inactive");
                                             }
                                         });
                                         
                                         // Position error indicator
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.label("Position Error:");
                                             let error_color = if diag.position_error.abs() > 0.1 {
-                                                Color32::RED
+                                                ui_shell::danger()
                                             } else if diag.position_error.abs() > 0.05 {
-                                                Color32::YELLOW
+                                                ui_shell::warning()
                                             } else {
-                                                Color32::GREEN
+                                                ui_shell::good()
                                             };
                                             ui.colored_label(error_color, format!("{:.4} mm", diag.position_error));
                                         });
@@ -7247,7 +7181,7 @@ impl eframe::App for MyApp {
                                     }
                                     
                                     if diagnostics.is_empty() {
-                                        ui.colored_label(Color32::GRAY, "No encoder axes configured");
+                                        ui.colored_label(ui_shell::muted(), "No encoder axes configured");
                                     }
                                 });
                                 
@@ -7269,9 +7203,9 @@ impl eframe::App for MyApp {
                                             
                                             ui.label("Position Error:");
                                             let error_color = if diag.position_error.abs() > 0.1 {
-                                                Color32::RED
+                                                ui_shell::danger()
                                             } else {
-                                                Color32::GREEN
+                                                ui_shell::good()
                                             };
                                             ui.colored_label(error_color, format!("{:.4} mm", diag.position_error));
                                             ui.end_row();
@@ -7286,17 +7220,17 @@ impl eframe::App for MyApp {
                                             
                                             ui.label("Error Count:");
                                             if diag.error_count > 0 {
-                                                ui.colored_label(Color32::RED, diag.error_count.to_string());
+                                                ui.colored_label(ui_shell::danger(), diag.error_count.to_string());
                                             } else {
-                                                ui.colored_label(Color32::GREEN, "0");
+                                                ui.colored_label(ui_shell::good(), "0");
                                             }
                                             ui.end_row();
                                             
                                             ui.label("Comm Errors:");
                                             if diag.communication_errors > 0 {
-                                                ui.colored_label(Color32::RED, diag.communication_errors.to_string());
+                                                ui.colored_label(ui_shell::danger(), diag.communication_errors.to_string());
                                             } else {
-                                                ui.colored_label(Color32::GREEN, "0");
+                                                ui.colored_label(ui_shell::good(), "0");
                                             }
                                             ui.end_row();
                                         });
@@ -7305,7 +7239,7 @@ impl eframe::App for MyApp {
                                         
                                         // PID tuning controls
                                         ui.label("🎛 PID Tuning");
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             if ui.button("Auto Tune").clicked() {
                                                 // Could implement PID auto-tuning
                                             }
@@ -7315,7 +7249,7 @@ impl eframe::App for MyApp {
                                         });
                                         
                                         // Manual PID adjustment (simplified UI)
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.label("Kp: 1.0"); // Could make these editable
                                             ui.label("Ki: 0.1");
                                             ui.label("Kd: 0.01");
@@ -7325,7 +7259,7 @@ impl eframe::App for MyApp {
                                         
                                         // Encoder axis management
                                         ui.label("🔧 Axis Management");
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             if ui.button("🗑 Remove Axis").clicked() {
                                                 if let Err(e) = self.closed_loop_manager.remove_axis(&selected_axis) {
                                                     // Could implement error display
@@ -7361,9 +7295,9 @@ impl eframe::App for MyApp {
                                 egui::Grid::new("status_grid").show(ui, |ui| {
                                     ui.label("Global Status:");
                                     if status.global_enabled {
-                                        ui.colored_label(Color32::GREEN, "✓ Enabled");
+                                        ui.colored_label(ui_shell::good(), "✓ Enabled");
                                     } else {
-                                        ui.colored_label(Color32::RED, "❌ Disabled");
+                                        ui.colored_label(ui_shell::danger(), "❌ Disabled");
                                     }
                                     ui.end_row();
                                     
@@ -7376,33 +7310,33 @@ impl eframe::App for MyApp {
                                     ui.end_row();
                                     
                                     ui.label("Enabled Axes:");
-                                    ui.colored_label(Color32::GREEN, status.enabled_axes.to_string());
+                                    ui.colored_label(ui_shell::good(), status.enabled_axes.to_string());
                                     ui.end_row();
                                     
                                     ui.label("Calibrated Axes:");
-                                    ui.colored_label(Color32::BLUE, status.calibrated_axes.to_string());
+                                    ui.colored_label(ui_shell::info(), status.calibrated_axes.to_string());
                                     ui.end_row();
                                     
                                     ui.label("Connected Axes:");
-                                    ui.colored_label(Color32::GREEN, status.connected_axes.to_string());
+                                    ui.colored_label(ui_shell::good(), status.connected_axes.to_string());
                                     ui.end_row();
                                     
                                     ui.label("Max Position Error:");
                                     let error_color = if status.max_position_error > 0.1 {
-                                        Color32::RED
+                                        ui_shell::danger()
                                     } else if status.max_position_error > 0.05 {
-                                        Color32::YELLOW
+                                        ui_shell::warning()
                                     } else {
-                                        Color32::GREEN
+                                        ui_shell::good()
                                     };
                                     ui.colored_label(error_color, format!("{:.4} mm", status.max_position_error));
                                     ui.end_row();
                                     
                                     ui.label("Error Recovery:");
                                     if status.error_recovery_enabled {
-                                        ui.colored_label(Color32::GREEN, "✓ Enabled");
+                                        ui.colored_label(ui_shell::good(), "✓ Enabled");
                                     } else {
-                                        ui.colored_label(Color32::YELLOW, "⚠ Disabled");
+                                        ui.colored_label(ui_shell::warning(), "⚠ Disabled");
                                     }
                                     ui.end_row();
                                 });
@@ -7413,7 +7347,7 @@ impl eframe::App for MyApp {
                                 if let Some(selected_axis) = &self.selected_encoder_axis {
                                     ui.label(format!("🔧 {} Actions", selected_axis));
                                     
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         if ui.button("🏠 Home Axis").clicked() {
                                             let _ = self.closed_loop_manager.home_axis(selected_axis);
                                         }
@@ -7436,7 +7370,7 @@ impl eframe::App for MyApp {
                                     
                                     // Manual position control (for testing)
                                     ui.label("🎮 Manual Control");
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         if ui.button("← -1mm").clicked() {
                                             let diagnostics = self.closed_loop_manager.get_all_diagnostics();
                                             if let Some(diag) = diagnostics.get(selected_axis) {
@@ -7472,7 +7406,7 @@ impl eframe::App for MyApp {
                                 
                                 // Quick encoder setup wizard
                                 ui.label("🧙 Quick Setup");
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     if ui.button("📐 Add X Axis Encoder").clicked() {
                                         use closed_loop_control::EncoderPinConfig;
                                         let config = EncoderConfig {
@@ -7514,7 +7448,7 @@ impl eframe::App for MyApp {
                                     }
                                 });
                                 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     if ui.button("📐 Add Z Axis Encoder").clicked() {
                                         use closed_loop_control::EncoderPinConfig;
                                         let config = EncoderConfig {
@@ -7569,23 +7503,23 @@ impl eframe::App for MyApp {
                                 ui.label("🎯 Temperature Zones");
                                 
                                 // Global temperature controls
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     let status = self.temperature_manager.get_system_status();
                                     
                                     if status.global_enabled {
                                         if ui.button("⏸ Disable Global").clicked() {
                                             self.temperature_manager.disable_global();
                                         }
-                                        ui.colored_label(Color32::GREEN, "✓ Enabled");
+                                        ui.colored_label(ui_shell::good(), "✓ Enabled");
                                     } else {
                                         if ui.button("▶ Enable Global").clicked() {
                                             self.temperature_manager.enable_global();
                                         }
-                                        ui.colored_label(Color32::RED, "❌ Disabled");
+                                        ui.colored_label(ui_shell::danger(), "❌ Disabled");
                                     }
                                     
                                     if status.emergency_stop {
-                                        ui.colored_label(Color32::RED, "🚨 EMERGENCY STOP");
+                                        ui.colored_label(ui_shell::danger(), "🚨 EMERGENCY STOP");
                                         if ui.button("Clear E-Stop").clicked() {
                                             self.temperature_manager.clear_emergency_stop();
                                         }
@@ -7595,7 +7529,7 @@ impl eframe::App for MyApp {
                                 ui.separator();
                                 
                                 // Quick setup actions
-                                ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
                                     // Dropdown for adding multiple hotends
                                     egui::ComboBox::from_label("🔥 Add Hotend")
                                         .selected_text("Select Hotend")
@@ -7683,7 +7617,7 @@ impl eframe::App for MyApp {
                                         });
                                 });
                                 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     // Chamber heater with multiple configurations
                                     egui::ComboBox::from_label("🏠 Add Chamber")
                                         .selected_text("Chamber Type")
@@ -7782,7 +7716,7 @@ impl eframe::App for MyApp {
                                         let is_selected = self.selected_temp_zone.as_ref() == Some(zone);
                                         
                                         ui.group(|ui| {
-                                            ui.horizontal(|ui| {
+                                            ui.horizontal_wrapped(|ui| {
                                                 if ui.selectable_label(is_selected, &zone.to_string()).clicked() {
                                                     self.selected_temp_zone = Some(zone.clone());
                                                 }
@@ -7793,45 +7727,45 @@ impl eframe::App for MyApp {
                                                 // Target temperature
                                                 if stats.target_temperature > 0.0 {
                                                     ui.label("→");
-                                                    ui.colored_label(Color32::BLUE, format!("{:.0}°C", stats.target_temperature));
+                                                    ui.colored_label(ui_shell::info(), format!("{:.0}°C", stats.target_temperature));
                                                 }
                                                 
                                                 // Status indicators
                                                 if stats.safety_shutdown {
-                                                    ui.colored_label(Color32::RED, "🚨 SHUTDOWN");
+                                                    ui.colored_label(ui_shell::danger(), "🚨 SHUTDOWN");
                                                 } else if stats.enabled {
                                                     let error = stats.temperature_error.abs();
                                                     if error < 2.0 {
-                                                        ui.colored_label(Color32::GREEN, "✓ At Target");
+                                                        ui.colored_label(ui_shell::good(), "✓ At Target");
                                                     } else if error < 10.0 {
-                                                        ui.colored_label(Color32::YELLOW, "🔄 Heating");
+                                                        ui.colored_label(ui_shell::warning(), "🔄 Heating");
                                                     } else {
                                                         ui.colored_label(Color32::ORANGE, "⚠ Large Error");
                                                     }
                                                 } else {
-                                                    ui.colored_label(Color32::GRAY, "⏸ Disabled");
+                                                    ui.colored_label(ui_shell::muted(), "⏸ Disabled");
                                                 }
                                             });
                                             
                                             // Temperature error and stability
-                                            ui.horizontal(|ui| {
+                                            ui.horizontal_wrapped(|ui| {
                                                 ui.label("Error:");
                                                 let error_color = if stats.temperature_error.abs() > 5.0 {
-                                                    Color32::RED
+                                                    ui_shell::danger()
                                                 } else if stats.temperature_error.abs() > 2.0 {
-                                                    Color32::YELLOW
+                                                    ui_shell::warning()
                                                 } else {
-                                                    Color32::GREEN
+                                                    ui_shell::good()
                                                 };
                                                 ui.colored_label(error_color, format!("{:.2}°C", stats.temperature_error));
                                                 
                                                 ui.label("Stability:");
                                                 let stability_color = if stats.temperature_stability > 1.0 {
-                                                    Color32::RED
+                                                    ui_shell::danger()
                                                 } else if stats.temperature_stability > 0.5 {
-                                                    Color32::YELLOW
+                                                    ui_shell::warning()
                                                 } else {
-                                                    Color32::GREEN
+                                                    ui_shell::good()
                                                 };
                                                 ui.colored_label(stability_color, format!("±{:.2}°C", stats.temperature_stability));
                                             });
@@ -7841,7 +7775,7 @@ impl eframe::App for MyApp {
                                     }
                                     
                                     if statistics.is_empty() {
-                                        ui.colored_label(Color32::GRAY, "No temperature zones configured");
+                                        ui.colored_label(ui_shell::muted(), "No temperature zones configured");
                                     }
                                 });
                             });
@@ -7856,17 +7790,17 @@ impl eframe::App for MyApp {
                                 egui::Grid::new("temp_status_grid").show(ui, |ui| {
                                     ui.label("Global Status:");
                                     if status.global_enabled {
-                                        ui.colored_label(Color32::GREEN, "✓ Enabled");
+                                        ui.colored_label(ui_shell::good(), "✓ Enabled");
                                     } else {
-                                        ui.colored_label(Color32::RED, "❌ Disabled");
+                                        ui.colored_label(ui_shell::danger(), "❌ Disabled");
                                     }
                                     ui.end_row();
                                     
                                     ui.label("Emergency Stop:");
                                     if status.emergency_stop {
-                                        ui.colored_label(Color32::RED, "🚨 ACTIVE");
+                                        ui.colored_label(ui_shell::danger(), "🚨 ACTIVE");
                                     } else {
-                                        ui.colored_label(Color32::GREEN, "✓ Clear");
+                                        ui.colored_label(ui_shell::good(), "✓ Clear");
                                     }
                                     ui.end_row();
                                     
@@ -7879,28 +7813,28 @@ impl eframe::App for MyApp {
                                     ui.end_row();
                                     
                                     ui.label("Enabled Zones:");
-                                    ui.colored_label(Color32::GREEN, status.enabled_zones.to_string());
+                                    ui.colored_label(ui_shell::good(), status.enabled_zones.to_string());
                                     ui.end_row();
                                     
                                     ui.label("Zones at Target:");
-                                    ui.colored_label(Color32::BLUE, status.zones_at_target.to_string());
+                                    ui.colored_label(ui_shell::info(), status.zones_at_target.to_string());
                                     ui.end_row();
                                     
                                     ui.label("Zones in Error:");
                                     if status.zones_in_error > 0 {
-                                        ui.colored_label(Color32::RED, status.zones_in_error.to_string());
+                                        ui.colored_label(ui_shell::danger(), status.zones_in_error.to_string());
                                     } else {
-                                        ui.colored_label(Color32::GREEN, "0");
+                                        ui.colored_label(ui_shell::good(), "0");
                                     }
                                     ui.end_row();
                                     
                                     ui.label("Max Temp Error:");
                                     let error_color = if status.max_temperature_error > 10.0 {
-                                        Color32::RED
+                                        ui_shell::danger()
                                     } else if status.max_temperature_error > 5.0 {
-                                        Color32::YELLOW
+                                        ui_shell::warning()
                                     } else {
-                                        Color32::GREEN
+                                        ui_shell::good()
                                     };
                                     ui.colored_label(error_color, format!("{:.2}°C", status.max_temperature_error));
                                     ui.end_row();
@@ -7915,7 +7849,7 @@ impl eframe::App for MyApp {
                                     let statistics = self.temperature_manager.get_all_statistics();
                                     if let Some(stats) = statistics.get(selected_zone) {
                                         // Temperature setting
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.label("Target Temperature:");
                                             
                                             // Quick temperature buttons
@@ -7959,7 +7893,7 @@ impl eframe::App for MyApp {
                                         });
                                         
                                         // Manual temperature adjustment
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.label("Fine Control:");
                                             if ui.button("← -10°C").clicked() {
                                                 let new_target = (stats.target_temperature - 10.0).max(0.0);
@@ -7994,7 +7928,7 @@ impl eframe::App for MyApp {
                                         ui.separator();
                                         
                                         // Zone enable/disable
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             if stats.enabled {
                                                 if ui.button("⏸ Disable Zone").clicked() {
                                                     let _ = self.temperature_manager.disable_zone(selected_zone);
@@ -8016,7 +7950,7 @@ impl eframe::App for MyApp {
                                         
                                         // PID Tuning
                                         ui.label("🎛 PID Configuration");
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             if ui.button("Auto Tune PID").clicked() {
                                                 // Could implement PID auto-tuning
                                             }
@@ -8027,7 +7961,7 @@ impl eframe::App for MyApp {
                                         });
                                         
                                         // Manual PID parameters (simplified display)
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.label("Kp: 20.0"); // Could make these editable
                                             ui.label("Ki: 2.0");
                                             ui.label("Kd: 0.5");
@@ -8037,7 +7971,7 @@ impl eframe::App for MyApp {
                                         
                                         // Feedforward model
                                         ui.label("🔮 Feedforward Model");
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             if ui.button("Enable Feedforward").clicked() {
                                                 let mut model = FeedforwardModel::default();
                                                 model.enabled = true;
@@ -8051,7 +7985,7 @@ impl eframe::App for MyApp {
                                         });
                                         
                                         // Model parameters (simplified display)
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.label("Time Constant: 30s");
                                             ui.label("Dead Time: 5s");
                                             ui.label("Gain: 1.0");
@@ -8063,7 +7997,7 @@ impl eframe::App for MyApp {
                                 
                                 // Emergency controls
                                 ui.label("🚨 Emergency Controls");
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     if ui.button("🚨 EMERGENCY STOP").clicked() {
                                         self.temperature_manager.emergency_stop();
                                     }
@@ -8095,26 +8029,26 @@ impl eframe::App for MyApp {
                                 let has_recovery_data = self.power_loss_manager.has_recovery_data();
                                 
                                 // Main status
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Recovery System:");
                                     if config.enabled {
-                                        ui.colored_label(Color32::GREEN, "✓ Enabled");
+                                        ui.colored_label(ui_shell::good(), "✓ Enabled");
                                     } else {
-                                        ui.colored_label(Color32::RED, "❌ Disabled");
+                                        ui.colored_label(ui_shell::danger(), "❌ Disabled");
                                     }
                                 });
                                 
                                 // Check for existing recovery data
                                 let mut load_recovery_clicked = false;
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Recovery Data:");
                                     if has_recovery_data {
-                                        ui.colored_label(Color32::YELLOW, "⚠ Found");
+                                        ui.colored_label(ui_shell::warning(), "⚠ Found");
                                         if ui.button("🔄 Load Recovery").clicked() {
                                             load_recovery_clicked = true;
                                         }
                                     } else {
-                                        ui.colored_label(Color32::GREEN, "✓ None");
+                                        ui.colored_label(ui_shell::good(), "✓ None");
                                     }
                                 });
                                 
@@ -8148,24 +8082,24 @@ impl eframe::App for MyApp {
                                     ui.end_row();
                                     
                                     ui.label("Successful Recoveries:");
-                                    ui.colored_label(Color32::GREEN, stats.successful_recoveries.to_string());
+                                    ui.colored_label(ui_shell::good(), stats.successful_recoveries.to_string());
                                     ui.end_row();
                                     
                                     ui.label("Failed Recoveries:");
                                     if stats.failed_recoveries > 0 {
-                                        ui.colored_label(Color32::RED, stats.failed_recoveries.to_string());
+                                        ui.colored_label(ui_shell::danger(), stats.failed_recoveries.to_string());
                                     } else {
-                                        ui.colored_label(Color32::GREEN, "0");
+                                        ui.colored_label(ui_shell::good(), "0");
                                     }
                                     ui.end_row();
                                     
                                     ui.label("Success Rate:");
                                     let color = if stats.recovery_success_rate > 80.0 {
-                                        Color32::GREEN
+                                        ui_shell::good()
                                     } else if stats.recovery_success_rate > 60.0 {
-                                        Color32::YELLOW
+                                        ui_shell::warning()
                                     } else {
-                                        Color32::RED
+                                        ui_shell::danger()
                                     };
                                     ui.colored_label(color, format!("{:.1}%", stats.recovery_success_rate));
                                     ui.end_row();
@@ -8195,9 +8129,9 @@ impl eframe::App for MyApp {
                                 ui.separator();
                                 
                                 // Configuration
-                                ui.label("⚙️ Configuration");
+                                ui.label("⚙ Configuration");
                                 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Detection Method:");
                                     match &config.detection_method {
                                         PowerLossDetectionMethod::VoltageSensor { threshold_voltage, .. } => {
@@ -8215,26 +8149,26 @@ impl eframe::App for MyApp {
                                     }
                                 });
                                 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Save Interval:");
                                     ui.label(format!("{} ms", config.save_interval_ms));
                                 });
                                 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Auto Recovery:");
                                     if config.auto_recovery {
-                                        ui.colored_label(Color32::GREEN, "✓ Enabled");
+                                        ui.colored_label(ui_shell::good(), "✓ Enabled");
                                     } else {
-                                        ui.colored_label(Color32::YELLOW, "⚠ Manual");
+                                        ui.colored_label(ui_shell::warning(), "⚠ Manual");
                                     }
                                 });
                                 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Z-Lift on Loss:");
                                     ui.label(format!("{:.1} mm", config.z_lift_on_power_loss));
                                 });
                                 
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label("Recovery Retraction:");
                                     ui.label(format!("{:.1} mm", config.recovery_retraction));
                                 });
@@ -8243,7 +8177,7 @@ impl eframe::App for MyApp {
                                 
                                 // Test controls
                                 ui.label("🧪 Testing");
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     if ui.button("💾 Test Save State").clicked() {
                                         // Simulate a print state for testing
                                         let test_state = PrintStateUpdate {
@@ -8301,11 +8235,11 @@ impl eframe::App for MyApp {
                                         
                                         ui.label("Success Probability:");
                                         let prob_color = if recovery_plan.recovery_success_probability > 0.8 {
-                                            Color32::GREEN
+                                            ui_shell::good()
                                         } else if recovery_plan.recovery_success_probability > 0.6 {
-                                            Color32::YELLOW
+                                            ui_shell::warning()
                                         } else {
-                                            Color32::RED
+                                            ui_shell::danger()
                                         };
                                         ui.colored_label(prob_color, format!("{:.0}%", recovery_plan.recovery_success_probability * 100.0));
                                         ui.end_row();
@@ -8323,24 +8257,24 @@ impl eframe::App for MyApp {
                                     egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                                         for (i, step) in recovery_plan.steps.iter().enumerate() {
                                             ui.group(|ui| {
-                                                ui.horizontal(|ui| {
+                                                ui.horizontal_wrapped(|ui| {
                                                     ui.label(format!("{}.", i + 1));
                                                     if step.critical {
-                                                        ui.colored_label(Color32::RED, "🔴");
+                                                        ui.colored_label(ui_shell::danger(), "🔴");
                                                     } else {
-                                                        ui.colored_label(Color32::GREEN, "🟢");
+                                                        ui.colored_label(ui_shell::good(), "🟢");
                                                     }
                                                     ui.label(&step.description);
                                                 });
                                                 
                                                 if !step.gcode_commands.is_empty() {
-                                                    ui.horizontal(|ui| {
+                                                    ui.horizontal_wrapped(|ui| {
                                                         ui.label("G-code:");
                                                         ui.label(step.gcode_commands.join("; "));
                                                     });
                                                 }
                                                 
-                                                ui.horizontal(|ui| {
+                                                ui.horizontal_wrapped(|ui| {
                                                     ui.label("Duration:");
                                                     ui.label(format!("{}s", step.estimated_duration.as_secs()));
                                                 });
@@ -8356,7 +8290,7 @@ impl eframe::App for MyApp {
                                     let mut start_recovery = false;
                                     let mut cancel_recovery = false;
                                     
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         if recovery_plan.requires_user_confirmation {
                                             if ui.button("✅ Start Recovery").clicked() {
                                                 start_recovery = true;
@@ -8388,9 +8322,9 @@ impl eframe::App for MyApp {
                                     ui.separator();
                                     
                                     // System configuration
-                                    ui.label("⚙️ System Configuration");
+                                    ui.label("⚙ System Configuration");
                                     
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         if ui.button("🔧 Configure Detection").clicked() {
                                             // Could open configuration dialog
                                         }
@@ -8399,7 +8333,7 @@ impl eframe::App for MyApp {
                                         }
                                     });
                                     
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         if ui.button("🧹 Clear Statistics").clicked() {
                                             // Could clear statistics with confirmation
                                         }
@@ -8421,7 +8355,7 @@ impl eframe::App for MyApp {
                                     
                                     // Manual recovery file management
                                     ui.label("📂 Recovery File Management");
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         if ui.button("📄 View Recovery Files").clicked() {
                                             // Could show file browser
                                         }
@@ -8446,7 +8380,7 @@ impl eframe::App for MyApp {
                         ui.separator();
                         
                         // Extruder selection
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("🎯 Active Extruder:");
                             let current_extruder = 0; // TODO: Get from actual state
                             if ui.button(&format!("Extruder {}", current_extruder)).clicked() {
@@ -8459,8 +8393,8 @@ impl eframe::App for MyApp {
                         // Pressure advance configuration
                         let mut config = self.pressure_advance.get_active_controller().get_config().clone();
                         
-                        ui.label("⚙️ Configuration");
-                        ui.horizontal(|ui| {
+                        ui.label("⚙ Configuration");
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Pressure Advance:");
                             ui.add(egui::DragValue::new(&mut config.pressure_advance)
                                 .speed(0.001)
@@ -8469,7 +8403,7 @@ impl eframe::App for MyApp {
                             ui.label("(Higher values = more advance)");
                         });
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Smooth Time:");
                             ui.add(egui::DragValue::new(&mut config.smooth_time)
                                 .speed(0.001)
@@ -8478,7 +8412,7 @@ impl eframe::App for MyApp {
                             ui.label("seconds");
                         });
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Max Lookahead:");
                             ui.add(egui::DragValue::new(&mut config.max_lookahead_distance)
                                 .speed(0.1)
@@ -8487,7 +8421,7 @@ impl eframe::App for MyApp {
                             ui.label("mm");
                         });
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if ui.button("💾 Apply Settings").clicked() {
                                 self.pressure_advance.get_active_controller().update_config(config.clone());
                                 println!("Updated pressure advance: PA={:.4}", config.pressure_advance);
@@ -8504,33 +8438,33 @@ impl eframe::App for MyApp {
                         let stats = self.pressure_advance.get_active_controller().get_statistics();
                         ui.label("📊 Statistics");
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Segments Processed:");
                             ui.label(format!("{}", stats.segments_processed));
                         });
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Total Advance Applied:");
                             ui.label(format!("{:.3} mm", stats.total_advance_applied));
                         });
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Max Advance Applied:");
                             ui.label(format!("{:.3} mm", stats.max_advance_applied));
                         });
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Avg Pressure Change:");
                             ui.label(format!("{:.3} mm", stats.avg_pressure_change));
                         });
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Pressure Reversals:");
                             ui.label(format!("{}", stats.pressure_reversals));
                         });
                         
-                        ui.horizontal(|ui| {
-                            if ui.button("🗑️ Reset Statistics").clicked() {
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("🗑 Reset Statistics").clicked() {
                                 self.pressure_advance.get_active_controller().reset_statistics();
                             }
                         });
@@ -8541,7 +8475,7 @@ impl eframe::App for MyApp {
                         ui.label("🔬 Auto-Calibration");
                         ui.label("Automatically tune pressure advance for optimal print quality");
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if ui.button("🚀 Run Calibration Test").clicked() {
                                 // TODO: Implement calibration test pattern
                                 println!("Starting pressure advance calibration...");
@@ -8556,7 +8490,7 @@ impl eframe::App for MyApp {
                         
                         // Quick presets for common materials
                         ui.label("🎨 Material Presets");
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if ui.button("PLA").clicked() {
                                 let pla_config = PressureAdvanceConfig {
                                     pressure_advance: 0.04,
@@ -8597,7 +8531,7 @@ impl eframe::App for MyApp {
                 }
                 
                 Tab::RuntimeConfig => {
-                    ui.heading("⚙️ Runtime Configuration - Klipper-Style Settings");
+                    ui.heading("⚙ Runtime Configuration - Klipper-Style Settings");
                     ui.label("Runtime configuration tab - coming soon!");
                     /*
                     egui::ScrollArea::vertical()
@@ -8609,7 +8543,7 @@ impl eframe::App for MyApp {
                         
                         // Config file management
                         ui.label("📁 Configuration File Management");
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if ui.button("💾 Save Config").clicked() {
                                 match self.config_manager.save_config() {
                                     Ok(()) => println!("✅ Configuration saved successfully"),
@@ -8624,15 +8558,15 @@ impl eframe::App for MyApp {
                             }
                             if ui.button("🔄 Reset to Defaults").clicked() {
                                 self.config_manager.reset_to_defaults();
-                                println!("⚠️ Configuration reset to defaults");
+                                println!("⚠ Configuration reset to defaults");
                             }
                         });
                         
                         ui.separator();
                         
                         // Printer type quick setup
-                        ui.label("🖨️ Quick Setup Templates");
-                        ui.horizontal(|ui| {
+                        ui.label("🖨 Quick Setup Templates");
+                        ui.horizontal_wrapped(|ui| {
                             if ui.button("📐 Cartesian Printer").clicked() {
                                 let cartesian_config = ConfigManager::generate_sample_config(PrinterType::Cartesian);
                                 *self.config_manager.get_config_mut() = cartesian_config;
@@ -8657,17 +8591,17 @@ impl eframe::App for MyApp {
                         let config = self.config_manager.get_config_mut();
                         
                         ui.label("📝 Printer Information");
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Name:");
                             ui.text_edit_singleline(&mut config.printer.name);
                         });
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Description:");
                             ui.text_edit_singleline(&mut config.printer.description);
                         });
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Version:");
                             ui.text_edit_singleline(&mut config.printer.version);
                         });
@@ -8676,7 +8610,7 @@ impl eframe::App for MyApp {
                         
                         // Kinematics settings
                         ui.label("🔧 Kinematics Configuration");
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Type:");
                             egui::ComboBox::from_id_salt("kinematics_type")
                                 .selected_text(&config.kinematics.kinematics_type)
@@ -8687,7 +8621,7 @@ impl eframe::App for MyApp {
                                 });
                         });
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Max Z Velocity:");
                             ui.add(egui::DragValue::new(&mut config.kinematics.max_z_velocity)
                                 .speed(1.0)
@@ -8695,7 +8629,7 @@ impl eframe::App for MyApp {
                             ui.label("mm/s");
                         });
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Max Z Acceleration:");
                             ui.add(egui::DragValue::new(&mut config.kinematics.max_z_accel)
                                 .speed(10.0)
@@ -8707,7 +8641,7 @@ impl eframe::App for MyApp {
                         
                         // Motion settings
                         ui.label("⚡ Motion Configuration");
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Max Velocity:");
                             ui.add(egui::DragValue::new(&mut config.motion.max_velocity)
                                 .speed(10.0)
@@ -8715,7 +8649,7 @@ impl eframe::App for MyApp {
                             ui.label("mm/s");
                         });
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Max Acceleration:");
                             ui.add(egui::DragValue::new(&mut config.motion.max_accel)
                                 .speed(100.0)
@@ -8723,7 +8657,7 @@ impl eframe::App for MyApp {
                             ui.label("mm/s²");
                         });
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Square Corner Velocity:");
                             ui.add(egui::DragValue::new(&mut config.motion.square_corner_velocity)
                                 .speed(0.5)
@@ -8735,7 +8669,7 @@ impl eframe::App for MyApp {
                         
                         // Communication settings
                         ui.label("📡 Communication Settings");
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Baudrate:");
                             egui::ComboBox::from_id_salt("baudrate")
                                 .selected_text(config.communication.baudrate.to_string())
@@ -8746,17 +8680,17 @@ impl eframe::App for MyApp {
                                 });
                         });
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Serial Port:");
                             ui.text_edit_singleline(&mut config.communication.serial_port);
                         });
                         
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.checkbox(&mut config.communication.enable_can, "Enable CAN Bus");
                         });
                         
                         if config.communication.enable_can {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("CAN Bitrate:");
                                 if let Some(ref mut bitrate) = config.communication.can_bitrate {
                                     egui::ComboBox::from_id_salt("can_bitrate")
@@ -8774,7 +8708,7 @@ impl eframe::App for MyApp {
                         
                         // Export/Import configuration  
                         ui.label("🔄 Import/Export Configuration");
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if ui.button("📤 Export TOML").clicked() {
                                 match self.config_manager.export_config(ExportFormat::Toml) {
                                     Ok(config_str) => {
@@ -8805,7 +8739,7 @@ impl eframe::App for MyApp {
                         ui.label(format!("Configured motors: {}", config.motors.len()));
                         
                         for (name, motor) in config.motors.iter().take(3) {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(format!("• {}: {:?}", name, motor.function));
                                 ui.label(format!("({:?})", motor.motor_type));
                             });
@@ -8818,11 +8752,11 @@ impl eframe::App for MyApp {
                         ui.separator();
                         
                         // Current extruders overview  
-                        ui.label("🌡️ Extruders Overview");
+                        ui.label("🌡 Extruders Overview");
                         ui.label(format!("Configured extruders: {}", config.extruders.len()));
                         
                         for (name, extruder) in config.extruders.iter().take(2) {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(format!("• {}: ⌀{:.1}mm", name, extruder.nozzle_diameter));
                                 ui.label(format!("Max: {}°C", extruder.max_temp));
                             });
@@ -8873,7 +8807,7 @@ impl eframe::App for MyApp {
                 }
 
                 Tab::StateSpaceControl => {
-                    ui.heading("⚖️ State Space Control");
+                    ui.heading("⚖ State Space Control");
                     ui.label("Advanced state-space control algorithms and MPC");
 
                     egui::ScrollArea::vertical().id_salt("state_space_scroll").show(ui, |ui| {
@@ -8909,12 +8843,12 @@ impl eframe::App for MyApp {
                 .show(ctx, |ui| {
                     ui.heading("Add New Motor");
                     
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("Motor ID:");
                         ui.text_edit_singleline(&mut self.new_motor_id);
                     });
                     
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("Function:");
                         let selected_function_text = match &self.new_motor_function {
                             motor_assignment::MotorFunction::XAxis(_) => "X Axis",
@@ -8937,7 +8871,7 @@ impl eframe::App for MyApp {
                             });
                     });
                     
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("Motor Type:");
                         let selected_type_text = match &self.new_motor_type {
                             motor_assignment::MotorType::Stepper => "Stepper Motor",
@@ -8957,7 +8891,7 @@ impl eframe::App for MyApp {
                             });
                     });
                     
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         if ui.button("✅ Add Motor").clicked() {
                             let motor_config = motor_assignment::MotorConfiguration {
                                 motor_id: self.new_motor_id.clone(),

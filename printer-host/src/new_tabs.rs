@@ -8,7 +8,7 @@
                     egui::ScrollArea::vertical().id_salt("auto_input_shaper_scroll").show(ui, |ui| {
                         // Global calibration controls
                         ui.group(|ui| {
-                            ui.label("🛠️ Automated Calibration");
+                            ui.label("🛠 Automated Calibration");
 
                             ui.horizontal(|ui| {
                                 if !self.calibration_running {
@@ -109,7 +109,7 @@
                                 ui.label(format!("Probe points: {}", map_info.probe_points));
                                 ui.label(format!("Grid points: {}", map_info.grid_points));
                                 if map_info.has_thermal_compensation {
-                                    ui.colored_label(Color32::BLUE, "🌡️ Thermal compensation enabled");
+                                    ui.colored_label(Color32::BLUE, "🌡 Thermal compensation enabled");
                                 }
                             }
                         });
@@ -150,7 +150,7 @@
 
                         // Configuration settings
                         ui.group(|ui| {
-                            ui.label("⚙️ Configuration");
+                            ui.label("⚙ Configuration");
                             ui.label("Probe resolution: 25mm grid");
                             ui.label("Build volume: 300×300×400mm");
                             ui.label("Max deviation: 2.0mm");
@@ -280,7 +280,7 @@
                     egui::ScrollArea::vertical().id_salt("plugins_scroll").show(ui, |ui| {
                         // Plugin management
                         ui.group(|ui| {
-                            ui.label("🛠️ Plugin Management");
+                            ui.label("🛠 Plugin Management");
 
                             ui.horizontal(|ui| {
                                 if ui.button("🔄 Refresh Plugins").clicked() {
@@ -370,7 +370,7 @@
                                             }
                                         }
 
-                                        if ui.button("🗑️ Unload Plugin").clicked() {
+                                        if ui.button("🗑 Unload Plugin").clicked() {
                                             if let Err(e) = self.plugin_manager.unload_plugin(&plugin_info.manifest.name) {
                                                 println!("Failed to unload plugin: {}", e);
                                             } else {
@@ -392,7 +392,7 @@
                 }
 
                 Tab::StateSpaceControl => {
-                    ui.heading("🎚️ State-Space Control & LQR");
+                    ui.heading("🎚 State-Space Control & LQR");
                     ui.label("Modern control theory for multi-axis coordination and optimal performance");
 
                     egui::ScrollArea::vertical().id_salt("state_space_control_scroll").show(ui, |ui| {
@@ -458,7 +458,7 @@
 
                         // LQR Controller Design
                         ui.group(|ui| {
-                            ui.label("⚙️ LQR Controller Design");
+                            ui.label("⚙ LQR Controller Design");
 
                             ui.horizontal(|ui| {
                                 ui.label("Position weight:");
@@ -536,7 +536,7 @@
 
                         // Observer status
                         ui.group(|ui| {
-                            ui.label("👁️ State Observer (Kalman Filter)");
+                            ui.label("👁 State Observer (Kalman Filter)");
 
                             for axis in ['X', 'Y', 'Z'] {
                                 if let Some(observer_state) = self.state_space_controller.get_observer_state(axis) {
@@ -648,7 +648,7 @@
 
                         // Optimization weights
                         ui.group(|ui| {
-                            ui.label("⚖️ Optimization Weights");
+                            ui.label("⚖ Optimization Weights");
 
                             ui.horizontal(|ui| {
                                 ui.label("Tracking weight:");

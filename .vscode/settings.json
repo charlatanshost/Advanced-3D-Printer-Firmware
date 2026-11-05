@@ -1,0 +1,5 @@
+{
+    "code-runner.executorMap": {
+        "rust": "cd \"$workspaceRoot/printer-host\" && cargo run"
+    }
+}

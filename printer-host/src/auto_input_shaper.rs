@@ -580,7 +580,7 @@ impl CalibrationUI {
             }
 
             // Shaper recommendations
-            ui.heading("🛠️ Recommended Input Shapers");
+            ui.heading("🛠 Recommended Input Shapers");
 
             for (shaper, score) in &results.recommended_shapers {
                 let is_selected = self.selected_shaper.as_ref()
