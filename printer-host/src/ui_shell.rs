@@ -446,6 +446,16 @@ pub fn pill(ui: &mut egui::Ui, text: &str, color: Color32) {
         });
 }
 
+/// A control that can't work yet: greyed out, and it says why when you hover over it.
+pub fn unavailable_button(ui: &mut egui::Ui, label: &str, why: &str) {
+    ui.add_enabled(false, egui::Button::new(label)).on_disabled_hover_text(why);
+}
+
+/// A control that needs a machine to act on.
+pub fn needs_printer_button(ui: &mut egui::Ui, label: &str) {
+    unavailable_button(ui, label, "Needs a connected printer. Connecting to one isn't supported yet.");
+}
+
 /// A bordered section of a page.
 pub fn card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let p = palette();
@@ -538,6 +548,60 @@ mod tests {
         assert!(tab_from_name("Bed-Mesh") == Some(Tab::BedMesh));
         assert!(tab_from_name("g-code") == Some(Tab::Gcode));
         assert!(tab_from_name("nonsense").is_none());
+    }
+
+    /// A button whose handler is empty, a comment or only a print looks like it works and doesn't.
+    /// If it can't work yet, use unavailable_button or needs_printer_button, which say so.
+    fn dead_buttons(source: &str) -> Vec<String> {
+        // Code inside /* */ isn't live
+        let mut in_comment = false;
+        let lines: Vec<&str> = source
+            .lines()
+            .map(|line| {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("/*") {
+                    in_comment = true;
+                }
+                let kept = if in_comment { "" } else { line };
+                if line.contains("*/") {
+                    in_comment = false;
+                }
+                kept
+            })
+            .collect();
+        let indent = |line: &str| line.len() - line.trim_start().len();
+        let mut dead = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.trim_start().starts_with("if ") || !line.trim_end().ends_with(".clicked() {") {
+                continue;
+            }
+            let does_something = lines[i + 1..]
+                .iter()
+                .take_while(|next| next.trim().is_empty() || indent(next) > indent(line))
+                .map(|next| next.trim())
+                .any(|next| !next.is_empty() && next != "}" && !next.starts_with("//") && !next.starts_with("println!") && !next.starts_with("eprintln!"));
+            if !does_something {
+                dead.push(format!("line {}: {}", i + 1, line.trim()));
+            }
+        }
+        dead
+    }
+
+    #[test]
+    fn every_button_does_something_or_says_why_it_cannot() {
+        for source in [include_str!("main.rs"), include_str!("ui_motors.rs")] {
+            let dead = dead_buttons(source);
+            assert!(dead.is_empty(), "buttons that do nothing:\n{}", dead.join("\n"));
+        }
+    }
+
+    #[test]
+    fn the_dead_button_check_can_tell_the_difference() {
+        let dead = "        if ui.button(\"A\").clicked() {\n            // later\n        }\n\
+                    if ui.button(\"B\").clicked() {\n            println!(\"b\");\n        }\n";
+        assert_eq!(dead_buttons(dead).len(), 2);
+        let live = "        if ui.button(\"C\").clicked() {\n            self.x = 1;\n        }\n";
+        assert!(dead_buttons(live).is_empty());
     }
 
     /// A symbol missing from the fonts shows up as an empty box.

@@ -1,3 +1,4 @@
+mod ui_motors;
 mod ui_shell;
 
 use eframe::egui::{self, Color32};
@@ -673,6 +674,18 @@ impl Default for MockMPCStatus {
     }
 }
 
+/// The app as it is before any saved files are read, for tests that drive its pages.
+#[cfg(all(test, not(target_os = "linux"), not(all(windows, feature = "windows-ethercat"))))]
+fn test_app() -> MyApp {
+    let config: Config = toml::from_str(include_str!("../printer.toml")).expect("printer.toml should parse");
+    let (tx, _rx) = tokio::sync::mpsc::channel::<[f32; 5]>(64);
+    MyApp::new(create_kinematics(&config), Arc::new(DummySlaveGroup), tx, String::new(), vec![])
+}
+
+fn macro_in_filter(category: &str, filter: Option<&str>) -> bool {
+    filter.map_or(true, |wanted| category == wanted)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Tab {
     Overview,
@@ -1220,6 +1233,16 @@ struct MyApp {
     last_step_time: Instant, // Debounce step operations
     show_status_panel: bool,
     show_add_motor_dialog: bool,
+    new_motor_step_pin: String,
+    new_motor_dir_pin: String,
+    new_motor_enable_pin: String,
+    add_motor_error: Option<String>,
+    /// The last result on the Motors page, and whether it went well.
+    motor_message: Option<(String, bool)>,
+    pending_motor_change: Option<ui_motors::PendingMotorChange>,
+    motors_unsaved: bool,
+    /// motors.json exists but can't be read: don't overwrite what might be recoverable.
+    motors_save_blocked: bool,
     new_motor_id: String,
     new_motor_function: motor_assignment::MotorFunction,
     new_motor_type: motor_assignment::MotorType,
@@ -1430,6 +1453,8 @@ struct MyApp {
     // Macro system
     macros: Vec<MacroDefinition>,
     selected_macro: String,
+    /// The macro category to list. None shows them all.
+    macro_filter: Option<String>,
     // 5-Axis kinematics system
     five_axis_kinematics: Option<PracticalKinematics>,
     selected_machine_type: PracticalMachineType,
@@ -1484,6 +1509,14 @@ impl MyApp {
             status_panel_open: true,
             show_status_panel: true,
             show_add_motor_dialog: false,
+            new_motor_step_pin: String::new(),
+            new_motor_dir_pin: String::new(),
+            new_motor_enable_pin: String::new(),
+            add_motor_error: None,
+            motor_message: None,
+            pending_motor_change: None,
+            motors_unsaved: false,
+            motors_save_blocked: false,
             new_motor_id: "motor_1".to_string(),
             new_motor_function: motor_assignment::MotorFunction::XAxis(0),
             new_motor_type: motor_assignment::MotorType::Stepper,
@@ -1938,6 +1971,7 @@ impl MyApp {
                 },
             ],
             selected_macro: "Home All Axes".to_string(),
+            macro_filter: None,
             // Initialize 5-axis kinematics system - will be set after config_manager is created
             five_axis_kinematics: None,
             selected_machine_type: PracticalMachineType::penta_axis_style(),
@@ -1970,6 +2004,7 @@ impl MyApp {
 
     /// Initialize machine configuration from saved config
     fn initialize_machine_config(&mut self) {
+        self.load_saved_motors();
         // Read the saved file. If it can't be used, keep the defaults and say so: the file is
         // left alone unless the user saves something.
         if let Err(e) = self.config_manager.load_config() {
@@ -3047,21 +3082,16 @@ impl eframe::App for MyApp {
             // Quick controls
             ui_shell::section_title(ui, "QUICK CONTROLS");
             ui.horizontal_wrapped(|ui| {
-                if ui.button("🏠 Home All").clicked() && !self.emergency_stop_triggered {
-                    self.printer_state = PrinterState::Homing;
-                    println!("Homing all axes...");
-                }
-                if ui.button("🔌 Disable Motors").clicked() && !self.emergency_stop_triggered {
-                    println!("Motors disabled");
-                }
-            });
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("🔍 Probe Z").clicked() && !self.emergency_stop_triggered {
-                    self.start_probe_sequence();
-                }
-                if ui.button("⚙ Auto Level").clicked() && !self.emergency_stop_triggered {
-                    println!("Starting auto bed leveling...");
-                    self.printer_state = PrinterState::Homing;
+                ui_shell::needs_printer_button(ui, "🏠 Home All");
+                ui_shell::needs_printer_button(ui, "🔍 Probe Z");
+                ui_shell::needs_printer_button(ui, "⚙ Auto Level");
+                if ui.button("🔌 Disable Motors")
+                    .on_hover_text("Marks every motor on the Motors page as disabled. No driver is told: no printer is connected.")
+                    .clicked()
+                {
+                    let count = self.motor_manager.set_all_motors_enabled(false);
+                    self.motors_unsaved = true;
+                    self.motor_message = Some((format!("{} motors marked disabled. No driver was told: no printer is connected.", count), true));
                 }
             });
         });
@@ -4205,6 +4235,7 @@ impl eframe::App for MyApp {
                 }
                 Tab::PrinterConfig => {
                     ui.heading("Printer Configuration");
+                    ui.colored_label(ui_shell::warning(), "These settings aren't saved or used yet: changing them has no effect on the machine or the simulator.");
                     ui.label("Configure printer settings similar to Klipper's printer.cfg");
                     
                     egui::ScrollArea::vertical().id_salt("printer_config_scroll").show(ui, |ui| {
@@ -4383,10 +4414,7 @@ impl eframe::App for MyApp {
                         ui.separator();
                         
                         ui.horizontal_wrapped(|ui| {
-                            if ui.button("💾 Save Configuration").clicked() {
-                                println!("Configuration saved to memory");
-                                // Here you would typically save to printer.toml or similar
-                            }
+                            ui_shell::unavailable_button(ui, "💾 Save Configuration", "Not built yet: the settings on this page aren't saved or used.");
                             if ui.button("🔄 Reset to Defaults").clicked() {
                                 // Reset to default values
                                 self.printer_settings = PrinterSettings {
@@ -5043,11 +5071,11 @@ impl eframe::App for MyApp {
                             // Category filter buttons
                             ui.horizontal_wrapped(|ui| {
                                 ui.label("Filter:");
-                                if ui.small_button("All").clicked() { /* Filter logic here */ }
-                                if ui.small_button("Homing").clicked() { /* Filter logic here */ }
-                                if ui.small_button("Calibration").clicked() { /* Filter logic here */ }
-                                if ui.small_button("Heating").clicked() { /* Filter logic here */ }
-                                if ui.small_button("Maintenance").clicked() { /* Filter logic here */ }
+                                for (label, filter) in [("All", None), ("Homing", Some("Homing")), ("Calibration", Some("Calibration")), ("Heating", Some("Heating")), ("Maintenance", Some("Maintenance"))] {
+                                    if ui.selectable_label(self.macro_filter.as_deref() == filter, label).clicked() {
+                                        self.macro_filter = filter.map(str::to_string);
+                                    }
+                                }
                             });
                             
                             ui.separator();
@@ -5057,10 +5085,10 @@ impl eframe::App for MyApp {
                                 .max_height(300.0)
                                 .show(ui, |ui| {
                                     for (i, macro_def) in self.macros.iter().enumerate() {
-                                        if !macro_def.enabled {
+                                        if !macro_def.enabled || !macro_in_filter(&macro_def.category, self.macro_filter.as_deref()) {
                                             continue;
                                         }
-                                        
+
                                         let is_selected = self.selected_macro == macro_def.name;
                                         
                                         ui.group(|ui| {
@@ -5510,9 +5538,7 @@ impl eframe::App for MyApp {
 
                                     ui.horizontal_wrapped(|ui| {
                                         ui.label("Configured Modules:");
-                                        if ui.button("➕ Add Beckhoff Module").clicked() {
-                                            // Add dropdown for module selection
-                                        }
+                                        ui_shell::unavailable_button(ui, "➕ Add Beckhoff Module", "Use the module buttons below.");
                                         if ui.button("🔧 Add Custom Module").clicked() {
                                             self.ethercat_modules.push(EtherCATModule::new_beckhoff(EtherCATModuleType::Custom,
                                                 self.ethercat_modules.len() as u16 + 1));
@@ -6125,15 +6151,9 @@ impl eframe::App for MyApp {
                             });
                             
                             ui.horizontal_wrapped(|ui| {
-                                if ui.button("🔄 Test Connection").clicked() {
-                                    // Test connection based on current protocol
-                                }
-                                if ui.button("📊 Diagnostics").clicked() {
-                                    // Show protocol diagnostics
-                                }
-                                if ui.button("💾 Save Configuration").clicked() {
-                                    // Save fieldbus configuration to file
-                                }
+                                ui_shell::needs_printer_button(ui, "🔄 Test Connection");
+                                ui_shell::needs_printer_button(ui, "📊 Diagnostics");
+                                ui_shell::unavailable_button(ui, "💾 Save Configuration", "Not built yet: fieldbus settings aren't saved.");
                             });
                         });
                         
@@ -6158,13 +6178,8 @@ impl eframe::App for MyApp {
                             });
                             
                             ui.horizontal_wrapped(|ui| {
-                                if ui.button("🔍 Start Discovery Scan").clicked() {
-                                    // Trigger manual discovery scan
-                                    println!("Starting protocol discovery scan on {}", self.protocol_discovery.scan_range);
-                                }
-                                if ui.button("📋 Export Results").clicked() {
-                                    // Export discovered devices to file
-                                }
+                                ui_shell::needs_printer_button(ui, "🔍 Start Discovery Scan");
+                                ui_shell::unavailable_button(ui, "📋 Export Results", "Nothing to export: a scan needs a connected network.");
                             });
                             
                             ui.separator();
@@ -6228,17 +6243,13 @@ impl eframe::App for MyApp {
                             ui.group(|ui| {
                                 ui.label("🗝 Certificate Management");
                                 ui.horizontal_wrapped(|ui| {
-                                    if ui.button("📥 Load Certificate").clicked() {
-                                        // Load certificate file
-                                    }
+                                    ui_shell::unavailable_button(ui, "📥 Load Certificate", "Not built yet.");
                                     if ui.button("🔑 Generate Key Pair").clicked() {
                                         // Generate new key pair
                                         let challenge = security::generate_challenge();
                                         println!("Generated challenge: {}", challenge);
                                     }
-                                    if ui.button("💾 Export Config").clicked() {
-                                        // Export security configuration
-                                    }
+                                    ui_shell::unavailable_button(ui, "💾 Export Config", "Not built yet.");
                                 });
                                 
                                 ui.label("📊 Security Statistics:");
@@ -6314,10 +6325,7 @@ impl eframe::App for MyApp {
                             });
                             
                             ui.horizontal_wrapped(|ui| {
-                                if ui.button("🔌 Connect CAN Bus").clicked() {
-                                    // Initialize CAN connection
-                                    println!("Connecting to CAN interface: {}", self.can_interface_name);
-                                }
+                                ui_shell::needs_printer_button(ui, "🔌 Connect CAN Bus");
                                 if ui.button("🔍 Discover Toolheads").clicked() {
                                     // Trigger toolhead discovery
                                     self.discover_can_toolheads();
@@ -6359,12 +6367,8 @@ impl eframe::App for MyApp {
                                                     if ui.small_button("⚙ Config").clicked() {
                                                         self.selected_toolhead_uuid = Some(*uuid);
                                                     }
-                                                    if ui.small_button("🌡 Status").clicked() {
-                                                        // Get toolhead status
-                                                    }
-                                                    if ui.small_button("⛔ Stop").clicked() {
-                                                        // Emergency stop this toolhead
-                                                    }
+                                                    ui_shell::needs_printer_button(ui, "🌡 Status");
+                                                    ui_shell::unavailable_button(ui, "⛔ Stop", "Use Emergency Stop in the top bar.");
                                                 });
                                             });
                                             
@@ -6496,15 +6500,9 @@ impl eframe::App for MyApp {
                             }
                             
                             ui.horizontal_wrapped(|ui| {
-                                if ui.button("📊 Export Diagnostics").clicked() {
-                                    // Export CAN diagnostics
-                                }
-                                if ui.button("🔄 Reset Counters").clicked() {
-                                    // Reset diagnostic counters
-                                }
-                                if ui.button("📋 View Logs").clicked() {
-                                    // View CAN communication logs
-                                }
+                                ui_shell::unavailable_button(ui, "📊 Export Diagnostics", "Not built yet.");
+                                ui_shell::unavailable_button(ui, "🔄 Reset Counters", "Not built yet.");
+                                ui_shell::unavailable_button(ui, "📋 View Logs", "Not built yet.");
                             });
                         });
                     });
@@ -6707,15 +6705,9 @@ impl eframe::App for MyApp {
                             ui.separator();
                             
                             ui.horizontal_wrapped(|ui| {
-                                if ui.button("📈 View Response Graph").clicked() {
-                                    // Show frequency response graph
-                                }
-                                if ui.button("📋 Export Results").clicked() {
-                                    // Export resonance test results
-                                }
-                                if ui.button("🔧 Advanced Settings").clicked() {
-                                    // Show advanced resonance testing options
-                                }
+                                ui_shell::unavailable_button(ui, "📈 View Response Graph", "Needs a resonance test, which needs a connected printer.");
+                                ui_shell::unavailable_button(ui, "📋 Export Results", "Needs a resonance test, which needs a connected printer.");
+                                ui_shell::unavailable_button(ui, "🔧 Advanced Settings", "Not built yet.");
                             });
                         });
                         
@@ -6757,301 +6749,7 @@ impl eframe::App for MyApp {
                         });
                     });
                 }
-                Tab::MotorAssignment => {
-                    ui.heading("🔧 Motor Assignment & Configuration");
-                    ui.label("Configure and assign motors to printer axes, extruders, and other functions");
-                    
-                    egui::ScrollArea::vertical().id_salt("motor_assignment_main_scroll").show(ui, |ui| {
-                        ui.columns(2, |columns| {
-                            // Left column - Motor list and configuration
-                            columns[0].group(|ui| {
-                                ui.label("🎯 Motor Configuration");
-                                
-                                // Quick setup buttons
-                                ui.horizontal_wrapped(|ui| {
-                                    if ui.button("📐 Cartesian Setup").clicked() {
-                                        if let Err(e) = self.motor_manager.create_standard_cartesian_setup() {
-                                            // Show error - could implement error display
-                                        }
-                                    }
-                                    if ui.button("🔄 CoreXY Setup").clicked() {
-                                        if let Err(e) = self.motor_manager.create_corexy_setup() {
-                                            // Show error  
-                                        }
-                                    }
-                                    if ui.button("➕ Add Motor").clicked() {
-                                        self.show_add_motor_dialog = true;
-                                    }
-                                    
-                                    ui.end_row();
-                                    ui.horizontal_wrapped(|ui| {
-                                        if ui.button("🗑 Remove Selected").clicked() {
-                                            if let Some(selected_id) = &self.selected_motor_id {
-                                                match self.motor_manager.remove_motor(selected_id) {
-                                                    Ok(removed_config) => {
-                                                        println!("Removed motor: {} (was {:?})", 
-                                                            removed_config.motor_id, removed_config.function);
-                                                        self.selected_motor_id = None;
-                                                    },
-                                                    Err(e) => {
-                                                        println!("Error removing motor: {}", e);
-                                                    }
-                                                }
-                                            } else {
-                                                println!("No motor selected for removal");
-                                            }
-                                        }
-                                        
-                                        if ui.button("🧹 Clear All Motors").clicked() {
-                                            let motor_ids: Vec<String> = self.motor_manager.get_all_motors().keys().cloned().collect();
-                                            let count = motor_ids.len();
-                                            for id in motor_ids {
-                                                let _ = self.motor_manager.remove_motor(&id);
-                                            }
-                                            self.selected_motor_id = None;
-                                            println!("Removed all {} motors", count);
-                                        }
-                                    });
-                                });
-                                
-                                ui.separator();
-                                
-                                // Motor list with assignment status
-                                ui.label("🔩 Registered Motors");
-                                egui::ScrollArea::vertical()
-                                    .id_salt("motor_list_scroll")
-                                    .max_height(300.0)
-                                    .auto_shrink([false, true])
-                                    .show(ui, |ui| {
-                                    for (motor_id, config) in self.motor_manager.get_all_motors() {
-                                        let is_selected = self.selected_motor_id.as_ref() == Some(motor_id);
-                                        
-                                        ui.horizontal_wrapped(|ui| {
-                                            if ui.selectable_label(is_selected, motor_id).clicked() {
-                                                self.selected_motor_id = Some(motor_id.clone());
-                                            }
-                                            
-                                            // Show motor type and function
-                                            ui.label(format!("{:?}", config.motor_type));
-                                            
-                                            // Function assignment indicator
-                                            let function_text = match &config.function {
-                                                MotorFunction::Unassigned => "⚠ Unassigned".to_string(),
-                                                f => format!("{:?}", f),
-                                            };
-                                            
-                                            let color = if config.function == MotorFunction::Unassigned {
-                                                ui_shell::warning()
-                                            } else if config.enabled {
-                                                ui_shell::good()
-                                            } else {
-                                                ui_shell::muted()
-                                            };
-                                            
-                                            ui.colored_label(color, function_text);
-                                            
-                                            if config.enabled {
-                                                ui.label("✓");
-                                            } else {
-                                                ui.label("❌");
-                                            }
-                                        });
-                                    }
-                                });
-                                
-                                // Motor details for selected motor
-                                if let Some(selected_id) = &self.selected_motor_id {
-                                    if let Some(config) = self.motor_manager.get_motor_config(selected_id) {
-                                        ui.separator();
-                                        ui.label("🔧 Motor Details");
-                                        
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.label("ID:");
-                                            ui.label(&config.motor_id);
-                                        });
-                                        
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.label("Type:");
-                                            ui.label(format!("{:?}", config.motor_type));
-                                        });
-                                        
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.label("Function:");
-                                            ui.label(format!("{:?}", config.function));
-                                        });
-                                        
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.label("Max Speed:");
-                                            ui.label(format!("{:.1}", config.capabilities.max_speed));
-                                        });
-                                        
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.label("Steps/mm:");
-                                            ui.label(format!("{:.1}", config.capabilities.steps_per_unit));
-                                        });
-                                        
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.label("Current:");
-                                            ui.label(format!("{:.2}A", config.current_setting));
-                                        });
-                                        
-                                        if config.capabilities.has_encoder {
-                                            ui.colored_label(ui_shell::good(), "🔄 Encoder Available");
-                                        }
-                                        
-                                        if config.capabilities.stall_detection {
-                                            ui.colored_label(ui_shell::info(), "⚠ Stall Detection");
-                                        }
-                                    }
-                                }
-                            });
-                            
-                            // Right column - Function assignments and motor states
-                            columns[1].group(|ui| {
-                                ui.label("🎯 Function Assignments");
-                                
-                                // Function assignment matrix
-                                egui::Grid::new("function_grid").show(ui, |ui| {
-                                    ui.label("Function");
-                                    ui.label("Assigned Motor");
-                                    ui.label("Status");
-                                    ui.end_row();
-                                    
-                                    let functions = [
-                                        ("X Axis", MotorFunction::XAxis(0)),
-                                        ("Y Axis", MotorFunction::YAxis(0)),
-                                        ("Z Axis", MotorFunction::ZAxis(0)),
-                                        ("A Axis", MotorFunction::AAxis(0)),
-                                        ("B Axis", MotorFunction::BAxis(0)),
-                                        ("Extruder 0", MotorFunction::Extruder(0)),
-                                        ("Tool Changer", MotorFunction::ToolChanger),
-                                        ("Bed Leveling", MotorFunction::BedLeveling(0)),
-                                    ];
-                                    
-                                    for (name, function) in functions.iter() {
-                                        ui.label(*name);
-                                        
-                                        if let Some(motor_ids) = self.motor_manager.get_motors_for_function(function) {
-                                            if let Some(motor_id) = motor_ids.first() {
-                                            ui.label(motor_id);
-                                            
-                                            if let Some(state) = self.motor_manager.get_motor_state(motor_id) {
-                                                let status = if state.enabled {
-                                                    if state.homed { "✓ Ready" } else { "⚠ Not Homed" }
-                                                } else {
-                                                    "❌ Disabled"
-                                                };
-                                                
-                                                let color = if state.enabled && state.homed {
-                                                    ui_shell::good()
-                                                } else if state.enabled {
-                                                    ui_shell::warning()
-                                                } else {
-                                                    ui_shell::danger()
-                                                };
-                                                
-                                                ui.colored_label(color, status);
-                                            } else {
-                                                ui.colored_label(ui_shell::muted(), "No State");
-                                            }
-                                            }
-                                        } else {
-                                            ui.colored_label(ui_shell::danger(), "Unassigned");
-                                            ui.colored_label(ui_shell::danger(), "❌");
-                                        }
-                                        
-                                        ui.end_row();
-                                    }
-                                });
-                                
-                                ui.separator();
-                                
-                                // Assignment history
-                                ui.label("📜 Assignment History (Last 10)");
-                                egui::ScrollArea::vertical()
-                                    .id_salt("motor_assignment_history_scroll")
-                                    .max_height(200.0)
-                                    .auto_shrink([false, true])
-                                    .show(ui, |ui| {
-                                    for event in self.motor_manager.get_assignment_history().iter().rev().take(10) {
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.label(format!("{}", event.motor_id));
-                                            ui.label("→");
-                                            ui.colored_label(ui_shell::good(), format!("{:?}", event.new_function));
-                                            ui.label(format!("({})", event.reason));
-                                        });
-                                    }
-                                });
-                                
-                                ui.separator();
-                                
-                                // Quick actions for selected motor
-                                if let Some(selected_id) = self.selected_motor_id.clone() {
-                                    ui.label("🔧 Quick Actions");
-                                    ui.horizontal_wrapped(|ui| {
-                                        if ui.button("🏠 Home").clicked() {
-                                            // Home motor - could implement actual homing
-                                        }
-                                        if ui.button("▶ Enable").clicked() {
-                                            // Enable motor - could implement actual enable
-                                        }
-                                        if ui.button("⏸ Disable").clicked() {
-                                            // Disable motor - could implement actual disable
-                                        }
-                                        if ui.button("❌ Remove Motor").clicked() {
-                                            // Add confirmation for motor removal
-                                            match self.motor_manager.remove_motor(&selected_id) {
-                                                Ok(removed_config) => {
-                                                    println!("Successfully removed motor: {} (was {:?})", 
-                                                        removed_config.motor_id, removed_config.function);
-                                                    self.selected_motor_id = None;
-                                                },
-                                                Err(e) => {
-                                                    println!("Error removing motor: {}", e);
-                                                }
-                                            }
-                                        }
-                                        if ui.button("➕ Clone Motor").clicked() {
-                                            // Clone the current motor configuration with a new ID
-                                            if let Some(config) = self.motor_manager.get_motor_config(&selected_id) {
-                                                let mut new_config = config.clone();
-                                                new_config.motor_id = format!("{}_clone", config.motor_id);
-                                                new_config.function = MotorFunction::Unassigned;
-                                                if let Ok(new_id) = self.motor_manager.register_motor(new_config) {
-                                                    println!("Cloned motor as: {}", new_id);
-                                                }
-                                            }
-                                        }
-                                    });
-                                    
-                                    // Function reassignment
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label("Assign to:");
-                                        egui::ComboBox::from_label("")
-                                            .selected_text("Select Function")
-                                            .show_ui(ui, |ui| {
-                                                if ui.button("X Axis").clicked() {
-                                                    let _ = self.motor_manager.assign_function(&selected_id, MotorFunction::XAxis(0), "Manual assignment");
-                                                }
-                                                if ui.button("Y Axis").clicked() {
-                                                    let _ = self.motor_manager.assign_function(&selected_id, MotorFunction::YAxis(0), "Manual assignment");
-                                                }
-                                                if ui.button("Z Axis").clicked() {
-                                                    let _ = self.motor_manager.assign_function(&selected_id, MotorFunction::ZAxis(0), "Manual assignment");
-                                                }
-                                                if ui.button("Extruder 0").clicked() {
-                                                    let _ = self.motor_manager.assign_function(&selected_id, MotorFunction::Extruder(0), "Manual assignment");
-                                                }
-                                                if ui.button("Unassigned").clicked() {
-                                                    let _ = self.motor_manager.assign_function(&selected_id, MotorFunction::Unassigned, "Manual unassignment");
-                                                }
-                                            });
-                                    });
-                                }
-                            });
-                        });
-                    });
-                }
+                Tab::MotorAssignment => self.show_motors_page(ui),
                 Tab::ClosedLoop => {
                     ui.heading("🔄 Closed-Loop Encoder Control");
                     ui.label("Configure and monitor closed-loop feedback systems for precise position control");
@@ -7091,9 +6789,7 @@ impl eframe::App for MyApp {
                                             // Could implement error display
                                         }
                                     }
-                                    if ui.button("➕ Add Encoder Axis").clicked() {
-                                        // Could implement add encoder dialog
-                                    }
+                                    ui_shell::unavailable_button(ui, "➕ Add Encoder Axis", "Use the Add Axis Encoder buttons under Quick Setup.");
                                     
                                     ui.end_row();
                                     ui.horizontal_wrapped(|ui| {
@@ -7240,12 +6936,8 @@ impl eframe::App for MyApp {
                                         // PID tuning controls
                                         ui.label("🎛 PID Tuning");
                                         ui.horizontal_wrapped(|ui| {
-                                            if ui.button("Auto Tune").clicked() {
-                                                // Could implement PID auto-tuning
-                                            }
-                                            if ui.button("Reset PID").clicked() {
-                                                // Reset PID controller
-                                            }
+                                            ui_shell::needs_printer_button(ui, "Auto Tune");
+                                            ui_shell::unavailable_button(ui, "Reset PID", "Not built yet.");
                                         });
                                         
                                         // Manual PID adjustment (simplified UI)
@@ -7940,9 +7632,7 @@ impl eframe::App for MyApp {
                                             }
                                             
                                             if stats.safety_shutdown {
-                                                if ui.button("🔓 Clear Safety").clicked() {
-                                                    // Would need to add method to clear individual zone safety
-                                                }
+                                                ui_shell::unavailable_button(ui, "🔓 Clear Safety", "Not built yet. A safety shutdown stays latched until you restart the app.");
                                             }
                                         });
                                         
@@ -7951,9 +7641,7 @@ impl eframe::App for MyApp {
                                         // PID Tuning
                                         ui.label("🎛 PID Configuration");
                                         ui.horizontal_wrapped(|ui| {
-                                            if ui.button("Auto Tune PID").clicked() {
-                                                // Could implement PID auto-tuning
-                                            }
+                                            ui_shell::needs_printer_button(ui, "Auto Tune PID");
                                             if ui.button("Reset PID").clicked() {
                                                 let default_pid = TempPIDConfig::default();
                                                 let _ = self.temperature_manager.configure_pid(selected_zone, default_pid);
@@ -8325,21 +8013,13 @@ impl eframe::App for MyApp {
                                     ui.label("⚙ System Configuration");
                                     
                                     ui.horizontal_wrapped(|ui| {
-                                        if ui.button("🔧 Configure Detection").clicked() {
-                                            // Could open configuration dialog
-                                        }
-                                        if ui.button("📁 Set Recovery Path").clicked() {
-                                            // Could open file dialog
-                                        }
+                                        ui_shell::unavailable_button(ui, "🔧 Configure Detection", "Not built yet.");
+                                        ui_shell::unavailable_button(ui, "📁 Set Recovery Path", "Not built yet.");
                                     });
                                     
                                     ui.horizontal_wrapped(|ui| {
-                                        if ui.button("🧹 Clear Statistics").clicked() {
-                                            // Could clear statistics with confirmation
-                                        }
-                                        if ui.button("🔄 Reset Configuration").clicked() {
-                                            // Could reset to defaults with confirmation
-                                        }
+                                        ui_shell::unavailable_button(ui, "🧹 Clear Statistics", "Not built yet.");
+                                        ui_shell::unavailable_button(ui, "🔄 Reset Configuration", "Not built yet.");
                                     });
                                     
                                     ui.separator();
@@ -8356,12 +8036,8 @@ impl eframe::App for MyApp {
                                     // Manual recovery file management
                                     ui.label("📂 Recovery File Management");
                                     ui.horizontal_wrapped(|ui| {
-                                        if ui.button("📄 View Recovery Files").clicked() {
-                                            // Could show file browser
-                                        }
-                                        if ui.button("🗑 Clean Old Files").clicked() {
-                                            // Could clean up old recovery files
-                                        }
+                                        ui_shell::unavailable_button(ui, "📄 View Recovery Files", "Not built yet.");
+                                        ui_shell::unavailable_button(ui, "🗑 Clean Old Files", "Not built yet.");
                                     });
                                 }
                             });
@@ -8383,9 +8059,7 @@ impl eframe::App for MyApp {
                         ui.horizontal_wrapped(|ui| {
                             ui.label("🎯 Active Extruder:");
                             let current_extruder = 0; // TODO: Get from actual state
-                            if ui.button(&format!("Extruder {}", current_extruder)).clicked() {
-                                // TODO: Show extruder selection dialog
-                            }
+                            ui_shell::unavailable_button(ui, &&format!("Extruder {}", current_extruder), "Only one extruder is supported here so far.");
                         });
                         
                         ui.separator();
@@ -8476,14 +8150,8 @@ impl eframe::App for MyApp {
                         ui.label("Automatically tune pressure advance for optimal print quality");
                         
                         ui.horizontal_wrapped(|ui| {
-                            if ui.button("🚀 Run Calibration Test").clicked() {
-                                // TODO: Implement calibration test pattern
-                                println!("Starting pressure advance calibration...");
-                            }
-                            if ui.button("📋 Generate Test Pattern").clicked() {
-                                // TODO: Generate G-code test pattern for manual calibration
-                                println!("Generating pressure advance test pattern...");
-                            }
+                            ui_shell::needs_printer_button(ui, "🚀 Run Calibration Test");
+                            ui_shell::unavailable_button(ui, "📋 Generate Test Pattern", "Not built yet.");
                         });
                         
                         ui.separator();
@@ -8835,114 +8503,8 @@ impl eframe::App for MyApp {
             }
         });
 
-        // Add Motor Dialog
-        if self.show_add_motor_dialog {
-            egui::Window::new("Add Motor")
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.heading("Add New Motor");
-                    
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("Motor ID:");
-                        ui.text_edit_singleline(&mut self.new_motor_id);
-                    });
-                    
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("Function:");
-                        let selected_function_text = match &self.new_motor_function {
-                            motor_assignment::MotorFunction::XAxis(_) => "X Axis",
-                            motor_assignment::MotorFunction::YAxis(_) => "Y Axis",
-                            motor_assignment::MotorFunction::ZAxis(_) => "Z Axis",
-                            motor_assignment::MotorFunction::Extruder(_) => "Extruder",
-                            motor_assignment::MotorFunction::CoreXY_A(_) => "CoreXY A",
-                            motor_assignment::MotorFunction::CoreXY_B(_) => "CoreXY B",
-                            _ => "Other",
-                        };
-                        egui::ComboBox::from_label("")
-                            .selected_text(selected_function_text)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.new_motor_function, motor_assignment::MotorFunction::XAxis(0), "X Axis");
-                                ui.selectable_value(&mut self.new_motor_function, motor_assignment::MotorFunction::YAxis(0), "Y Axis");
-                                ui.selectable_value(&mut self.new_motor_function, motor_assignment::MotorFunction::ZAxis(0), "Z Axis");
-                                ui.selectable_value(&mut self.new_motor_function, motor_assignment::MotorFunction::Extruder(0), "Extruder");
-                                ui.selectable_value(&mut self.new_motor_function, motor_assignment::MotorFunction::CoreXY_A(0), "CoreXY A");
-                                ui.selectable_value(&mut self.new_motor_function, motor_assignment::MotorFunction::CoreXY_B(0), "CoreXY B");
-                            });
-                    });
-                    
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("Motor Type:");
-                        let selected_type_text = match &self.new_motor_type {
-                            motor_assignment::MotorType::Stepper => "Stepper Motor",
-                            motor_assignment::MotorType::Servo => "Servo Motor",
-                            motor_assignment::MotorType::BrushlessDC => "Brushless DC Motor",
-                            motor_assignment::MotorType::BrushedDC => "Brushed DC Motor",
-                            motor_assignment::MotorType::LinearActuator => "Linear Actuator",
-                        };
-                        egui::ComboBox::from_label("")
-                            .selected_text(selected_type_text)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.new_motor_type, motor_assignment::MotorType::Stepper, "Stepper Motor");
-                                ui.selectable_value(&mut self.new_motor_type, motor_assignment::MotorType::Servo, "Servo Motor");
-                                ui.selectable_value(&mut self.new_motor_type, motor_assignment::MotorType::BrushlessDC, "Brushless DC Motor");
-                                ui.selectable_value(&mut self.new_motor_type, motor_assignment::MotorType::BrushedDC, "Brushed DC Motor");
-                                ui.selectable_value(&mut self.new_motor_type, motor_assignment::MotorType::LinearActuator, "Linear Actuator");
-                            });
-                    });
-                    
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("✅ Add Motor").clicked() {
-                            let motor_config = motor_assignment::MotorConfiguration {
-                                motor_id: self.new_motor_id.clone(),
-                                function: self.new_motor_function.clone(),
-                                motor_type: self.new_motor_type.clone(),
-                                physical_connection: motor_assignment::MotorConnection::StepDir {
-                                    step_pin: "PA2".to_string(),
-                                    dir_pin: "PA3".to_string(),
-                                    enable_pin: Some("PA1".to_string()),
-                                },
-                                capabilities: motor_assignment::MotorCapabilities {
-                                    max_speed: 1000.0,
-                                    max_acceleration: 3000.0,
-                                    steps_per_unit: 80.0,
-                                    max_current: 1.2,
-                                    min_current: 0.1,
-                                    has_encoder: false,
-                                    encoder_resolution: None,
-                                    has_endstops: true,
-                                    can_reverse: true,
-                                    thermal_protection: true,
-                                    stall_detection: false,
-                                },
-                                enabled: true,
-                                inverted: false,
-                                microstepping: Some(16),
-                                current_setting: 0.8,
-                                hold_current: 0.5,
-                                interpolation: true,
-                                created_at: std::time::Instant::now(),
-                                last_modified: std::time::Instant::now(),
-                            };
-                            
-                            if let Err(e) = self.motor_manager.register_motor(motor_config) {
-                                println!("Failed to add motor: {}", e);
-                            } else {
-                                println!("Added motor: {}", self.new_motor_id);
-                                // Reset form
-                                self.new_motor_id = "motor_".to_string() + &(self.motor_manager.get_all_motors().len() + 1).to_string();
-                                self.new_motor_function = motor_assignment::MotorFunction::XAxis(0);
-                                self.new_motor_type = motor_assignment::MotorType::Stepper;
-                                self.show_add_motor_dialog = false;
-                            }
-                        }
-                        
-                        if ui.button("❌ Cancel").clicked() {
-                            self.show_add_motor_dialog = false;
-                        }
-                    });
-                });
-        }
+        self.show_add_motor_window(ctx);
+        self.save_motors_if_changed(ctx);
     }
 }
 

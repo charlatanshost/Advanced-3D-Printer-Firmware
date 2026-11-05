@@ -11,3 +11,5 @@ Desktop.ini
 
 # Local network capture (contains MAC address and hostname)
 ethercat packet.pcapng
+printer-host/motors.json
+printer-host/motors.json.tmp

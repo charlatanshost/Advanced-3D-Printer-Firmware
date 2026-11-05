@@ -122,3 +122,8 @@ volumetric-compensation = ["input-shaping"]
 auto-calibration = ["input-shaping", "rustfft", "accelerometers"]
 windows-ethercat = ["pcap", "winapi"]
 full-protocols = ["industrial-protocols", "protocol-discovery", "security", "klipper-can", "advanced-motion", "plugins", "sensor-fusion", "volumetric-compensation", "auto-calibration"]
+
+[dev-dependencies]
+egui_kittest = "0.32"
+# Tests find controls through the accessibility tree
+eframe = { version = "0.32.2", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }

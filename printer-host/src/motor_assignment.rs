@@ -169,6 +169,7 @@ pub struct MotorState {
     pub load: Option<f32>,        // Load percentage (0-100%)
 }
 
+#[derive(Clone)]
 pub struct MotorAssignmentManager {
     motors: HashMap<String, MotorConfiguration>,
     motor_states: HashMap<String, MotorState>,
@@ -266,9 +267,14 @@ impl MotorAssignmentManager {
         
         // This section is now handled above
         
+        let function = config.function.clone();
         self.motors.insert(motor_id.clone(), config);
         self.motor_states.insert(motor_id.clone(), state);
-        
+
+        if function != MotorFunction::Unassigned {
+            self.record_assignment_event(&motor_id, MotorFunction::Unassigned, function, "Motor added");
+        }
+
         Ok(motor_id)
     }
     
@@ -398,6 +404,8 @@ impl MotorAssignmentManager {
                 group.master_motor = group.motor_ids.first().cloned();
             }
         }
+        // A group with no motors left has nothing to coordinate
+        self.axis_groups.retain(|_, group| !group.motor_ids.is_empty());
         
         self.record_assignment_event(motor_id, config.function.clone(), MotorFunction::Unassigned, "Motor removed");
         
@@ -536,6 +544,26 @@ impl MotorAssignmentManager {
     
     // Bulk operations for machine configuration
     pub fn create_standard_cartesian_setup(&mut self) -> Result<(), String> {
+        self.all_or_nothing(Self::build_cartesian_setup)
+    }
+
+    pub fn create_corexy_setup(&mut self) -> Result<(), String> {
+        self.all_or_nothing(Self::build_corexy_setup)
+    }
+
+    pub fn create_multi_servo_cartesian_setup(&mut self) -> Result<(), String> {
+        self.all_or_nothing(Self::build_multi_servo_setup)
+    }
+
+    /// Apply a change only if all of it succeeds, so a failure can't leave half a machine behind.
+    fn all_or_nothing(&mut self, build: fn(&mut Self) -> Result<(), String>) -> Result<(), String> {
+        let mut trial = self.clone();
+        build(&mut trial)?;
+        *self = trial;
+        Ok(())
+    }
+
+    fn build_cartesian_setup(&mut self) -> Result<(), String> {
         // Standard Cartesian printer setup with multi-motor support
         let configs = vec![
             self.create_stepper_config("x_motor", MotorFunction::XAxis(0), "X1", "X2", Some("X_EN")),
@@ -559,7 +587,7 @@ impl MotorAssignmentManager {
         Ok(())
     }
     
-    pub fn create_corexy_setup(&mut self) -> Result<(), String> {
+    fn build_corexy_setup(&mut self) -> Result<(), String> {
         // CoreXY printer setup
         let configs = vec![
             self.create_stepper_config("a_motor", MotorFunction::CoreXY_A(0), "X1", "X2", Some("X_EN")), // A motor (X+Y)
@@ -591,7 +619,7 @@ impl MotorAssignmentManager {
     }
     
     // High-performance servo setup with multiple motors per axis
-    pub fn create_multi_servo_cartesian_setup(&mut self) -> Result<(), String> {
+    fn build_multi_servo_setup(&mut self) -> Result<(), String> {
         let configs = vec![
             self.create_servo_config("x_servo_1", MotorFunction::XAxis(0), 1000.0),
             self.create_servo_config("x_servo_2", MotorFunction::XAxis(1), 1000.0),
@@ -636,6 +664,185 @@ impl MotorAssignmentManager {
         Ok(())
     }
     
+    /// Remove every motor and axis group. The history is kept.
+    pub fn clear_all_motors(&mut self) -> usize {
+        let ids: Vec<String> = self.motors.keys().cloned().collect();
+        let count = ids.len();
+        for id in ids {
+            let _ = self.remove_motor(&id);
+        }
+        count
+    }
+
+    /// Replace everything with a standard setup. If it fails, the current motors stay.
+    pub fn replace_with_setup(&mut self, build: fn(&mut Self) -> Result<(), String>) -> Result<(), String> {
+        let mut trial = self.clone();
+        trial.clear_all_motors();
+        build(&mut trial)?;
+        *self = trial;
+        Ok(())
+    }
+
+    /// Record whether a motor should be enabled. This changes the machine's configuration: no
+    /// driver is told, since nothing connects this manager to hardware yet.
+    pub fn set_motor_enabled(&mut self, motor_id: &str, enabled: bool) -> Result<(), String> {
+        let config = self.motors.get_mut(motor_id).ok_or_else(|| format!("Motor {} not found", motor_id))?;
+        config.enabled = enabled;
+        config.last_modified = Instant::now();
+        if let Some(state) = self.motor_states.get_mut(motor_id) {
+            state.enabled = enabled;
+            state.last_update = Instant::now();
+        }
+        Ok(())
+    }
+
+    pub fn set_all_motors_enabled(&mut self, enabled: bool) -> usize {
+        let ids: Vec<String> = self.motors.keys().cloned().collect();
+        for id in &ids {
+            let _ = self.set_motor_enabled(id, enabled);
+        }
+        ids.len()
+    }
+
+    /// Save edited settings for a motor. Its ID and function change through their own methods,
+    /// which keep the assignment tables in step.
+    pub fn update_motor_settings(&mut self, edited: MotorConfiguration) -> Result<(), String> {
+        if !(edited.capabilities.steps_per_unit > 0.0) {
+            return Err("Steps per unit must be above zero".to_string());
+        }
+        if !(edited.current_setting > 0.0) || edited.current_setting > edited.capabilities.max_current {
+            return Err(format!("Current must be above 0 and no more than {:.2} A", edited.capabilities.max_current));
+        }
+        if !(0.0..=1.0).contains(&edited.hold_current) {
+            return Err("Hold current must be between 0% and 100%".to_string());
+        }
+        let config = self.motors.get_mut(&edited.motor_id).ok_or_else(|| format!("Motor {} not found", edited.motor_id))?;
+        let function = config.function.clone();
+        let enabled = config.enabled;
+        let created_at = config.created_at;
+        *config = edited;
+        config.function = function;
+        config.enabled = enabled;
+        config.created_at = created_at;
+        config.last_modified = Instant::now();
+        Ok(())
+    }
+
+    /// Motor IDs in a fixed order, so lists on screen don't change order between launches.
+    pub fn sorted_motor_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.motors.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// Motors doing this kind of job, whichever number they have: ZAxis(0) and ZAxis(1) are both Z.
+    pub fn motors_in_family(&self, template: &MotorFunction) -> Vec<&MotorConfiguration> {
+        let mut found: Vec<&MotorConfiguration> = self.motors.values()
+            .filter(|m| std::mem::discriminant(&m.function) == std::mem::discriminant(template))
+            .collect();
+        found.sort_by_key(|m| (m.function.index(), m.motor_id.clone()));
+        found
+    }
+
+    /// The first free slot of this kind: the second motor given to Z becomes ZAxis(1).
+    pub fn next_free_function(&self, template: &MotorFunction) -> MotorFunction {
+        let used: Vec<Option<u8>> = self.motors_in_family(template).iter().map(|m| m.function.index()).collect();
+        (0..=u8::MAX)
+            .find_map(|i| {
+                let candidate = template.with_index(i)?;
+                (!used.contains(&candidate.index())).then_some(candidate)
+            })
+            .unwrap_or_else(|| template.clone())
+    }
+
+    /// Give a motor a kind of job, using the next free slot. Does nothing if it already has that job.
+    pub fn assign_to_family(&mut self, motor_id: &str, template: &MotorFunction, reason: &str) -> Result<(), String> {
+        let current = &self.motors.get(motor_id).ok_or_else(|| format!("Motor {} not found", motor_id))?.function;
+        if std::mem::discriminant(current) == std::mem::discriminant(template) {
+            return Ok(());
+        }
+        let function = self.next_free_function(template);
+        self.assign_function(motor_id, function, reason)
+    }
+
+    /// A copy of a motor under a new name, with no job and its own pins left blank to fill in.
+    pub fn clone_motor(&mut self, motor_id: &str) -> Result<String, String> {
+        let mut copy = self.motors.get(motor_id).ok_or_else(|| format!("Motor {} not found", motor_id))?.clone();
+        let base = format!("{}_clone", motor_id);
+        let mut new_id = base.clone();
+        let mut n = 2;
+        while self.motors.contains_key(&new_id) {
+            new_id = format!("{}{}", base, n);
+            n += 1;
+        }
+        copy.motor_id = new_id;
+        copy.function = MotorFunction::Unassigned;
+        self.register_motor(copy)
+    }
+
+    /// Which motor already uses this pin, if any.
+    pub fn pin_owner(&self, pin: &str) -> Option<&str> {
+        let mut ids: Vec<&String> = self.motors.keys().collect();
+        ids.sort();
+        ids.into_iter()
+            .find(|id| match &self.motors[*id].physical_connection {
+                MotorConnection::StepDir { step_pin, dir_pin, enable_pin } => {
+                    step_pin == pin || dir_pin == pin || enable_pin.as_deref() == Some(pin)
+                }
+                MotorConnection::PwmOutput { pwm_pin, dir_pin } => pwm_pin == pin || dir_pin.as_deref() == Some(pin),
+                MotorConnection::SpiDriver { cs_pin, .. } => cs_pin == pin,
+                _ => false,
+            })
+            .map(|id| id.as_str())
+    }
+
+    /// A motor ID that isn't taken yet.
+    pub fn suggest_motor_id(&self) -> String {
+        (1..).map(|n| format!("motor_{}", n)).find(|id| !self.motors.contains_key(id)).unwrap()
+    }
+
+    pub fn to_json(&self) -> Result<String, String> {
+        let mut motors: Vec<MotorConfiguration> = self.motors.values().cloned().collect();
+        motors.sort_by(|a, b| a.motor_id.cmp(&b.motor_id));
+        let mut axis_groups: Vec<AxisGroup> = self.axis_groups.values().cloned().collect();
+        axis_groups.sort_by(|a, b| a.axis_name.cmp(&b.axis_name));
+        serde_json::to_string_pretty(&SavedMotors { motors, axis_groups }).map_err(|e| e.to_string())
+    }
+
+    pub fn from_json(json: &str) -> Result<Self, String> {
+        let saved: SavedMotors = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        let mut manager = Self::new();
+        for motor in saved.motors {
+            manager.register_motor(motor)?;
+        }
+        for mut group in saved.axis_groups {
+            group.motor_ids.retain(|id| manager.motors.contains_key(id));
+            if !group.motor_ids.is_empty() {
+                manager.axis_groups.insert(group.axis_name.clone(), group);
+            }
+        }
+        // Reading the file isn't a change anyone made
+        manager.assignment_history.clear();
+        Ok(manager)
+    }
+
+    /// Write the file in one step, so a crash part way can't leave it damaged.
+    pub fn save_to_file(&self, path: &std::path::Path) -> Result<(), String> {
+        let json = self.to_json()?;
+        let temp = path.with_extension("json.tmp");
+        std::fs::write(&temp, json).map_err(|e| e.to_string())?;
+        std::fs::rename(&temp, path).map_err(|e| e.to_string())
+    }
+
+    /// The saved motors. None if nothing has been saved yet.
+    pub fn load_from_file(path: &std::path::Path) -> Result<Option<Self>, String> {
+        match std::fs::read_to_string(path) {
+            Ok(json) => Self::from_json(&json).map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     fn create_stepper_config(&self, id: &str, function: MotorFunction, step_pin: &str, dir_pin: &str, enable_pin: Option<&str>) -> MotorConfiguration {
         // Typical values: belts for X/Y, a leadscrew for Z (5x as many steps per mm), and a
         // geared extruder. One number for all of them would move Z and E the wrong distance.
@@ -725,6 +932,97 @@ impl MotorAssignmentManager {
         // Keep history size reasonable
         if self.assignment_history.len() > 1000 {
             self.assignment_history.remove(0);
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedMotors {
+    motors: Vec<MotorConfiguration>,
+    axis_groups: Vec<AxisGroup>,
+}
+
+impl MotorFunction {
+    /// Which of several motors on the same job this is. None for jobs with no number.
+    pub fn index(&self) -> Option<u8> {
+        use MotorFunction::*;
+        match self {
+            XAxis(i) | YAxis(i) | ZAxis(i) | AAxis(i) | BAxis(i) | CAxis(i) | UAxis(i) | VAxis(i) | WAxis(i)
+            | CoreXY_A(i) | CoreXY_B(i) | CoreXZ_A(i) | CoreXZ_B(i) | DeltaA(i) | DeltaB(i) | DeltaC(i)
+            | Extruder(i) | ToolLock(i) | BedLeveling(i) | FilamentFeeder(i) | PartFan(i) | HotendFan(i) => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// This job with another number. For jobs with no number, the job itself once.
+    fn with_index(&self, n: u8) -> Option<MotorFunction> {
+        use MotorFunction::*;
+        Some(match self {
+            XAxis(_) => XAxis(n),
+            YAxis(_) => YAxis(n),
+            ZAxis(_) => ZAxis(n),
+            AAxis(_) => AAxis(n),
+            BAxis(_) => BAxis(n),
+            CAxis(_) => CAxis(n),
+            UAxis(_) => UAxis(n),
+            VAxis(_) => VAxis(n),
+            WAxis(_) => WAxis(n),
+            CoreXY_A(_) => CoreXY_A(n),
+            CoreXY_B(_) => CoreXY_B(n),
+            CoreXZ_A(_) => CoreXZ_A(n),
+            CoreXZ_B(_) => CoreXZ_B(n),
+            DeltaA(_) => DeltaA(n),
+            DeltaB(_) => DeltaB(n),
+            DeltaC(_) => DeltaC(n),
+            Extruder(_) => Extruder(n),
+            ToolLock(_) => ToolLock(n),
+            BedLeveling(_) => BedLeveling(n),
+            FilamentFeeder(_) => FilamentFeeder(n),
+            PartFan(_) => PartFan(n),
+            HotendFan(_) => HotendFan(n),
+            other => {
+                if n > 0 {
+                    return None;
+                }
+                other.clone()
+            }
+        })
+    }
+
+    /// The jobs offered in menus, with their names.
+    pub fn assignable() -> Vec<(&'static str, MotorFunction)> {
+        use MotorFunction::*;
+        vec![
+            ("X Axis", XAxis(0)),
+            ("Y Axis", YAxis(0)),
+            ("Z Axis", ZAxis(0)),
+            ("A Axis", AAxis(0)),
+            ("B Axis", BAxis(0)),
+            ("C Axis", CAxis(0)),
+            ("CoreXY A", CoreXY_A(0)),
+            ("CoreXY B", CoreXY_B(0)),
+            ("Delta A", DeltaA(0)),
+            ("Delta B", DeltaB(0)),
+            ("Delta C", DeltaC(0)),
+            ("Extruder", Extruder(0)),
+            ("Tool Changer", ToolChanger),
+            ("Bed Leveling", BedLeveling(0)),
+        ]
+    }
+
+    /// A readable name: the second Z motor is "Z Axis 2".
+    pub fn display_name(&self) -> String {
+        if *self == MotorFunction::Unassigned {
+            return "Unassigned".to_string();
+        }
+        let name = Self::assignable()
+            .into_iter()
+            .find(|(_, f)| std::mem::discriminant(f) == std::mem::discriminant(self))
+            .map(|(name, _)| name.to_string())
+            .unwrap_or_else(|| format!("{:?}", self));
+        match self.index() {
+            Some(i) if i > 0 => format!("{} {}", name, i + 1),
+            _ => name,
         }
     }
 }

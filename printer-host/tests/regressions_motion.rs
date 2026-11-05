@@ -152,6 +152,171 @@ fn tool_change_stays_above_a_tall_print() {
 
 // ---------- Motor assignment ----------
 
+#[test]
+fn a_motor_setup_can_be_swapped_for_another_without_leftovers() {
+    let mut motors = MotorAssignmentManager::new();
+    motors.create_standard_cartesian_setup().unwrap();
+    motors.replace_with_setup(MotorAssignmentManager::create_corexy_setup).unwrap();
+
+    assert_eq!(motors.get_all_motors().len(), 5);
+    assert!(motors.get_motor_config("x_motor").is_none(), "Cartesian motors must be gone");
+    assert!(motors.get_motor_config("a_motor").is_some());
+    assert!(motors.get_axis_group("CoreXY").is_some());
+    assert!(motors.motors_in_family(&MotorFunction::XAxis(0)).is_empty());
+
+    // And back again, which used to fail on the Z motors that were already there
+    motors.replace_with_setup(MotorAssignmentManager::create_standard_cartesian_setup).unwrap();
+    assert!(motors.get_motor_config("x_motor").is_some());
+    assert!(motors.get_axis_group("CoreXY").is_none(), "the CoreXY group must not outlive its motors");
+}
+
+#[test]
+fn a_setup_that_cannot_finish_changes_nothing() {
+    let mut motors = MotorAssignmentManager::new();
+    motors.create_standard_cartesian_setup().unwrap();
+
+    // The Z motors clash, after the two CoreXY motors would have been added
+    assert!(motors.create_corexy_setup().is_err());
+
+    assert_eq!(motors.get_all_motors().len(), 5);
+    assert!(motors.get_motor_config("a_motor").is_none(), "a failed setup must not leave half its motors");
+}
+
+#[test]
+fn clearing_motors_leaves_nothing_to_block_the_next_setup() {
+    let mut motors = MotorAssignmentManager::new();
+    motors.create_standard_cartesian_setup().unwrap();
+
+    assert_eq!(motors.clear_all_motors(), 5);
+
+    assert!(motors.get_all_motors().is_empty());
+    assert!(motors.get_all_axis_groups().is_empty());
+    assert!(motors.get_motors_for_function(&MotorFunction::ZAxis(0)).is_none());
+    motors.create_corexy_setup().unwrap();
+}
+
+#[test]
+fn enabling_a_motor_updates_both_places_the_page_reads() {
+    let mut motors = MotorAssignmentManager::new();
+    motors.create_standard_cartesian_setup().unwrap();
+
+    motors.set_motor_enabled("x_motor", false).unwrap();
+    assert!(!motors.get_motor_config("x_motor").unwrap().enabled);
+    assert!(!motors.get_motor_state("x_motor").unwrap().enabled);
+    assert!(motors.get_motor_state("y_motor").unwrap().enabled);
+
+    motors.set_motor_enabled("x_motor", true).unwrap();
+    assert!(motors.get_motor_config("x_motor").unwrap().enabled);
+    assert!(motors.get_motor_state("x_motor").unwrap().enabled);
+
+    assert_eq!(motors.set_all_motors_enabled(false), 5);
+    assert!(motors.get_all_motors().values().all(|m| !m.enabled));
+    assert!(motors.set_motor_enabled("nope", true).is_err());
+}
+
+#[test]
+fn a_second_motor_on_an_axis_gets_the_next_number() {
+    let mut motors = MotorAssignmentManager::new();
+    motors.create_standard_cartesian_setup().unwrap();
+    let clone = motors.clone_motor("x_motor").unwrap();
+
+    // Asked for the X job: X 0 is taken, so this is X 1
+    motors.assign_to_family(&clone, &MotorFunction::XAxis(0), "test").unwrap();
+    assert_eq!(motors.get_motor_config(&clone).unwrap().function, MotorFunction::XAxis(1));
+    assert_eq!(motors.motors_in_family(&MotorFunction::XAxis(0)).len(), 2);
+    assert_eq!(MotorFunction::XAxis(1).display_name(), "X Axis 2");
+
+    // Choosing the job it already has must not renumber it
+    motors.assign_to_family(&clone, &MotorFunction::XAxis(0), "test").unwrap();
+    assert_eq!(motors.get_motor_config(&clone).unwrap().function, MotorFunction::XAxis(1));
+
+    // A freed slot is used again, and unassigning takes it out of every table
+    motors.assign_to_family(&clone, &MotorFunction::Unassigned, "test").unwrap();
+    assert_eq!(motors.next_free_function(&MotorFunction::XAxis(0)), MotorFunction::XAxis(1));
+    assert_eq!(motors.motors_in_family(&MotorFunction::XAxis(0)).len(), 1);
+    assert_eq!(motors.next_free_function(&MotorFunction::ToolChanger), MotorFunction::ToolChanger);
+}
+
+#[test]
+fn cloning_twice_gives_two_motors_with_no_job() {
+    let mut motors = MotorAssignmentManager::new();
+    motors.create_standard_cartesian_setup().unwrap();
+    let first = motors.clone_motor("x_motor").unwrap();
+    let second = motors.clone_motor("x_motor").unwrap();
+    assert_ne!(first, second);
+    assert_eq!(motors.get_motor_config(&second).unwrap().function, MotorFunction::Unassigned);
+    assert_eq!(motors.get_all_motors().len(), 7);
+}
+
+#[test]
+fn setups_appear_in_the_assignment_history() {
+    let mut motors = MotorAssignmentManager::new();
+    motors.create_standard_cartesian_setup().unwrap();
+    assert_eq!(motors.get_assignment_history().len(), 5);
+}
+
+#[test]
+fn bad_motor_settings_are_refused() {
+    let mut motors = MotorAssignmentManager::new();
+    motors.create_standard_cartesian_setup().unwrap();
+    let good = motors.get_motor_config("x_motor").unwrap().clone();
+
+    let mut edited = good.clone();
+    edited.capabilities.steps_per_unit = 160.0;
+    edited.function = MotorFunction::Unassigned;
+    motors.update_motor_settings(edited).unwrap();
+    let saved = motors.get_motor_config("x_motor").unwrap();
+    assert_eq!(saved.capabilities.steps_per_unit, 160.0);
+    assert_eq!(saved.function, MotorFunction::XAxis(0), "settings must not change the motor's job");
+
+    let mut edited = good.clone();
+    edited.capabilities.steps_per_unit = 0.0;
+    assert!(motors.update_motor_settings(edited).is_err());
+    let mut edited = good.clone();
+    edited.current_setting = 99.0;
+    assert!(motors.update_motor_settings(edited).is_err(), "more current than the motor is rated for");
+    let mut edited = good;
+    edited.hold_current = f32::NAN;
+    assert!(motors.update_motor_settings(edited).is_err());
+}
+
+#[test]
+fn pins_already_in_use_are_found() {
+    let mut motors = MotorAssignmentManager::new();
+    motors.create_standard_cartesian_setup().unwrap();
+    assert_eq!(motors.pin_owner("X1"), Some("x_motor"));
+    assert_eq!(motors.pin_owner("Z_EN_R"), Some("z_motor_right"));
+    assert_eq!(motors.pin_owner("PB9"), None);
+}
+
+#[test]
+fn saved_motors_come_back_the_same() {
+    let dir = std::env::temp_dir().join(format!("motors_test_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("motors.json");
+
+    assert!(MotorAssignmentManager::load_from_file(&path).unwrap().is_none(), "no file yet is not an error");
+
+    let mut motors = MotorAssignmentManager::new();
+    motors.create_corexy_setup().unwrap();
+    motors.set_motor_enabled("b_motor", false).unwrap();
+    motors.save_to_file(&path).unwrap();
+
+    let loaded = MotorAssignmentManager::load_from_file(&path).unwrap().unwrap();
+    assert_eq!(loaded.sorted_motor_ids(), motors.sorted_motor_ids());
+    assert_eq!(loaded.get_motor_config("a_motor").unwrap().function, MotorFunction::CoreXY_A(0));
+    assert!(!loaded.get_motor_state("b_motor").unwrap().enabled);
+    assert_eq!(loaded.get_axis_group("Z").unwrap().motor_ids.len(), 2);
+    assert_eq!(loaded.motors_in_family(&MotorFunction::ZAxis(0)).len(), 2);
+    assert!(loaded.get_assignment_history().is_empty());
+    assert!(!loaded.get_motor_state("a_motor").unwrap().homed, "a restart must never count as homed");
+
+    // A damaged file is reported, not treated as an empty machine
+    std::fs::write(&path, "{ not json").unwrap();
+    assert!(MotorAssignmentManager::load_from_file(&path).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn dual_z() -> MotorAssignmentManager {
     let mut manager = MotorAssignmentManager::new();
     manager.create_standard_cartesian_setup().unwrap();
