@@ -13,14 +13,13 @@ serde_json = "1.0"
 serde_yaml = "0.9"
 chrono = { version = "0.4", features = ["serde"] }
 nalgebra = "0.34"
-libloading = { version = "0.8", optional = true }
+libloading = "0.8"
 tokio = { version = "1.0", features = ["full"] }
 clap = { version = "4.5", features = ["derive"] }
 bytemuck = "1.16"
 winit = "0.30"
 futures = "0.3"
 serialport = "4.4"
-ethercrab = { version = "0.6.0", features = ["std"] }
 pnet = "0.35.0"
 gcode-parser = { path = "../printer-host/gcode-parser", optional = true }
 rfd = "0.15.0"
@@ -105,7 +104,7 @@ glob = "0.3"
 
 [features]
 default = ["gcode-parser", "input-shaping", "security"]
-dynamic = ["printer-kinematics/dynamic", "libloading"]
+dynamic = ["printer-kinematics/dynamic"]
 fieldbus = ["modbus", "socketcan", "tokio-modbus"]
 industrial-protocols = ["fieldbus"]
 protocol-discovery = ["pnet_datalink", "ping"]
@@ -116,7 +115,7 @@ klipper-can = ["can-toolheads"]
 input-shaping = ["libm", "fixed", "rustfft"]
 accelerometers = ["adxl345", "mpu9250", "lsm6ds33"]
 advanced-motion = ["input-shaping", "accelerometers"]
-plugins = ["mlua", "wasmtime", "libloading"]
+plugins = ["mlua", "wasmtime"]
 sensor-fusion = ["input-shaping", "accelerometers"]
 volumetric-compensation = ["input-shaping"]
 auto-calibration = ["input-shaping", "rustfft", "accelerometers"]
@@ -127,3 +126,12 @@ full-protocols = ["industrial-protocols", "protocol-discovery", "security", "kli
 egui_kittest = "0.32"
 # Tests find controls through the accessibility tree
 eframe = { version = "0.32.2", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }
+
+# ethercrab on Windows: without "std" so nothing needs the Npcap SDK to build. Frames go through
+# ethercat_probe.rs, which loads Npcap when run. See build.rs for the rest of this.
+[target.'cfg(windows)'.dependencies]
+ethercrab = { version = "0.6.0", default-features = false }
+embassy-time = { version = "0.4", features = ["std", "generic-queue-64"] }
+
+[target.'cfg(not(windows))'.dependencies]
+ethercrab = { version = "0.6.0", features = ["std"] }

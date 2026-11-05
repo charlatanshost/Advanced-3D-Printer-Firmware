@@ -232,6 +232,9 @@ async fn main() -> eframe::Result<()> {
     if args.len() > 1 && args[1] == "--simulate" {
         std::process::exit(printer_host::simulator::run_cli(&args[2..]));
     }
+    if args.len() > 1 && args[1] == "--ethercat" {
+        std::process::exit(printer_host::ethercat_probe::run_cli(&args[2..]).await);
+    }
     if args.len() > 1 && args[1] == "--test" {
         test_runner::run_integration_test();
         return Ok(());
@@ -349,7 +352,6 @@ async fn main() -> eframe::Result<()> {
         native_options,
         Box::new(move |cc| {
             ui_shell::install(&cc.egui_ctx);
-            cc.egui_ctx.set_debug_on_hover(false); // Disable debug rendering
             println!("UI initialized with wgpu renderer");
             let mut app = MyApp::new(kinematics, group, tx, gcode, vec![]); // Empty plot_points for now
             app.initialize_machine_config(); // Load machine config from saved settings

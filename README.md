@@ -1361,3 +1361,20 @@ Faults take effect at a time in seconds (`NAME@600`) or a line of the file (`NAM
 It reports what happened, including collisions with the printed part and cold extrusion, and exits with 0 only if the print ran clean. The tests in `printer-host/tests/simulator.rs` run these scenarios automatically.
 
 It checks the control logic only. The heater values are typical figures rather than measurements, and plastic, belts and vibration are not modelled, so passing does not show a real machine will behave the same way.
+## Checking EtherCAT hardware
+
+A read-only check of real EtherCAT hardware, from the `printer-host` folder. On Windows it needs
+[Npcap](https://npcap.com) installed. The Npcap SDK isn't needed to build.
+
+```
+cargo run -- --ethercat list                  # show network adapters
+cargo run -- --ethercat scan 3                # find devices on adapter 3 from the list
+cargo run -- --ethercat watch 3 30            # show inputs as they change, for 30 seconds
+```
+
+You choose the adapter, because these frames don't belong on an ordinary network. It never writes
+outputs, and `watch` stops before going operational if any device has outputs.
+
+Printer settings from the app are kept in `printer_settings.toml` and motors in `motors.json`, in
+the folder the app runs from. `--simulate` uses the limits from `printer_settings.toml`.
+

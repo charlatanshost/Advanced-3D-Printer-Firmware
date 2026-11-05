@@ -6,6 +6,20 @@ fn main() {
     let _out_dir = env::var("OUT_DIR").unwrap();
     let _manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
 
+    // ethercrab pulls in the pcap crate on Windows, which asks the linker for wpcap.lib from the
+    // Npcap SDK even though nothing here calls it: ethercat_probe.rs loads Npcap itself when run.
+    // An empty library satisfies the linker, so the app builds without the SDK.
+    #[cfg(all(windows, not(feature = "windows-ethercat")))]
+    {
+        let dir = PathBuf::from(&_out_dir).join("empty-libs");
+        std::fs::create_dir_all(&dir).expect("create folder for empty libraries");
+        for name in ["wpcap.lib", "Packet.lib"] {
+            std::fs::write(dir.join(name), b"!<arch>
+").expect("write empty library");
+        }
+        println!("cargo:rustc-link-search=native={}", dir.display());
+    }
+
     // Windows EtherCAT (Npcap) library configuration
     #[cfg(all(windows, feature = "windows-ethercat"))]
     {
