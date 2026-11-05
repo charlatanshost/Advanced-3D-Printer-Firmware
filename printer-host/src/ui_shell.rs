@@ -456,6 +456,27 @@ pub fn needs_printer_button(ui: &mut egui::Ui, label: &str) {
     unavailable_button(ui, label, "Needs a connected printer. Connecting to one isn't supported yet.");
 }
 
+/// A box for typing an address. It can hold half an address while typing, and marks the text if
+/// it isn't valid. The address only changes once what's typed is valid.
+pub fn address_box<T: std::fmt::Display + std::str::FromStr>(ui: &mut egui::Ui, text: &mut Option<String>, address: &mut T) {
+    let mut shown = text.clone().unwrap_or_else(|| address.to_string());
+    let valid = shown.parse::<T>().is_ok();
+    let mut edit = egui::TextEdit::singleline(&mut shown);
+    if !valid {
+        edit = edit.text_color(danger());
+    }
+    let response = ui.add(edit);
+    if response.changed() {
+        if let Ok(parsed) = shown.parse::<T>() {
+            *address = parsed;
+        }
+        *text = Some(shown);
+    } else if response.lost_focus() {
+        // Back to the address in use, in its normal form
+        *text = None;
+    }
+}
+
 /// A bordered section of a page.
 pub fn card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let p = palette();
@@ -589,10 +610,42 @@ mod tests {
 
     #[test]
     fn every_button_does_something_or_says_why_it_cannot() {
-        for source in [include_str!("main.rs"), include_str!("ui_motors.rs")] {
+        for source in [include_str!("main.rs"), include_str!("ui_motors.rs"), include_str!("ui_printer.rs")] {
             let dead = dead_buttons(source);
             assert!(dead.is_empty(), "buttons that do nothing:\n{}", dead.join("\n"));
         }
+    }
+
+    /// A slider on a variable given a fixed value just above it goes back there every frame.
+    fn sliders_that_reset(source: &str) -> Vec<String> {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut found = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("let mut ") else { continue };
+            let Some((name, value)) = rest.split_once(" = ") else { continue };
+            if !value.starts_with(|c: char| c.is_ascii_digit()) {
+                continue;
+            }
+            let bound = format!("&mut {},", name.trim());
+            let bound_end = format!("&mut {})", name.trim());
+            if let Some(next) = lines.get(i + 1) {
+                if (next.contains("Slider::new") || next.contains("DragValue::new")) && (next.contains(&bound) || next.contains(&bound_end)) {
+                    found.push(format!("line {}: {}", i + 1, trimmed));
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn no_slider_resets_itself_every_frame() {
+        for source in [include_str!("main.rs"), include_str!("ui_motors.rs"), include_str!("ui_printer.rs")] {
+            let found = sliders_that_reset(source);
+            assert!(found.is_empty(), "these can never move:\n{}", found.join("\n"));
+        }
+        let bad = "let mut speed = 128u8;\nui.add(egui::Slider::new(&mut speed, 0..=255));\n";
+        assert_eq!(sliders_that_reset(bad).len(), 1);
     }
 
     #[test]

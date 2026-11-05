@@ -1,7 +1,9 @@
 mod ui_motors;
+mod ui_printer;
 mod ui_shell;
 
 use eframe::egui::{self, Color32};
+use printer_host::printer_settings::{MotorType, PrinterSettings};
 use std::sync::Arc;
 // use egui_plot::{Line, Plot, PlotPoints, Points}; // Commented out for now
 
@@ -679,11 +681,24 @@ impl Default for MockMPCStatus {
 fn test_app() -> MyApp {
     let config: Config = toml::from_str(include_str!("../printer.toml")).expect("printer.toml should parse");
     let (tx, _rx) = tokio::sync::mpsc::channel::<[f32; 5]>(64);
-    MyApp::new(create_kinematics(&config), Arc::new(DummySlaveGroup), tx, String::new(), vec![])
+    let mut app = MyApp::new(create_kinematics(&config), Arc::new(DummySlaveGroup), tx, String::new(), vec![]);
+    // Tests must never write over someone's real settings
+    app.settings_path = std::env::temp_dir().join(format!("printer_settings_unused_{}.toml", std::process::id()));
+    app
 }
 
 fn macro_in_filter(category: &str, filter: Option<&str>) -> bool {
     filter.map_or(true, |wanted| category == wanted)
+}
+
+/// The hottest a heater zone may be set to.
+fn zone_temperature_limit(settings: &PrinterSettings, zone: &TemperatureZone) -> f64 {
+    match zone {
+        TemperatureZone::Hotend(_) => settings.extruder_max_temp as f64,
+        TemperatureZone::Bed => settings.bed_max_temp as f64,
+        TemperatureZone::Chamber => 80.0,
+        _ => 50.0,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -730,12 +745,6 @@ enum Tab {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum MotorType {
-    Stepper,
-    Servo,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 enum PrinterState {
     Idle,
     Printing,
@@ -743,67 +752,6 @@ enum PrinterState {
     Homing,
     Emergency,
     Error(String),
-}
-
-#[derive(Debug, Clone)]
-struct PrinterSettings {
-    // Temperature settings
-    extruder_max_temp: f32,
-    bed_max_temp: f32,
-    extruder_min_extrude_temp: f32,
-    
-    // Movement settings
-    max_velocity: f32,
-    max_accel: f32,
-    max_accel_to_decel: f32,
-    square_corner_velocity: f32,
-    
-    // Homing settings
-    homing_speed: f32,
-    homing_retract_dist: f32,
-    second_homing_speed: f32,
-    
-    // Safety settings
-    position_min: [f32; 3], // X, Y, Z minimum
-    position_max: [f32; 3], // X, Y, Z maximum
-    
-    // Motor configuration (per axis: X, Y, Z, E0, E1)
-    motor_types: [MotorType; 5],
-    
-    // Stepper settings
-    hold_current: f32,
-    run_current: f32,
-    microsteps: u16,
-    
-    // Servo settings
-    servo_min_pulse: u16,  // microseconds
-    servo_max_pulse: u16,  // microseconds
-    servo_max_angle: f32,  // degrees
-    
-    // Firmware retraction
-    retract_length: f32,
-    retract_speed: f32,
-    unretract_extra_length: f32,
-    unretract_speed: f32,
-    
-    // Pressure advance settings
-    pressure_advance: f32,
-    pressure_advance_smooth_time: f32,
-    
-    // Z offset and probe settings
-    z_offset: f32,
-    probe_z_offset: f32,
-    probe_xy_offset: [f32; 2], // X, Y offset of probe from nozzle
-    probe_speed: f32,
-    probe_lift_speed: f32,
-    probe_samples: u8,
-    probe_sample_retract_dist: f32,
-    
-    // 5-axis control
-    enable_5axis_mode: bool,
-    tool_point_control: bool, // TCP (Tool Center Point) control
-    rotary_axis_max_velocity: [f32; 2], // A, B axis max velocities
-    rotary_axis_acceleration: [f32; 2], // A, B axis accelerations
 }
 
 #[derive(Debug, Clone)]
@@ -1423,6 +1371,19 @@ struct MyApp {
     // Printer state and settings
     printer_state: PrinterState,
     printer_settings: PrinterSettings,
+    /// What's in the file, so a change anywhere in the app gets noticed and saved.
+    last_saved_settings: PrinterSettings,
+    settings_path: std::path::PathBuf,
+    /// The file exists but can't be read: don't overwrite what might be recoverable.
+    settings_save_blocked: bool,
+    settings_message: Option<(String, bool)>,
+    confirm_settings_reset: bool,
+    toolhead_target_temp: f32,
+    toolhead_fan_speed: u8,
+    toolhead_extrude_distance: f32,
+    /// What's being typed into an IP box. Half an address is fine until it's finished.
+    codesys_ip_text: Option<String>,
+    cip_ip_text: Option<String>,
     emergency_stop_triggered: bool,
     last_modbus_positions: Option<[f32; 5]>,
     modbus_send_in_flight: Arc<std::sync::atomic::AtomicBool>,
@@ -1798,66 +1759,17 @@ impl MyApp {
             view_3d: false,
             // Initialize printer state and settings
             printer_state: PrinterState::Idle,
-            printer_settings: PrinterSettings {
-                // Temperature settings - typical values for PLA/PETG printers
-                extruder_max_temp: 300.0,
-                bed_max_temp: 120.0,
-                extruder_min_extrude_temp: 170.0,
-                
-                // Movement settings
-                max_velocity: 300.0,
-                max_accel: 3000.0,
-                max_accel_to_decel: 1500.0,
-                square_corner_velocity: 5.0,
-                
-                // Homing settings
-                homing_speed: 50.0,
-                homing_retract_dist: 5.0,
-                second_homing_speed: 10.0,
-                
-                // Safety settings (200mm bed example)
-                position_min: [0.0, 0.0, 0.0],
-                position_max: [200.0, 200.0, 200.0],
-                
-                // Motor configuration (default all steppers)
-                motor_types: [MotorType::Stepper, MotorType::Stepper, MotorType::Stepper, 
-                             MotorType::Stepper, MotorType::Stepper],
-                
-                // Stepper settings
-                hold_current: 0.5,
-                run_current: 0.8,
-                microsteps: 16,
-                
-                // Servo settings (typical RC servo values)
-                servo_min_pulse: 500,   // 0.5ms
-                servo_max_pulse: 2500,  // 2.5ms
-                servo_max_angle: 180.0,
-                
-                // Firmware retraction
-                retract_length: 0.5,
-                retract_speed: 35.0,
-                unretract_extra_length: 0.0,
-                unretract_speed: 35.0,
-                
-                // Pressure advance settings
-                pressure_advance: 0.0,
-                pressure_advance_smooth_time: 0.04, // 40ms default
-                
-                // Z offset and probe settings
-                z_offset: 0.0,
-                probe_z_offset: 0.0,
-                probe_xy_offset: [0.0, 0.0],
-                probe_speed: 5.0,
-                probe_lift_speed: 15.0,
-                probe_samples: 3,
-                probe_sample_retract_dist: 2.0,
-                
-                // 5-axis control
-                enable_5axis_mode: false,
-                tool_point_control: false,
-                rotary_axis_max_velocity: [120.0, 120.0], // degrees/sec
-                rotary_axis_acceleration: [1800.0, 1800.0], // degrees/sec²
-            },
+            printer_settings: PrinterSettings::default(),
+            last_saved_settings: PrinterSettings::default(),
+            settings_path: std::path::PathBuf::from(ui_printer::SETTINGS_FILE),
+            settings_save_blocked: false,
+            settings_message: None,
+            confirm_settings_reset: false,
+            toolhead_target_temp: 200.0,
+            toolhead_fan_speed: 128,
+            toolhead_extrude_distance: 10.0,
+            codesys_ip_text: None,
+            cip_ip_text: None,
             emergency_stop_triggered: false,
             last_modbus_positions: None,
             modbus_send_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2005,6 +1917,7 @@ impl MyApp {
     /// Initialize machine configuration from saved config
     fn initialize_machine_config(&mut self) {
         self.load_saved_motors();
+        self.load_saved_settings();
         // Read the saved file. If it can't be used, keep the defaults and say so: the file is
         // left alone unless the user saves something.
         if let Err(e) = self.config_manager.load_config() {
@@ -2270,11 +2183,6 @@ impl MyApp {
         self.printer_settings.z_offset += delta;
         self.z += delta; // Apply immediately to current position
         println!("Z offset adjusted by {:.3}mm, new offset: {:.3}mm", delta, self.printer_settings.z_offset);
-    }
-    
-    fn save_z_offset(&mut self) {
-        println!("Z offset saved: {:.3}mm", self.printer_settings.z_offset);
-        // Here you would save to configuration file
     }
     
     fn analyze_gcode_for_print_area(&mut self) {
@@ -3073,9 +2981,6 @@ impl eframe::App for MyApp {
                     self.adjust_z_offset(0.1);
                 }
             });
-            if ui.button("💾 Save Z Offset").clicked() {
-                self.save_z_offset();
-            }
             
             ui.separator();
             
@@ -3266,9 +3171,9 @@ impl eframe::App for MyApp {
                             // Standard 3-Axis Controls
                             ui.group(|ui| {
                                 ui.label("📐 Position Control");
-                                ui.add(egui::Slider::new(&mut self.x, -100.0..=100.0).text("X"));
-                                ui.add(egui::Slider::new(&mut self.y, -100.0..=100.0).text("Y"));
-                                ui.add(egui::Slider::new(&mut self.z, -100.0..=100.0).text("Z"));
+                                ui.add(egui::Slider::new(&mut self.x, self.printer_settings.position_min[0]..=self.printer_settings.position_max[0]).text("X"));
+                                ui.add(egui::Slider::new(&mut self.y, self.printer_settings.position_min[1]..=self.printer_settings.position_max[1]).text("Y"));
+                                ui.add(egui::Slider::new(&mut self.z, self.printer_settings.position_min[2]..=self.printer_settings.position_max[2]).text("Z"));
                                 if self.printer_settings.enable_5axis_mode {
                                     ui.add(egui::Slider::new(&mut self.a, -180.0..=180.0).text("A (degrees)"));
                                     ui.add(egui::Slider::new(&mut self.b, -180.0..=180.0).text("B (degrees)"));
@@ -4233,235 +4138,8 @@ impl eframe::App for MyApp {
                         }
                     });
                 }
-                Tab::PrinterConfig => {
-                    ui.heading("Printer Configuration");
-                    ui.colored_label(ui_shell::warning(), "These settings aren't saved or used yet: changing them has no effect on the machine or the simulator.");
-                    ui.label("Configure printer settings similar to Klipper's printer.cfg");
-                    
-                    egui::ScrollArea::vertical().id_salt("printer_config_scroll").show(ui, |ui| {
-                        ui.group(|ui| {
-                            ui.label("🌡 Temperature Settings");
-                            ui.add(egui::Slider::new(&mut self.printer_settings.extruder_max_temp, 180.0..=400.0).text("Max Extruder Temp (°C)"));
-                            ui.add(egui::Slider::new(&mut self.printer_settings.bed_max_temp, 60.0..=150.0).text("Max Bed Temp (°C)"));
-                            ui.add(egui::Slider::new(&mut self.printer_settings.extruder_min_extrude_temp, 160.0..=200.0).text("Min Extrude Temp (°C)"));
-                        });
-                        
-                        ui.separator();
-                        
-                        ui.group(|ui| {
-                            ui.label("🏃 Movement Settings");
-                            ui.add(egui::Slider::new(&mut self.printer_settings.max_velocity, 50.0..=500.0).text("Max Velocity (mm/s)"));
-                            ui.add(egui::Slider::new(&mut self.printer_settings.max_accel, 500.0..=10000.0).text("Max Acceleration (mm/s²)"));
-                            ui.add(egui::Slider::new(&mut self.printer_settings.max_accel_to_decel, 250.0..=5000.0).text("Max Accel to Decel (mm/s²)"));
-                            ui.add(egui::Slider::new(&mut self.printer_settings.square_corner_velocity, 1.0..=20.0).text("Square Corner Velocity (mm/s)"));
-                        });
-                        
-                        ui.separator();
-                        
-                        ui.group(|ui| {
-                            ui.label("🏠 Homing Settings");
-                            ui.add(egui::Slider::new(&mut self.printer_settings.homing_speed, 10.0..=100.0).text("Homing Speed (mm/s)"));
-                            ui.add(egui::Slider::new(&mut self.printer_settings.homing_retract_dist, 1.0..=20.0).text("Homing Retract Distance (mm)"));
-                            ui.add(egui::Slider::new(&mut self.printer_settings.second_homing_speed, 5.0..=50.0).text("Second Homing Speed (mm/s)"));
-                        });
-                        
-                        ui.separator();
-                        
-                        ui.group(|ui| {
-                            ui.label("📏 Print Area Limits");
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("X min/max:");
-                                ui.add(egui::DragValue::new(&mut self.printer_settings.position_min[0]).speed(1.0));
-                                ui.add(egui::DragValue::new(&mut self.printer_settings.position_max[0]).speed(1.0));
-                            });
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("Y min/max:");
-                                ui.add(egui::DragValue::new(&mut self.printer_settings.position_min[1]).speed(1.0));
-                                ui.add(egui::DragValue::new(&mut self.printer_settings.position_max[1]).speed(1.0));
-                            });
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("Z min/max:");
-                                ui.add(egui::DragValue::new(&mut self.printer_settings.position_min[2]).speed(1.0));
-                                ui.add(egui::DragValue::new(&mut self.printer_settings.position_max[2]).speed(1.0));
-                            });
-                        });
-                        
-                        ui.separator();
-                        
-                        ui.group(|ui| {
-                            ui.label("⚙ Motor Configuration");
-                            let motor_labels = ["X-Axis", "Y-Axis", "Z-Axis", "Extruder 0", "Extruder 1"];
-                            
-                            for (i, label) in motor_labels.iter().enumerate() {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(format!("{}:", label));
-                                    egui::ComboBox::from_id_salt(format!("motor_{}", i))
-                                        .selected_text(format!("{:?}", self.printer_settings.motor_types[i]))
-                                        .show_ui(ui, |ui| {
-                                            ui.selectable_value(&mut self.printer_settings.motor_types[i], MotorType::Stepper, "Stepper");
-                                            ui.selectable_value(&mut self.printer_settings.motor_types[i], MotorType::Servo, "Servo");
-                                        });
-                                });
-                            }
-                        });
-                        
-                        ui.separator();
-                        
-                        ui.group(|ui| {
-                            ui.label("⚡ Stepper Motor Settings");
-                            ui.add(egui::Slider::new(&mut self.printer_settings.hold_current, 0.1..=2.0).text("Hold Current (A)"));
-                            ui.add(egui::Slider::new(&mut self.printer_settings.run_current, 0.2..=2.5).text("Run Current (A)"));
-                            egui::ComboBox::from_label("Microsteps")
-                                .selected_text(format!("{}", self.printer_settings.microsteps))
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut self.printer_settings.microsteps, 16, "16");
-                                    ui.selectable_value(&mut self.printer_settings.microsteps, 32, "32");
-                                    ui.selectable_value(&mut self.printer_settings.microsteps, 64, "64");
-                                    ui.selectable_value(&mut self.printer_settings.microsteps, 128, "128");
-                                    ui.selectable_value(&mut self.printer_settings.microsteps, 256, "256");
-                                });
-                        });
-                        
-                        ui.separator();
-                        
-                        ui.group(|ui| {
-                            ui.label("🔧 Servo Motor Settings");
-                            ui.add(egui::Slider::new(&mut self.printer_settings.servo_min_pulse, 500..=1500).text("Min Pulse Width (µs)"));
-                            ui.add(egui::Slider::new(&mut self.printer_settings.servo_max_pulse, 1500..=3000).text("Max Pulse Width (µs)"));
-                            ui.add(egui::Slider::new(&mut self.printer_settings.servo_max_angle, 90.0..=360.0).text("Max Angle (degrees)"));
-                            ui.label("Common servo types:");
-                            ui.horizontal_wrapped(|ui| {
-                                if ui.button("Standard (500-2500µs)").clicked() {
-                                    self.printer_settings.servo_min_pulse = 500;
-                                    self.printer_settings.servo_max_pulse = 2500;
-                                    self.printer_settings.servo_max_angle = 180.0;
-                                }
-                                if ui.button("Digital (600-2400µs)").clicked() {
-                                    self.printer_settings.servo_min_pulse = 600;
-                                    self.printer_settings.servo_max_pulse = 2400;
-                                    self.printer_settings.servo_max_angle = 180.0;
-                                }
-                                if ui.button("Continuous (1000-2000µs)").clicked() {
-                                    self.printer_settings.servo_min_pulse = 1000;
-                                    self.printer_settings.servo_max_pulse = 2000;
-                                    self.printer_settings.servo_max_angle = 360.0;
-                                }
-                            });
-                        });
-                        
-                        ui.separator();
-                        
-                        ui.group(|ui| {
-                            ui.label("🌊 Pressure Advance");
-                            ui.add(egui::Slider::new(&mut self.printer_settings.pressure_advance, 0.0..=0.2).text("Pressure Advance"));
-                            ui.add(egui::Slider::new(&mut self.printer_settings.pressure_advance_smooth_time, 0.01..=0.1).text("Smooth Time (s)"));
-                            ui.label("⚠ Start with small values (0.01-0.05) and increase gradually");
-                        });
-                        
-                        ui.separator();
-                        
-                        ui.group(|ui| {
-                            ui.label("🔍 Z Probe Settings");
-                            ui.add(egui::Slider::new(&mut self.printer_settings.probe_z_offset, -5.0..=5.0).text("Probe Z Offset (mm)"));
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("Probe XY Offset:");
-                                ui.add(egui::DragValue::new(&mut self.printer_settings.probe_xy_offset[0]).prefix("X:").speed(0.1));
-                                ui.add(egui::DragValue::new(&mut self.printer_settings.probe_xy_offset[1]).prefix("Y:").speed(0.1));
-                            });
-                            ui.add(egui::Slider::new(&mut self.printer_settings.probe_speed, 1.0..=20.0).text("Probe Speed (mm/s)"));
-                            ui.add(egui::Slider::new(&mut self.printer_settings.probe_lift_speed, 5.0..=50.0).text("Lift Speed (mm/s)"));
-                            ui.add(egui::Slider::new(&mut self.printer_settings.probe_samples, 1..=10).text("Samples per Point"));
-                            ui.add(egui::Slider::new(&mut self.printer_settings.probe_sample_retract_dist, 0.5..=10.0).text("Sample Retract Distance (mm)"));
-                        });
-                        
-                        ui.separator();
-                        
-                        ui.group(|ui| {
-                            ui.label("🔄 5-Axis Control");
-                            ui.checkbox(&mut self.printer_settings.enable_5axis_mode, "Enable 5-Axis Mode");
-                            if self.printer_settings.enable_5axis_mode {
-                                ui.checkbox(&mut self.printer_settings.tool_point_control, "Tool Center Point (TCP) Control");
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label("A-Axis Max Velocity:");
-                                    ui.add(egui::DragValue::new(&mut self.printer_settings.rotary_axis_max_velocity[0]).suffix("°/s").speed(1.0));
-                                });
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label("B-Axis Max Velocity:");
-                                    ui.add(egui::DragValue::new(&mut self.printer_settings.rotary_axis_max_velocity[1]).suffix("°/s").speed(1.0));
-                                });
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label("A-Axis Acceleration:");
-                                    ui.add(egui::DragValue::new(&mut self.printer_settings.rotary_axis_acceleration[0]).suffix("°/s²").speed(10.0));
-                                });
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label("B-Axis Acceleration:");
-                                    ui.add(egui::DragValue::new(&mut self.printer_settings.rotary_axis_acceleration[1]).suffix("°/s²").speed(10.0));
-                                });
-                                ui.label("⚠ TCP control maintains tool tip position during rotary movement");
-                            }
-                        });
-                        
-                        ui.separator();
-                        
-                        ui.group(|ui| {
-                            ui.label("🔄 Firmware Retraction");
-                            ui.add(egui::Slider::new(&mut self.printer_settings.retract_length, 0.0..=10.0).text("Retract Length (mm)"));
-                            ui.add(egui::Slider::new(&mut self.printer_settings.retract_speed, 10.0..=100.0).text("Retract Speed (mm/s)"));
-                            ui.add(egui::Slider::new(&mut self.printer_settings.unretract_extra_length, 0.0..=2.0).text("Unretract Extra Length (mm)"));
-                            ui.add(egui::Slider::new(&mut self.printer_settings.unretract_speed, 10.0..=100.0).text("Unretract Speed (mm/s)"));
-                        });
-                        
-                        ui.separator();
-                        
-                        ui.horizontal_wrapped(|ui| {
-                            ui_shell::unavailable_button(ui, "💾 Save Configuration", "Not built yet: the settings on this page aren't saved or used.");
-                            if ui.button("🔄 Reset to Defaults").clicked() {
-                                // Reset to default values
-                                self.printer_settings = PrinterSettings {
-                                    extruder_max_temp: 300.0,
-                                    bed_max_temp: 120.0,
-                                    extruder_min_extrude_temp: 170.0,
-                                    max_velocity: 300.0,
-                                    max_accel: 3000.0,
-                                    max_accel_to_decel: 1500.0,
-                                    square_corner_velocity: 5.0,
-                                    homing_speed: 50.0,
-                                    homing_retract_dist: 5.0,
-                                    second_homing_speed: 10.0,
-                                    position_min: [0.0, 0.0, 0.0],
-                                    position_max: [200.0, 200.0, 200.0],
-                                    motor_types: [MotorType::Stepper, MotorType::Stepper, MotorType::Stepper, 
-                                                 MotorType::Stepper, MotorType::Stepper],
-                                    hold_current: 0.5,
-                                    run_current: 0.8,
-                                    microsteps: 16,
-                                    servo_min_pulse: 500,
-                                    servo_max_pulse: 2500,
-                                    servo_max_angle: 180.0,
-                                    retract_length: 0.5,
-                                    retract_speed: 35.0,
-                                    unretract_extra_length: 0.0,
-                                    unretract_speed: 35.0,
-                                    // New settings
-                                    pressure_advance: 0.0,
-                                    pressure_advance_smooth_time: 0.04,
-                                    z_offset: 0.0,
-                                    probe_z_offset: 0.0,
-                                    probe_xy_offset: [0.0, 0.0],
-                                    probe_speed: 5.0,
-                                    probe_lift_speed: 15.0,
-                                    probe_samples: 3,
-                                    probe_sample_retract_dist: 2.0,
-                                    enable_5axis_mode: false,
-                                    tool_point_control: false,
-                                    rotary_axis_max_velocity: [120.0, 120.0],
-                                    rotary_axis_acceleration: [1800.0, 1800.0],
-                                };
-                                println!("Configuration reset to defaults");
-                            }
-                        });
-                    });
-                }
+                Tab::PrinterConfig => self.show_printer_page(ui),
+
                 Tab::BedMesh => {
                     ui.heading("📏 Bed Mesh Leveling");
                     ui.label("View, create, and manage bed mesh profiles for optimal print adhesion");
@@ -5985,11 +5663,7 @@ impl eframe::App for MyApp {
                                     ui.label("💻 CODESYS Settings");
                                     ui.horizontal_wrapped(|ui| {
                                         ui.label("Target IP:");
-                                        let mut ip_string = self.codesys_config.target_ip.to_string();
-                                        ui.text_edit_singleline(&mut ip_string);
-                                        if let Ok(parsed_ip) = ip_string.parse() {
-                                            self.codesys_config.target_ip = parsed_ip;
-                                        }
+                                        ui_shell::address_box(ui, &mut self.codesys_ip_text, &mut self.codesys_config.target_ip);
                                     });
                                     ui.horizontal_wrapped(|ui| {
                                         ui.label("Port:");
@@ -6024,11 +5698,7 @@ impl eframe::App for MyApp {
                                     });
                                     ui.horizontal_wrapped(|ui| {
                                         ui.label("Target IP:");
-                                        let mut ip_string = self.cip_config.target_ip.to_string();
-                                        ui.text_edit_singleline(&mut ip_string);
-                                        if let Ok(parsed_ip) = ip_string.parse() {
-                                            self.cip_config.target_ip = parsed_ip;
-                                        }
+                                        ui_shell::address_box(ui, &mut self.cip_ip_text, &mut self.cip_config.target_ip);
                                     });
                                     ui.horizontal_wrapped(|ui| {
                                         ui.label("Port:");
@@ -6409,31 +6079,29 @@ impl eframe::App for MyApp {
                                 
                                 ui.horizontal_wrapped(|ui| {
                                     ui.label("Temperature:");
-                                    let mut target_temp = 200.0f32;
-                                    ui.add(egui::Slider::new(&mut target_temp, 0.0..=300.0).suffix("°C"));
+                                    let limit = self.printer_settings.extruder_max_temp;
+                                    ui.add(egui::Slider::new(&mut self.toolhead_target_temp, 0.0..=limit).suffix("°C"));
                                     if ui.button("Set").clicked() {
-                                        self.set_toolhead_temperature(selected_uuid, target_temp);
+                                        self.set_toolhead_temperature(selected_uuid, self.toolhead_target_temp);
                                     }
                                 });
                                 
                                 ui.horizontal_wrapped(|ui| {
                                     ui.label("Fan Speed:");
-                                    let mut fan_speed = 128u8;
-                                    ui.add(egui::Slider::new(&mut fan_speed, 0..=255).suffix("%"));
+                                    ui.add(egui::Slider::new(&mut self.toolhead_fan_speed, 0..=255));
                                     if ui.button("Set").clicked() {
-                                        self.set_toolhead_fan(selected_uuid, fan_speed);
+                                        self.set_toolhead_fan(selected_uuid, self.toolhead_fan_speed);
                                     }
                                 });
                                 
                                 ui.horizontal_wrapped(|ui| {
                                     ui.label("Extruder:");
-                                    let mut extrude_distance = 10.0f32;
-                                    ui.add(egui::DragValue::new(&mut extrude_distance).suffix("mm"));
+                                    ui.add(egui::DragValue::new(&mut self.toolhead_extrude_distance).suffix("mm"));
                                     if ui.button("Extrude").clicked() {
-                                        self.move_extruder(selected_uuid, extrude_distance, 5.0);
+                                        self.move_extruder(selected_uuid, self.toolhead_extrude_distance, 5.0);
                                     }
                                     if ui.button("Retract").clicked() {
-                                        self.move_extruder(selected_uuid, -extrude_distance, 10.0);
+                                        self.move_extruder(selected_uuid, -self.toolhead_extrude_distance, 10.0);
                                     }
                                 });
                                 
@@ -7231,7 +6899,7 @@ impl eframe::App for MyApp {
                                                     let sensor_config = SensorConfig {
                                                         sensor_type: SensorType::Thermistor,
                                                         pin: i,
-                                                        max_temp: 300.0,
+                                                        max_temp: self.printer_settings.extruder_max_temp as _,
                                                         ..Default::default()
                                                     };
                                                     let heater_config = Some(HeaterConfig {
@@ -7262,7 +6930,7 @@ impl eframe::App for MyApp {
                                                 let sensor_config = SensorConfig {
                                                     sensor_type: SensorType::Thermistor,
                                                     pin: 5,
-                                                    max_temp: 120.0,
+                                                    max_temp: self.printer_settings.bed_max_temp as _,
                                                     ..Default::default()
                                                 };
                                                 let heater_config = Some(HeaterConfig {
@@ -7286,7 +6954,7 @@ impl eframe::App for MyApp {
                                                 let sensor_config = SensorConfig {
                                                     sensor_type: SensorType::PT100,
                                                     pin: 6,
-                                                    max_temp: 150.0,
+                                                    max_temp: self.printer_settings.bed_max_temp as _,
                                                     ..Default::default()
                                                 };
                                                 let heater_config = Some(HeaterConfig {
@@ -7596,22 +7264,12 @@ impl eframe::App for MyApp {
                                                 let _ = self.temperature_manager.set_target_temperature(selected_zone, new_target);
                                             }
                                             if ui.button("+1°C →").clicked() {
-                                                let max_temp = match selected_zone {
-                                                    TemperatureZone::Hotend(_) => 300.0,
-                                                    TemperatureZone::Bed => 120.0,
-                                                    TemperatureZone::Chamber => 80.0,
-                                                    _ => 50.0,
-                                                };
+                                                let max_temp = zone_temperature_limit(&self.printer_settings, &selected_zone);
                                                 let new_target = (stats.target_temperature + 1.0).min(max_temp);
                                                 let _ = self.temperature_manager.set_target_temperature(selected_zone, new_target);
                                             }
                                             if ui.button("+10°C →").clicked() {
-                                                let max_temp = match selected_zone {
-                                                    TemperatureZone::Hotend(_) => 300.0,
-                                                    TemperatureZone::Bed => 120.0,
-                                                    TemperatureZone::Chamber => 80.0,
-                                                    _ => 50.0,
-                                                };
+                                                let max_temp = zone_temperature_limit(&self.printer_settings, &selected_zone);
                                                 let new_target = (stats.target_temperature + 10.0).min(max_temp);
                                                 let _ = self.temperature_manager.set_target_temperature(selected_zone, new_target);
                                             }
@@ -8505,6 +8163,7 @@ impl eframe::App for MyApp {
 
         self.show_add_motor_window(ctx);
         self.save_motors_if_changed(ctx);
+        self.save_settings_if_changed(ctx);
     }
 }
 

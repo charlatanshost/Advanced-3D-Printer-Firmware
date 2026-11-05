@@ -333,3 +333,67 @@ fn fault_descriptions_parse() {
     assert!(parse_fault("nonsense@1").is_err());
     assert!(parse_fault("power-cut").is_err());
 }
+
+// The Printer page's settings have to change what the simulator does
+
+fn with_settings(change: impl FnOnce(&mut printer_host::printer_settings::PrinterSettings)) -> SimConfig {
+    let mut settings = printer_host::printer_settings::PrinterSettings::default();
+    change(&mut settings);
+    let mut config = SimConfig::default();
+    config.apply_printer_settings(&settings);
+    config
+}
+
+#[test]
+fn default_settings_let_a_normal_print_finish() {
+    let simulator = simulate(&square_tower(2), with_settings(|_| {}));
+    assert_eq!(simulator.report().outcome, Outcome::Completed);
+}
+
+#[test]
+fn the_print_area_setting_stops_moves_outside_it() {
+    let simulator = simulate(&square_tower(2), with_settings(|s| s.position_max[0] = 20.0));
+    match &simulator.report().outcome {
+        Outcome::Halted(why) => assert!(why.contains("outside the build volume"), "{}", why),
+        other => panic!("should have stopped: {:?}", other),
+    }
+}
+
+#[test]
+fn the_print_area_minimum_also_counts() {
+    let simulator = simulate("G28\nG1 X50 Y50 Z5 F3000\n", with_settings(|s| s.position_min[0] = 60.0));
+    match &simulator.report().outcome {
+        Outcome::Halted(why) => assert!(why.contains("X = 50"), "stopped for another reason: {}", why),
+        other => panic!("should have stopped: {:?}", other),
+    }
+}
+
+#[test]
+fn the_min_extrude_setting_decides_what_is_too_cold() {
+    let normal = simulate(&square_tower(2), with_settings(|_| {}));
+    assert_eq!(normal.report().cold_extrusions, 0);
+
+    let strict = simulate(&square_tower(2), with_settings(|s| s.extruder_min_extrude_temp = 280.0));
+    assert!(strict.report().cold_extrusions > 0, "{:?}", strict.report().outcome);
+}
+
+#[test]
+fn the_max_extruder_setting_limits_the_heater() {
+    let simulator = simulate(&square_tower(2), with_settings(|s| s.extruder_max_temp = 180.0));
+    assert!(simulator.report().peak_hotend < 195.0, "reached {}", simulator.report().peak_hotend);
+}
+
+#[test]
+fn the_max_velocity_setting_slows_the_print_down() {
+    let fast = simulate(&square_tower(2), with_settings(|_| {}));
+    let slow = simulate(&square_tower(2), with_settings(|s| s.max_velocity = 5.0));
+    assert!(slow.report().peak_speed <= 5.01, "reached {}", slow.report().peak_speed);
+    assert!(slow.report().seconds > fast.report().seconds);
+}
+
+#[test]
+fn the_max_acceleration_setting_changes_the_timing() {
+    let quick = simulate(&square_tower(2), with_settings(|_| {}));
+    let gentle = simulate(&square_tower(2), with_settings(|s| s.max_accel = 50.0));
+    assert!(gentle.report().seconds > quick.report().seconds);
+}

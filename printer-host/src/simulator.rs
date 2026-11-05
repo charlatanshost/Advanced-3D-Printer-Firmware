@@ -6,6 +6,7 @@
 // much filament it pushes. It does not model the plastic, belts or vibration, and passing
 // here does not show a real machine will behave, only that the logic does the right thing.
 
+use crate::printer_settings::PrinterSettings;
 use crate::fast_gcode_parser::{CommandType, GCodeCommand, Parameters, StreamingGCodeParser};
 use crate::power_loss_recovery::{PowerLossRecoveryManager, PrintStateUpdate, RecoveryConfig};
 use crate::smooth_trajectory::{MotionConstraints, MotionProfile, SmoothTrajectoryPlanner};
@@ -85,9 +86,13 @@ impl ThermalPlant {
     }
 }
 
+const SETTINGS_FILE: &str = "printer_settings.toml";
+
 #[derive(Debug, Clone)]
 pub struct SimConfig {
     pub build_volume: [f64; 3],
+    /// The lowest position allowed on each axis
+    pub build_min: [f64; 3],
     pub start_position: [f64; 3],
     pub min_extrude_temp: f64,
     pub hotend: ThermalPlant,
@@ -105,10 +110,27 @@ pub struct SimConfig {
     pub faults: Vec<(FaultTrigger, Fault)>,
 }
 
+impl SimConfig {
+    /// Use the machine's limits from the Printer page.
+    pub fn apply_printer_settings(&mut self, settings: &PrinterSettings) {
+        for axis in 0..3 {
+            self.build_min[axis] = settings.position_min[axis] as f64;
+            self.build_volume[axis] = settings.position_max[axis] as f64;
+            self.start_position[axis] = self.start_position[axis].clamp(self.build_min[axis], self.build_volume[axis]);
+        }
+        self.min_extrude_temp = settings.extruder_min_extrude_temp as f64;
+        self.hotend_max_temp = settings.extruder_max_temp as f64;
+        self.bed_max_temp = settings.bed_max_temp as f64;
+        self.constraints.max_velocity = settings.max_velocity as f64;
+        self.constraints.max_acceleration = settings.max_accel as f64;
+    }
+}
+
 impl Default for SimConfig {
     fn default() -> Self {
         Self {
             build_volume: [220.0, 220.0, 250.0],
+            build_min: [0.0, 0.0, 0.0],
             start_position: [110.0, 110.0, 20.0],
             min_extrude_temp: 170.0,
             // 40 W cartridge in a typical block: about 2.5 °C/s from cold
@@ -764,7 +786,7 @@ impl Simulator {
         }
         let target = [logical[0] - self.offset[0], logical[1] - self.offset[1], logical[2] - self.offset[2]];
         for axis in 0..3 {
-            if target[axis] < -0.001 || target[axis] > self.config.build_volume[axis] + 0.001 {
+            if target[axis] < self.config.build_min[axis] - 0.001 || target[axis] > self.config.build_volume[axis] + 0.001 {
                 self.halt(format!("Line {}: {} = {:.3} is outside the build volume", self.current_line, ["X", "Y", "Z"][axis], target[axis]));
                 return None;
             }
@@ -1128,6 +1150,25 @@ pub fn run_cli(args: &[String]) -> i32 {
     };
 
     let mut config = SimConfig::default();
+    // The machine's limits from the Printer page. Settings that can't be used stop the run:
+    // testing against different limits than asked for would give a misleading result.
+    let settings = match PrinterSettings::load_from_file(Path::new(SETTINGS_FILE)) {
+        Ok(Some(settings)) => {
+            println!("Using machine limits from {}", SETTINGS_FILE);
+            settings
+        }
+        Ok(None) => PrinterSettings::default(),
+        Err(e) => {
+            eprintln!("Cannot read {}: {}", SETTINGS_FILE, e);
+            return 2;
+        }
+    };
+    let problems = settings.problems();
+    if !problems.is_empty() {
+        eprintln!("{} has problems:\n  {}", SETTINGS_FILE, problems.join("\n  "));
+        return 2;
+    }
+    config.apply_printer_settings(&settings);
     let mut resume_after = None;
     let mut rest = args[1..].iter();
     while let Some(arg) = rest.next() {

@@ -13,3 +13,5 @@ Desktop.ini
 ethercat packet.pcapng
 printer-host/motors.json
 printer-host/motors.json.tmp
+printer-host/printer_settings.toml
+printer-host/printer_settings.toml.tmp
