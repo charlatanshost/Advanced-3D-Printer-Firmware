@@ -1342,3 +1342,22 @@ For commercial installations and professional support:
 ---
 
 **Note**: This firmware is designed for both hobbyist and industrial applications. Always follow safety guidelines when working with high-voltage systems, moving machinery, and hot surfaces. Test thoroughly in simulation mode before operating real hardware.
+## Simulating a print without a printer
+
+The host can run a G-code file against a virtual printer. It uses the real parser, trajectory planner, kinematics, heater safety logic and power-loss recovery, with simulated physics in place of hardware, and runs far faster than real time.
+
+```
+cd printer-host
+cargo run -- --simulate ../gcode/example.gcode
+cargo run -- --simulate ../gcode/example.gcode --fault hotend-sensor-open@600
+cargo run -- --simulate ../gcode/example.gcode --fault power-cut@line:120000 --resume-after 300
+```
+
+Faults take effect at a time in seconds (`NAME@600`) or a line of the file (`NAME@line:500`):
+
+- `hotend-` or `bed-` followed by `sensor-open`, `sensor-short`, `sensor-frozen`, `heater-dead` or `heater-stuck`
+- `power-cut`, `power-loss-detected`, `estop`
+
+It reports what happened, including collisions with the printed part and cold extrusion, and exits with 0 only if the print ran clean. The tests in `printer-host/tests/simulator.rs` run these scenarios automatically.
+
+It checks the control logic only. The heater values are typical figures rather than measurements, and plastic, belts and vibration are not modelled, so passing does not show a real machine will behave the same way.

@@ -19,6 +19,7 @@ pub mod protocols;
 pub mod resonance_cancellation;
 pub mod runtime_config;
 pub mod sensor_fusion;
+pub mod simulator;
 pub mod smooth_trajectory;
 pub mod temperature_control;
 pub mod test_runner;

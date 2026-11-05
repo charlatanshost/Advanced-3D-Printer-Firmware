@@ -281,6 +281,36 @@ fn recovery_data_loads_reliably() {
 }
 
 #[test]
+fn z_changes_are_saved_immediately() {
+    let mut config = recovery_config("zchange");
+    config.save_interval_ms = 3_600_000; // Nothing else would save for an hour
+    let mut manager = PowerLossRecoveryManager::new(config.clone()).unwrap();
+    manager.start_print_tracking("x.gcode".into(), 1000).unwrap();
+    manager.update_print_state(PrintStateUpdate { position: Some([1.0, 2.0, 0.4, 0.0, 0.0, 0.0]), ..Default::default() }).unwrap();
+    manager.update_print_state(PrintStateUpdate { position: Some([9.0, 2.0, 0.4, 0.0, 0.0, 0.0]), ..Default::default() }).unwrap();
+    
+    let mut restarted = PowerLossRecoveryManager::new(config).unwrap();
+    let state = restarted.load_recovery_data().unwrap().unwrap();
+    assert_eq!(state.position[2], 0.4);
+    assert_eq!(state.position[0], 1.0, "a move at the same height waits for the interval");
+}
+
+#[test]
+fn constant_z_changes_do_not_save_constantly() {
+    // A non-planar print: Z changes on every move
+    let mut config = recovery_config("nonplanar");
+    config.save_interval_ms = 3_600_000;
+    let mut manager = PowerLossRecoveryManager::new(config.clone()).unwrap();
+    manager.start_print_tracking("x.gcode".into(), 1000).unwrap();
+    for i in 1..=50 {
+        manager.update_print_state(PrintStateUpdate { position: Some([0.0, 0.0, i as f64 * 0.01, 0.0, 0.0, 0.0]), ..Default::default() }).unwrap();
+    }
+    let mut restarted = PowerLossRecoveryManager::new(config).unwrap();
+    let state = restarted.load_recovery_data().unwrap().unwrap();
+    assert_eq!(state.position[2], 0.01, "only the first of these, all within a second, was saved");
+}
+
+#[test]
 fn corrupted_recovery_data_is_refused() {
     let config = recovery_config("corrupt");
     drop(tracked_print(&config));

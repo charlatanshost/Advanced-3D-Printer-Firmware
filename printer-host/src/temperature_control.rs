@@ -230,8 +230,8 @@ struct RunawayMonitor {
 }
 
 impl RunawayMonitor {
-    fn new(temp: f64) -> Self {
-        Self { watch_start: Instant::now(), watch_start_temp: temp, reached_target: false, below_since: None }
+    fn new(temp: f64, now: Instant) -> Self {
+        Self { watch_start: now, watch_start_temp: temp, reached_target: false, below_since: None }
     }
 }
 
@@ -278,6 +278,8 @@ pub struct TemperatureController {
     pub safety_shutdown: bool,
     pub runaway_config: ThermalRunawayConfig,
     runaway: Option<RunawayMonitor>,
+    /// A simulated time to use instead of the real clock. See set_clock.
+    simulated_now: Option<Instant>,
 
     // History for modeling and display
     pub temperature_history: VecDeque<TemperatureReading>,
@@ -302,6 +304,7 @@ impl TemperatureController {
             zone,
             runaway_config,
             runaway: None,
+            simulated_now: None,
             sensor_config,
             heater_config,
             pid_config: PIDConfig::default(),
@@ -321,8 +324,18 @@ impl TemperatureController {
         }
     }
     
+    /// Run on a simulated clock from now on, so simulations can go faster than real time
+    /// and still exercise the real timing logic. Call again each time simulated time moves.
+    pub fn set_clock(&mut self, now: Instant) {
+        self.simulated_now = Some(now);
+    }
+
+    fn now(&self) -> Instant {
+        self.simulated_now.unwrap_or_else(Instant::now)
+    }
+
     pub fn update_reading(&mut self, raw_value: u16) -> Result<(), String> {
-        let now = Instant::now();
+        let now = self.now();
         let temperature = match self.raw_to_temperature(raw_value) {
             Ok(t) => t,
             Err(e) => {
@@ -397,7 +410,7 @@ impl TemperatureController {
         };
         let previous = self.target_temperature;
         self.target_temperature = target;
-        let now = Instant::now();
+        let now = self.now();
         
         // Store setpoint history
         self.setpoint_history.push_back((now, target));
@@ -426,7 +439,7 @@ impl TemperatureController {
         let safety_timeout = heater.safety_timeout;
         let max_duty = heater.max_pwm_duty;
 
-        let now = Instant::now();
+        let now = self.now();
 
         // Never heat on a bad or stale reading.
         if !self.current_reading.valid {
@@ -481,7 +494,7 @@ impl TemperatureController {
             return false;
         }
         let target = self.target_temperature;
-        let monitor = self.runaway.get_or_insert_with(|| RunawayMonitor::new(temp));
+        let monitor = self.runaway.get_or_insert_with(|| RunawayMonitor::new(temp, now));
         let mut fault = None;
 
         if !monitor.reached_target {
@@ -656,6 +669,7 @@ impl TemperatureController {
     
     pub fn reset_pid(&mut self) {
         self.pid_state = PIDState::default();
+        self.pid_state.last_update = self.now();
     }
     
     pub fn enable(&mut self) {

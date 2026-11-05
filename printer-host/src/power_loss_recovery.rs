@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 // Recovery file format version for compatibility
 const RECOVERY_FILE_VERSION: u32 = 2;
 const RECOVERY_FILE_HEADER: &[u8] = b"PLRV"; // Power Loss Recovery Version
+/// Shortest gap between saves caused by Z changing. Ordinary layers change slower than this, so
+/// they save at once. Non-planar prints change Z on nearly every move, and saving each one
+/// would wear out the storage.
+const Z_SAVE_MIN_GAP: Duration = Duration::from_secs(1);
 
 // Power loss detection methods
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,6 +218,7 @@ pub struct PowerLossRecoveryManager {
     config: RecoveryConfig,
     current_print_state: Option<PrintState>,
     last_save_time: Instant,
+    last_z_save_time: Option<Instant>,
     power_loss_detected: bool,
     recovery_in_progress: bool,
     statistics: RecoveryStatistics,
@@ -233,6 +238,7 @@ impl PowerLossRecoveryManager {
             config: config.clone(),
             current_print_state: None,
             last_save_time: Instant::now(),
+            last_z_save_time: None,
             power_loss_detected: false,
             recovery_in_progress: false,
             statistics: RecoveryStatistics::default(),
@@ -304,6 +310,11 @@ impl PowerLossRecoveryManager {
             return Ok(());
         }
         if let Some(ref mut state) = self.current_print_state {
+            // Z must always be current on disk. Recovery cannot home Z, so it declares the
+            // saved height as the truth. If that is one layer behind where the machine really
+            // is, every remaining layer is printed that much too high.
+            let z_changed = updates.position.map_or(false, |pos| pos[2] != state.position[2]);
+            
             // Update fields based on the update structure
             if let Some(pos) = updates.position {
                 state.position = pos;
@@ -344,7 +355,11 @@ impl PowerLossRecoveryManager {
             
             // Check if it's time to save state
             let now = Instant::now();
-            if now.duration_since(self.last_save_time).as_millis() >= self.config.save_interval_ms as u128 {
+            let z_save_due = z_changed && self.last_z_save_time.map_or(true, |t| now.duration_since(t) >= Z_SAVE_MIN_GAP);
+            if z_save_due {
+                self.last_z_save_time = Some(now);
+            }
+            if z_save_due || now.duration_since(self.last_save_time).as_millis() >= self.config.save_interval_ms as u128 {
                 self.save_state()?;
                 self.last_save_time = now;
             }

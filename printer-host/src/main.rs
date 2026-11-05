@@ -224,6 +224,9 @@ async fn send_modbus_tcp_positions_static(
 async fn main() -> eframe::Result<()> {
     // Check if we should run the integration test
     let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "--simulate" {
+        std::process::exit(printer_host::simulator::run_cli(&args[2..]));
+    }
     if args.len() > 1 && args[1] == "--test" {
         test_runner::run_integration_test();
         return Ok(());

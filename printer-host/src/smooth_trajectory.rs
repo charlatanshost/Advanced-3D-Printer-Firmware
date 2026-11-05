@@ -65,6 +65,7 @@ pub struct MotionPoint {
     pub feedrate: f64,          // Commanded feedrate
     pub actual_feedrate: f64,   // Actual achievable feedrate
     pub curvature: f64,         // Path curvature at this point
+    pub segment_fraction: f64,  // How far along its move this point is, from 0 to 1 at the end
 }
 
 impl Default for MotionPoint {
@@ -78,6 +79,7 @@ impl Default for MotionPoint {
             feedrate: 0.0,
             actual_feedrate: 0.0,
             curvature: 0.0,
+            segment_fraction: 0.0,
         }
     }
 }
@@ -503,6 +505,7 @@ impl SmoothTrajectoryPlanner {
                 feedrate,
                 actual_feedrate: speed,
                 curvature,
+                segment_fraction: if i == steps { 1.0 } else { (distance / segment.arc_length).clamp(0.0, 1.0) },
             });
         }
 
@@ -584,6 +587,16 @@ impl SmoothTrajectoryPlanner {
         self.planned_points.clear();
         self.current_time = 0.0;
         self.current_speed = 0.0;
+    }
+
+    /// Moves waiting to be turned into points
+    pub fn queued_segments(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Points of motion per second
+    pub fn set_interpolation_rate(&mut self, points_per_second: f64) {
+        self.interpolation_rate = points_per_second.max(1.0);
     }
 
     pub fn set_motion_profile(&mut self, profile: MotionProfile) {
