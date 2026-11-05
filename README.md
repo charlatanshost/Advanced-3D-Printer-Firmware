@@ -1369,11 +1369,19 @@ A read-only check of real EtherCAT hardware, from the `printer-host` folder. On 
 ```
 cargo run -- --ethercat list                  # show network adapters
 cargo run -- --ethercat scan 3                # find devices on adapter 3 from the list
+cargo run -- --ethercat inspect 3             # what the first device reports about itself
+cargo run -- --ethercat layout 3              # a BK1120's inputs and outputs, as it describes them
 cargo run -- --ethercat watch 3 30            # show inputs as they change, for 30 seconds
 ```
 
-You choose the adapter, because these frames don't belong on an ordinary network. It never writes
-outputs, and `watch` stops before going operational if any device has outputs.
+Add `--trace` to print every frame. You choose the adapter, because these frames don't belong on an
+ordinary network. `scan` and `inspect` don't change what a device is doing.
+
+`watch` never writes outputs. On a BK1120 it stays in SAFE-OP, where outputs stay in their safe
+state, and stops if the coupler has any output other than its own control word (object 0xF200). The
+BK1120 needs this separate start-up because its EEPROM has no configuration categories, which the
+ethercrab master relies on. For other devices `watch` uses ethercrab, which hasn't been tried on
+real hardware yet.
 
 Printer settings from the app are kept in `printer_settings.toml` and motors in `motors.json`, in
 the folder the app runs from. `--simulate` uses the limits from `printer_settings.toml`.

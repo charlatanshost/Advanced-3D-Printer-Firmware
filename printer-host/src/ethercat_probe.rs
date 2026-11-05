@@ -4,9 +4,11 @@
 //! limited, because it is the first thing here to touch real hardware:
 //! - it only uses the adapter you name, since these frames don't belong on an office network
 //! - it never writes outputs, and won't go operational if a device has any
+//! - scan and inspect don't change what a device is doing. Watch has to start the device up
 //!
 //! Npcap is loaded when needed instead of linked, so the app builds and runs without it.
 
+use crate::ethercat_coupler::{self, BECKHOFF_VENDOR_ID, BK1120_PRODUCT_CODE};
 use ethercrab::{MainDevice, MainDeviceConfig, PduRx, PduStorage, PduTx, Timeouts};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -17,7 +19,6 @@ const MAX_FRAMES: usize = 16;
 const MAX_PDU_DATA: usize = PduStorage::element_size(1100);
 const PDI_LEN: usize = 256;
 const ETHERCAT_ETHERTYPE: [u8; 2] = [0x88, 0xA4];
-const BECKHOFF_VENDOR_ID: u32 = 2;
 
 /// Nanoseconds since the EtherCAT epoch, 2000-01-01.
 fn ethercat_now() -> u64 {
@@ -66,7 +67,7 @@ pub fn pick_adapter<'a>(adapters: &'a [Adapter], wanted: &str) -> Result<&'a Ada
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceInfo {
-    pub address: u16,
+    pub position: u16,
     pub name: String,
     pub vendor_id: u32,
     pub product_id: u32,
@@ -74,12 +75,21 @@ pub struct DeviceInfo {
     pub serial: u32,
 }
 
+/// A name for devices this tool knows. Others are shown by their numbers.
+fn known_name(vendor_id: u32, product_id: u32) -> String {
+    if vendor_id == BECKHOFF_VENDOR_ID && product_id == BK1120_PRODUCT_CODE {
+        "BK1120".to_string()
+    } else {
+        "EtherCAT device".to_string()
+    }
+}
+
 impl DeviceInfo {
     fn describe(&self) -> String {
         format!(
-            "{} at address {:#06x}: vendor {:#x}{}, product {:#010x}, revision {:#x}, serial {}",
+            "{} at position {}: vendor {:#x}{}, product {:#010x}, revision {:#x}, serial {}",
             self.name,
-            self.address,
+            self.position,
             self.vendor_id,
             if self.vendor_id == BECKHOFF_VENDOR_ID { " (Beckhoff)" } else { "" },
             self.product_id,
@@ -107,6 +117,84 @@ pub fn format_bits(bytes: &[u8]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" | ")
+}
+
+/// One frame in words, for --trace: who sent it, and each EtherCAT command in it.
+pub fn describe_frame(frame: &[u8]) -> String {
+    if frame.len() < 16 {
+        return format!("short frame, {} bytes", frame.len());
+    }
+    let source = frame[6..12].iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(":");
+    let mut text = format!("from {} {} bytes", source, frame.len());
+    if frame[12..14] != ETHERCAT_ETHERTYPE {
+        text.push_str(&format!(", not EtherCAT (type {:02x}{:02x})", frame[12], frame[13]));
+        return text;
+    }
+    let mut at = 16;
+    // Each command: type, index, address 4 bytes, length and flags 2, interrupt 2, data, counter 2
+    while let Some(header) = frame.get(at..at + 10) {
+        let command = match header[0] {
+            0 => "NOP".to_string(),
+            1 => "APRD".to_string(),
+            2 => "APWR".to_string(),
+            3 => "APRW".to_string(),
+            4 => "FPRD".to_string(),
+            5 => "FPWR".to_string(),
+            6 => "FPRW".to_string(),
+            7 => "BRD".to_string(),
+            8 => "BWR".to_string(),
+            9 => "BRW".to_string(),
+            10 => "LRD".to_string(),
+            11 => "LWR".to_string(),
+            12 => "LRW".to_string(),
+            13 => "ARMW".to_string(),
+            14 => "FRMW".to_string(),
+            other => format!("command {}", other),
+        };
+        let position = u16::from_le_bytes([header[2], header[3]]);
+        let register = u16::from_le_bytes([header[4], header[5]]);
+        let flags = u16::from_le_bytes([header[6], header[7]]);
+        let length = (flags & 0x07FF) as usize;
+        let Some(data) = frame.get(at + 10..at + 10 + length) else {
+            text.push_str(&format!(" | {} cut short", command));
+            break;
+        };
+        let Some(counter) = frame.get(at + 10 + length..at + 12 + length) else {
+            text.push_str(&format!(" | {} cut short", command));
+            break;
+        };
+        let shown: Vec<String> = data.iter().take(8).map(|b| format!("{:02x}", b)).collect();
+        text.push_str(&format!(
+            " | {} device {:#06x} register {:#06x} data [{}{}] counter {}",
+            command,
+            position,
+            register,
+            shown.join(" "),
+            if length > 8 { " ..." } else { "" },
+            u16::from_le_bytes([counter[0], counter[1]])
+        ));
+        if flags & 0x8000 == 0 {
+            break;
+        }
+        at += 12 + length;
+    }
+    text
+}
+
+/// Prints every frame as it passes, around another link.
+pub struct TracingLink(pub Box<dyn RawLink>);
+impl RawLink for TracingLink {
+    fn send(&mut self, frame: &[u8]) -> Result<(), String> {
+        println!("  sent {}", describe_frame(frame));
+        self.0.send(frame)
+    }
+    fn receive(&mut self) -> Result<Option<Vec<u8>>, String> {
+        let received = self.0.receive()?;
+        if let Some(frame) = &received {
+            println!("  got  {}", describe_frame(frame));
+        }
+        Ok(received)
+    }
 }
 
 /// Move frames between the master and the link until told to stop.
@@ -141,6 +229,200 @@ fn run_link(mut link: Box<dyn RawLink>, mut tx: PduTx<'static>, mut rx: PduRx<'s
         }
         std::thread::yield_now();
     }
+}
+
+const NO_REPLY: &str = "No reply on this adapter. Check it's the right adapter, that the cable goes to the coupler's IN port, and that the coupler has power.";
+
+/// Talks to the first device with plain register reads, without the master. This shows what a
+/// device itself reports, which is what's needed when the master can't get it going.
+pub struct RegisterReader {
+    link: Box<dyn RawLink>,
+    index: u8,
+    /// Which device on the bus, counting from 0 at the master
+    position: u16,
+}
+
+const APRD: u8 = 1;
+const APWR: u8 = 2;
+const BRD: u8 = 7;
+const LRD: u8 = 10;
+
+impl RegisterReader {
+    pub fn new(link: Box<dyn RawLink>) -> Self {
+        Self { link, index: 0, position: 0 }
+    }
+
+    pub fn into_link(self) -> Box<dyn RawLink> {
+        self.link
+    }
+
+    /// How many devices are on the bus: each adds one to the counter as the frame passes.
+    pub fn count_devices(&mut self) -> Result<u16, String> {
+        Ok(self.exchange(BRD, 0, &[0])?.1)
+    }
+
+    /// True if the device acknowledged the write.
+    pub fn write(&mut self, register: u16, data: &[u8]) -> Result<bool, String> {
+        Ok(self.exchange(APWR, register, data)?.1 > 0)
+    }
+
+    /// Mapped process data, or None if nothing acknowledged the read.
+    pub fn read_logical(&mut self, address: u16, length: usize) -> Result<Option<Vec<u8>>, String> {
+        let saved = std::mem::replace(&mut self.position, 0);
+        let result = self.exchange(LRD, address, &vec![0; length]);
+        self.position = saved;
+        let (data, counter) = result?;
+        Ok((counter > 0).then_some(data))
+    }
+
+    /// The identity from a device's EEPROM.
+    pub fn identity(&mut self, position: u16) -> Result<DeviceInfo, String> {
+        self.position = position;
+        let result = (|| {
+            let vendor_id = u32::from_le_bytes(self.read_eeprom(0x08)?);
+            let product_id = u32::from_le_bytes(self.read_eeprom(0x0A)?);
+            let revision = u32::from_le_bytes(self.read_eeprom(0x0C)?);
+            let serial = u32::from_le_bytes(self.read_eeprom(0x0E)?);
+            Ok(DeviceInfo { position, name: known_name(vendor_id, product_id), vendor_id, product_id, revision, serial })
+        })();
+        self.position = 0;
+        result
+    }
+
+    fn exchange(&mut self, command: u8, register: u16, payload: &[u8]) -> Result<(Vec<u8>, u16), String> {
+        self.index = self.index.wrapping_add(1);
+        let mut frame = vec![0xFF; 6];
+        frame.extend_from_slice(&[0x10; 6]);
+        frame.extend_from_slice(&ETHERCAT_ETHERTYPE);
+        let pdu_length = (10 + payload.len() + 2) as u16;
+        frame.extend_from_slice(&(pdu_length | 0x1000).to_le_bytes());
+        // By position, the address counts down: the device that sees zero is the one addressed
+        frame.extend_from_slice(&[command, self.index]);
+        frame.extend_from_slice(&0u16.wrapping_sub(self.position).to_le_bytes());
+        frame.extend_from_slice(&register.to_le_bytes());
+        frame.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(&[0, 0]);
+        self.link.send(&frame)?;
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < deadline {
+            let Some(reply) = self.link.receive()? else {
+                std::thread::yield_now();
+                continue;
+            };
+            let ours = reply.get(12..14) == Some(&ETHERCAT_ETHERTYPE[..])
+                && reply.get(6).map_or(false, |first| first & 0x02 != 0)
+                && reply.get(17) == Some(&self.index);
+            if !ours {
+                continue;
+            }
+            let data = reply.get(26..26 + payload.len()).ok_or("reply cut short")?.to_vec();
+            let counter = reply.get(26 + payload.len()..28 + payload.len()).ok_or("reply cut short")?;
+            return Ok((data, u16::from_le_bytes([counter[0], counter[1]])));
+        }
+        Err(NO_REPLY.to_string())
+    }
+
+    /// A register's bytes, or None if the device didn't acknowledge the read.
+    pub fn read(&mut self, register: u16, length: usize) -> Result<Option<Vec<u8>>, String> {
+        let (data, counter) = self.exchange(APRD, register, &vec![0; length])?;
+        Ok((counter > 0).then_some(data))
+    }
+
+    /// Two words from the EEPROM. Writing the address is how an EEPROM read is asked for.
+    pub fn read_eeprom(&mut self, word: u16) -> Result<[u8; 4], String> {
+        let mut request = vec![0x00, 0x01];
+        request.extend_from_slice(&word.to_le_bytes());
+        request.extend_from_slice(&[0, 0]);
+        let (_, counter) = self.exchange(APWR, 0x0502, &request)?;
+        if counter == 0 {
+            return Err(format!("EEPROM read of word {:#06x} wasn't accepted", word));
+        }
+        let deadline = Instant::now() + Duration::from_millis(100);
+        loop {
+            let status = self.read(0x0502, 2)?.ok_or("EEPROM status wasn't readable")?;
+            if status[1] & 0x80 == 0 {
+                break;
+            }
+            if Instant::now() > deadline {
+                return Err("EEPROM stayed busy".to_string());
+            }
+        }
+        let data = self.read(0x0508, 4)?.ok_or("EEPROM data wasn't readable")?;
+        Ok([data[0], data[1], data[2], data[3]])
+    }
+}
+
+/// What a device's status code means, for the common ones during start-up.
+pub fn al_status_meaning(code: u16) -> &'static str {
+    match code {
+        0x0000 => "no error",
+        0x0001 => "unspecified error",
+        0x0011 => "invalid requested state change",
+        0x0012 => "unknown requested state",
+        0x0013 => "bootstrap not supported",
+        0x0014 => "no valid firmware",
+        0x0015 => "invalid mailbox configuration (bootstrap)",
+        0x0016 => "invalid mailbox configuration (PRE-OP)",
+        0x0017 => "invalid sync manager configuration",
+        0x0018 => "no valid inputs available",
+        0x0019 => "no valid outputs",
+        0x001A => "synchronization error",
+        0x001B => "sync manager watchdog",
+        0x001D => "invalid output configuration",
+        0x001E => "invalid input configuration",
+        0x001F => "invalid watchdog configuration",
+        0x0020 => "device needs a cold start",
+        0x0021 => "device needs to be in INIT",
+        0x0022 => "device needs to be in PRE-OP",
+        0x0023 => "device needs to be in SAFE-OP",
+        _ => "not a code this tool knows",
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
+}
+
+/// Print what the first device reports about itself. Changes nothing it does.
+pub fn inspect(link: Box<dyn RawLink>) -> Result<(), String> {
+    let mut device = RegisterReader::new(link);
+    let shown = |value: Option<Vec<u8>>| value.map_or("not acknowledged".to_string(), |bytes| hex(&bytes));
+
+    println!("Device type, revision, build: {}", shown(device.read(0x0000, 4)?));
+    if let Some(sizes) = device.read(0x0004, 4)? {
+        println!("FMMUs: {}, sync managers: {}, RAM: {} KB", sizes[0], sizes[1], sizes[2]);
+    }
+    println!("Station address: {}", shown(device.read(0x0010, 2)?));
+    println!("Link status: {}", shown(device.read(0x0110, 2)?));
+    println!("Requested state: {}", shown(device.read(0x0120, 2)?));
+    if let Some(status) = device.read(0x0130, 2)? {
+        let state = match status[0] & 0x0F {
+            1 => "INIT",
+            2 => "PRE-OP",
+            3 => "BOOT",
+            4 => "SAFE-OP",
+            8 => "OP",
+            _ => "unknown",
+        };
+        println!("State: {}{}", state, if status[0] & 0x10 != 0 { ", with an error flagged" } else { "" });
+    }
+    if let Some(code) = device.read(0x0134, 2)? {
+        let code = u16::from_le_bytes([code[0], code[1]]);
+        println!("Status code: {:#06x}: {}", code, al_status_meaning(code));
+    }
+    println!("Sync managers (start, length, control, status, activate, PDI):");
+    for manager in 0..4u16 {
+        println!("  SM{}: {}", manager, shown(device.read(0x0800 + manager * 8, 8)?));
+    }
+    println!("EEPROM:");
+    for word in (0..0x48u16).step_by(2) {
+        let data = device.read_eeprom(word)?;
+        println!("  {:#06x}: {}", word, hex(&data));
+    }
+    Ok(())
 }
 
 struct Session {
@@ -192,29 +474,30 @@ fn default_timeouts() -> Timeouts {
     Timeouts { wait_loop_delay: Duration::ZERO, eeprom: Duration::from_millis(50), ..Timeouts::default() }
 }
 
-/// Find the devices on the link. This reads their identity and changes nothing they do.
-pub async fn scan(link: Box<dyn RawLink>, timeouts: Timeouts) -> Result<Vec<DeviceInfo>, String> {
-    let session = Session::start(link, timeouts)?;
-    let group = session
-        .main_device
-        .init_single_group::<MAX_SUBDEVICES, PDI_LEN>(ethercat_now)
-        .await
-        .map_err(|e| session.explain("Looking for devices", e))?;
+/// Find the devices on the link. This only reads: it doesn't reset them or change their state.
+pub fn scan(link: Box<dyn RawLink>) -> Result<Vec<DeviceInfo>, String> {
+    let mut reader = RegisterReader::new(link);
+    let count = reader.count_devices()?;
+    (0..count).map(|position| reader.identity(position)).collect()
+}
 
-    Ok(group
-        .iter(session.main_device)
-        .map(|device| {
-            let identity = device.identity();
-            DeviceInfo {
-                address: device.configured_address(),
-                name: device.name().to_string(),
-                vendor_id: identity.vendor_id,
-                product_id: identity.product_id,
-                revision: identity.revision,
-                serial: identity.serial,
-            }
-        })
-        .collect())
+/// Watch inputs, using whichever start-up the device on the bus needs.
+pub async fn watch(link: Box<dyn RawLink>, seconds: u64) -> Result<(), String> {
+    let mut reader = RegisterReader::new(link);
+    let count = reader.count_devices()?;
+    if count == 0 {
+        return Err("No EtherCAT devices answered on this adapter.".to_string());
+    }
+    let first = reader.identity(0)?;
+    let is_bk1120 = first.vendor_id == BECKHOFF_VENDOR_ID && first.product_id == BK1120_PRODUCT_CODE;
+    let link = reader.into_link();
+    if is_bk1120 {
+        if count > 1 {
+            return Err(format!("Found {} devices. Watching a BK1120 only works when it's the only one on the bus so far.", count));
+        }
+        return ethercat_coupler::run_watch(link, seconds);
+    }
+    watch_inputs(link, default_timeouts(), seconds).await
 }
 
 /// Bring the devices up and print their inputs whenever they change.
@@ -462,11 +745,15 @@ fn print_adapters(adapters: &[Adapter]) {
     }
 }
 
-const USAGE: &str = "Usage:
+const USAGE: &str = "Add --trace to scan or watch to print every frame.
+Usage:
   printer-host --ethercat list              Show network adapters
   printer-host --ethercat scan ADAPTER      Find devices. ADAPTER is a number from the list
+  printer-host --ethercat inspect ADAPTER   Show what the first device reports about itself
+  printer-host --ethercat layout ADAPTER    Show a BK1120's process data. Drives nothing
   printer-host --ethercat watch ADAPTER [SECONDS]
-                                            Watch inputs. Refuses if a device has outputs";
+                                            Watch inputs. Never drives an output, and stops if a
+                                            device has any beyond a coupler's control word";
 
 /// The command line for this check. Returns the exit code: 0 worked, 1 didn't, 2 couldn't try.
 pub async fn run_cli(args: &[String]) -> i32 {
@@ -484,7 +771,7 @@ pub async fn run_cli(args: &[String]) -> i32 {
             }
             Err(code) => code,
         },
-        Some(action @ ("scan" | "watch")) => {
+        Some(action @ ("scan" | "watch" | "inspect" | "layout")) => {
             let Some(wanted) = args.get(1) else {
                 eprintln!("{}", USAGE);
                 return 2;
@@ -503,17 +790,28 @@ pub async fn run_cli(args: &[String]) -> i32 {
             };
             println!("Using {}", if adapter.description.is_empty() { &adapter.name } else { &adapter.description });
             let link = match open_link(adapter) {
+                Ok(link) if args.iter().any(|a| a == "--trace") => Box::new(TracingLink(link)) as Box<dyn RawLink>,
                 Ok(link) => link,
                 Err(e) => {
                     eprintln!("{}", e);
                     return 2;
                 }
             };
+            if action == "inspect" || action == "layout" {
+                let result = if action == "inspect" { inspect(link) } else { ethercat_coupler::run_layout(link) };
+                return match result {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        1
+                    }
+                };
+            }
             let result = if action == "scan" {
-                scan(link, default_timeouts()).await.map(|devices| report_scan(&devices))
+                scan(link).map(|devices| report_scan(&devices))
             } else {
                 let seconds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(30);
-                watch_inputs(link, default_timeouts(), seconds).await.map(|_| 0)
+                watch(link, seconds).await.map(|_| 0)
             };
             match result {
                 Ok(code) => code,
@@ -532,7 +830,7 @@ pub async fn run_cli(args: &[String]) -> i32 {
 
 fn report_scan(devices: &[DeviceInfo]) -> i32 {
     if devices.is_empty() {
-        eprintln!("The adapter works, but no EtherCAT devices answered. Check the cable goes to the coupler's IN port.");
+        eprintln!("Frames came back, but no EtherCAT device counted them. Check the cable goes to the coupler's IN port.");
         return 1;
     }
     println!("Found {} device(s):", devices.len());
@@ -590,10 +888,33 @@ mod tests {
 
     #[test]
     fn a_coupler_with_a_kbus_is_recognised() {
-        let device = |vendor, name: &str| DeviceInfo { address: 0x1000, name: name.to_string(), vendor_id: vendor, product_id: 0, revision: 0, serial: 0 };
+        let device = |vendor, name: &str| DeviceInfo { position: 0, name: name.to_string(), vendor_id: vendor, product_id: 0, revision: 0, serial: 0 };
         assert!(device(2, "BK1120").has_kbus());
         assert!(!device(2, "EK1100").has_kbus());
         assert!(!device(9, "BK1120").has_kbus());
+    }
+
+    #[test]
+    fn frames_are_described_in_words() {
+        let mut frame = vec![0u8; 14];
+        frame[6..12].copy_from_slice(&[0x12, 0x10, 0x10, 0x10, 0x10, 0x10]);
+        frame[12..14].copy_from_slice(&ETHERCAT_ETHERTYPE);
+        frame.extend_from_slice(&[0, 0x10]); // EtherCAT header
+        frame.extend_from_slice(&[7, 1, 0, 0, 0x00, 0x00, 1, 0, 0, 0, 0x11, 1, 0]); // BRD, 1 byte, counter 1
+        let text = describe_frame(&frame);
+        assert!(text.contains("from 12:10:10:10:10:10"), "{}", text);
+        assert!(text.contains("BRD device 0x0000 register 0x0000 data [11] counter 1"), "{}", text);
+
+        frame[12] = 0x08;
+        frame[13] = 0x00;
+        assert!(describe_frame(&frame).contains("not EtherCAT"));
+        assert!(describe_frame(&[1, 2, 3]).contains("short frame"));
+
+        // A frame that claims more data than it has must not panic
+        let mut cut = vec![0u8; 14];
+        cut[12..14].copy_from_slice(&ETHERCAT_ETHERTYPE);
+        cut.extend_from_slice(&[0, 0x10, 7, 1, 0, 0, 0, 0, 0xFF, 0x07, 0, 0, 1]);
+        assert!(describe_frame(&cut).contains("cut short"));
     }
 
     /// Nothing on the wire: frames go out and nothing ever comes back.
@@ -632,34 +953,47 @@ mod tests {
         }
     }
 
-    fn quick() -> Timeouts {
-        Timeouts { pdu: Duration::from_millis(20), ..default_timeouts() }
-    }
-
-    #[tokio::test]
-    async fn silence_on_the_wire_gets_advice_instead_of_a_hang() {
-        let error = scan(Box::new(SilentLink), quick()).await.unwrap_err();
-        assert!(error.contains("no reply"), "{}", error);
+    #[test]
+    fn silence_on_the_wire_gets_advice_instead_of_a_hang() {
+        let error = scan(Box::new(SilentLink)).unwrap_err();
+        assert!(error.contains("No reply"), "{}", error);
         assert!(error.contains("IN port"), "{}", error);
     }
 
-    #[tokio::test]
-    async fn a_bus_with_no_devices_is_reported_as_that() {
-        let devices = scan(Box::new(LoopbackLink(Default::default())), quick()).await.unwrap();
+    #[test]
+    fn a_bus_with_no_devices_is_reported_as_that() {
+        let devices = scan(Box::new(LoopbackLink(Default::default()))).unwrap();
         assert!(devices.is_empty());
         assert_eq!(report_scan(&devices), 1);
     }
 
     #[tokio::test]
     async fn watching_a_bus_with_no_devices_stops_cleanly() {
-        let error = watch_inputs(Box::new(LoopbackLink(Default::default())), quick(), 1).await.unwrap_err();
+        let error = watch(Box::new(LoopbackLink(Default::default())), 1).await.unwrap_err();
         assert!(error.contains("No EtherCAT devices"), "{}", error);
     }
 
-    #[tokio::test]
-    async fn a_failing_adapter_is_named_as_the_cause() {
-        let error = scan(Box::new(BrokenLink), quick()).await.unwrap_err();
+    #[test]
+    fn a_failing_adapter_is_named_as_the_cause() {
+        let error = scan(Box::new(BrokenLink)).unwrap_err();
         assert!(error.contains("the cable fell out"), "{}", error);
+    }
+
+    #[test]
+    fn a_bk1120_is_identified_from_its_eeprom() {
+        let devices = scan(Box::new(ethercat_coupler::fake::bk1120(4, 0))).unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "BK1120");
+        assert_eq!(devices[0].product_id, BK1120_PRODUCT_CODE);
+        assert!(devices[0].has_kbus());
+    }
+
+    #[test]
+    fn scanning_never_asks_a_device_to_change_state() {
+        let coupler = ethercat_coupler::fake::bk1120(4, 0);
+        let seen = coupler.seen.clone();
+        scan(Box::new(coupler)).unwrap();
+        assert!(seen.lock().unwrap().states_requested.is_empty());
     }
 
     /// An office network: plenty of traffic, none of it EtherCAT, including frames shaped to look
@@ -679,9 +1013,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn other_traffic_on_the_adapter_is_not_taken_for_a_reply() {
-        let error = scan(Box::new(BusyNetwork(Default::default())), quick()).await.unwrap_err();
-        assert!(error.contains("no reply"), "{}", error);
+    #[test]
+    fn other_traffic_on_the_adapter_is_not_taken_for_a_reply() {
+        let error = scan(Box::new(BusyNetwork(Default::default()))).unwrap_err();
+        assert!(error.contains("No reply"), "{}", error);
     }
 }

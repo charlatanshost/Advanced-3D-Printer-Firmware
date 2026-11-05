@@ -19,6 +19,7 @@ pub mod protocols;
 pub mod resonance_cancellation;
 pub mod runtime_config;
 pub mod sensor_fusion;
+pub mod ethercat_coupler;
 pub mod ethercat_probe;
 pub mod printer_settings;
 pub mod simulator;
