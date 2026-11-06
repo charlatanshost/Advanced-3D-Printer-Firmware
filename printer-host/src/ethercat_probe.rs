@@ -65,6 +65,14 @@ pub fn pick_adapter<'a>(adapters: &'a [Adapter], wanted: &str) -> Result<&'a Ada
     }
 }
 
+impl Adapter {
+    /// False for adapters EtherCAT can't run on: Wi-Fi and Windows' virtual ones.
+    pub fn could_be_ethercat(&self) -> bool {
+        let description = self.description.to_lowercase();
+        !["wan miniport", "wi-fi", "wifi", "wireless", "virtual adapter", "bluetooth", "loopback"].iter().any(|word| description.contains(word))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceInfo {
     pub position: u16,
@@ -85,7 +93,11 @@ fn known_name(vendor_id: u32, product_id: u32) -> String {
 }
 
 impl DeviceInfo {
-    fn describe(&self) -> String {
+    pub fn is_bk1120(&self) -> bool {
+        self.vendor_id == BECKHOFF_VENDOR_ID && self.product_id == BK1120_PRODUCT_CODE
+    }
+
+    pub fn describe(&self) -> String {
         format!(
             "{} at position {}: vendor {:#x}{}, product {:#010x}, revision {:#x}, serial {}",
             self.name,
@@ -476,9 +488,15 @@ fn default_timeouts() -> Timeouts {
 
 /// Find the devices on the link. This only reads: it doesn't reset them or change their state.
 pub fn scan(link: Box<dyn RawLink>) -> Result<Vec<DeviceInfo>, String> {
+    scan_keeping_link(link).map(|(devices, _)| devices)
+}
+
+/// scan, handing the link back for whatever comes next.
+pub fn scan_keeping_link(link: Box<dyn RawLink>) -> Result<(Vec<DeviceInfo>, Box<dyn RawLink>), String> {
     let mut reader = RegisterReader::new(link);
     let count = reader.count_devices()?;
-    (0..count).map(|position| reader.identity(position)).collect()
+    let devices = (0..count).map(|position| reader.identity(position)).collect::<Result<Vec<_>, _>>()?;
+    Ok((devices, reader.into_link()))
 }
 
 /// Watch inputs, using whichever start-up the device on the bus needs.
@@ -489,7 +507,7 @@ pub async fn watch(link: Box<dyn RawLink>, seconds: u64) -> Result<(), String> {
         return Err("No EtherCAT devices answered on this adapter.".to_string());
     }
     let first = reader.identity(0)?;
-    let is_bk1120 = first.vendor_id == BECKHOFF_VENDOR_ID && first.product_id == BK1120_PRODUCT_CODE;
+    let is_bk1120 = first.is_bk1120();
     let link = reader.into_link();
     if is_bk1120 {
         if count > 1 {
@@ -714,27 +732,27 @@ mod npcap {
 }
 
 #[cfg(windows)]
-fn list_adapters() -> Result<Vec<Adapter>, String> {
+pub fn list_adapters() -> Result<Vec<Adapter>, String> {
     npcap::adapters()
 }
 
 #[cfg(windows)]
-fn open_link(adapter: &Adapter) -> Result<Box<dyn RawLink>, String> {
+pub fn open_link(adapter: &Adapter) -> Result<Box<dyn RawLink>, String> {
     Ok(Box::new(npcap::NpcapLink::open(&adapter.name)?))
 }
 
 #[cfg(not(windows))]
-fn list_adapters() -> Result<Vec<Adapter>, String> {
+pub fn list_adapters() -> Result<Vec<Adapter>, String> {
     Err("This check only supports Windows so far.".to_string())
 }
 
 #[cfg(not(windows))]
-fn open_link(_adapter: &Adapter) -> Result<Box<dyn RawLink>, String> {
+pub fn open_link(_adapter: &Adapter) -> Result<Box<dyn RawLink>, String> {
     Err("This check only supports Windows so far.".to_string())
 }
 
 fn print_adapters(adapters: &[Adapter]) {
-    println!("Network adapters:");
+    println!("Network adapters. These numbers can change between runs, so check the \"Using\" line or give the full name in quotes:");
     for (i, adapter) in adapters.iter().enumerate() {
         println!(
             "  {}  {}{}",
@@ -755,10 +773,14 @@ Usage:
                                             Watch inputs. Never drives an output, and stops if a
                                             device has any beyond a coupler's control word";
 
-/// The command line for this check. Returns the exit code: 0 worked, 1 didn't, 2 couldn't try.
+/// Where the lock in claim_bus lives. The same place for every copy of the program.
+pub fn bus_lock_file() -> std::path::PathBuf {
+    std::env::temp_dir().join("printer-host-ethercat.lock")
+}
+
 /// Two copies on one bus wreck each other: each one's reset stops the other's run. The system
 /// lets go of this lock when the program ends, however it ends.
-fn claim_bus(lock_file: &std::path::Path) -> Result<std::fs::File, String> {
+pub fn claim_bus(lock_file: &std::path::Path) -> Result<std::fs::File, String> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -774,6 +796,7 @@ fn claim_bus(lock_file: &std::path::Path) -> Result<std::fs::File, String> {
     }
 }
 
+/// The command line for this check. Returns the exit code: 0 worked, 1 didn't, 2 couldn't try.
 pub async fn run_cli(args: &[String]) -> i32 {
     let adapters = |action: &str| -> Result<Vec<Adapter>, i32> {
         list_adapters().map_err(|e| {
@@ -794,7 +817,7 @@ pub async fn run_cli(args: &[String]) -> i32 {
                 eprintln!("{}", USAGE);
                 return 2;
             };
-            let _bus = match claim_bus(&std::env::temp_dir().join("printer-host-ethercat.lock")) {
+            let _bus = match claim_bus(&bus_lock_file()) {
                 Ok(bus) => bus,
                 Err(e) => {
                     eprintln!("{}", e);
@@ -996,6 +1019,18 @@ mod tests {
     async fn watching_a_bus_with_no_devices_stops_cleanly() {
         let error = watch(Box::new(LoopbackLink(Default::default())), 1).await.unwrap_err();
         assert!(error.contains("No EtherCAT devices"), "{}", error);
+    }
+
+    #[test]
+    fn only_adapters_that_could_carry_ethercat_are_offered() {
+        let could_be = |description: &str| Adapter { name: String::new(), description: description.to_string(), connected: true }.could_be_ethercat();
+        assert!(could_be("Intel(R) Ethernet Controller X710 for 10GBASE-T"));
+        assert!(could_be("Intel(R) Ethernet Controller X710 for 10GBASE-T #2"));
+        // Unnamed adapters stay on the list: better offered than hidden
+        assert!(could_be(""));
+        for other in ["WAN Miniport (IPv6)", "WAN Miniport (Network Monitor)", "Intel(R) Wi-Fi 6E AX210 160MHz", "Microsoft Wi-Fi Direct Virtual Adapter #2"] {
+            assert!(!could_be(other), "{}", other);
+        }
     }
 
     #[test]

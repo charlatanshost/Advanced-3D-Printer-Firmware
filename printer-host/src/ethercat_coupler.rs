@@ -229,37 +229,66 @@ impl Coupler {
     }
 }
 
-/// One update in words: the coupler's status word, then each module's bits in order.
-pub fn describe_inputs(layout: &[DataEntry], inputs: &[u8]) -> String {
+/// Input bytes sorted out: the coupler's status word, and each module's bits.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct InputsView {
+    pub status: Option<u32>,
+    pub modules: Vec<Vec<bool>>,
+}
+
+/// Sort input bytes by the layout. Bytes that are missing read as off, so an empty slice gives the
+/// shape of the modules.
+pub fn read_inputs(layout: &[DataEntry], inputs: &[u8]) -> InputsView {
     let bit = |at: usize| inputs.get(at / 8).map_or(false, |byte| byte >> (at % 8) & 1 == 1);
-    let mut parts: Vec<String> = Vec::new();
+    let mut view = InputsView::default();
     let mut current_module: Option<u16> = None;
-    let mut module_number = 0;
     let mut at = 0usize;
     for entry in layout {
         let bits = entry.bits as usize;
         if entry.object == OBJECT_DEVICE_STATUS {
-            let value = (0..bits).fold(0u32, |word, i| word | (u32::from(bit(at + i)) << i));
-            parts.push(format!("status {:#06x}", value));
+            view.status = Some((0..bits).fold(0u32, |word, i| word | (u32::from(bit(at + i)) << i)));
             current_module = None;
         } else if entry.object != 0 {
             if current_module != Some(entry.object) {
                 current_module = Some(entry.object);
-                module_number += 1;
-                parts.push(format!("module {}: ", module_number));
+                view.modules.push(Vec::new());
             }
-            let text: String = (0..bits).map(|i| if bit(at + i) { '1' } else { '0' }).collect();
-            if let Some(last) = parts.last_mut() {
-                last.push_str(&text);
+            if let Some(module) = view.modules.last_mut() {
+                module.extend((0..bits).map(|i| bit(at + i)));
             }
         }
         at += bits;
     }
-    parts.join("  ")
+    view
+}
+
+/// Output bits other than the coupler's own control word.
+pub fn other_output_bits(outputs: &[DataEntry]) -> usize {
+    outputs.iter().filter(|entry| entry.object != OBJECT_DEVICE_CONTROL && entry.object != 0).map(|entry| entry.bits as usize).sum()
+}
+
+/// One update in words: the coupler's status word, then each module's bits in order.
+pub fn describe_inputs(layout: &[DataEntry], inputs: &[u8]) -> String {
+    let view = read_inputs(layout, inputs);
+    let status = view.status.map(|word| format!("status {:#06x}", word));
+    let modules = view.modules.iter().enumerate().map(|(index, bits)| {
+        let text: String = bits.iter().map(|on| if *on { '1' } else { '0' }).collect();
+        format!("module {}: {}", index + 1, text)
+    });
+    status.into_iter().chain(modules).collect::<Vec<_>>().join("  ")
 }
 
 /// Bring the coupler up and report its inputs as they change. `on_update` hears each change.
-pub fn watch_inputs(link: Box<dyn RawLink>, how_long: Duration, mut on_update: impl FnMut(&[DataEntry], &[u8])) -> Result<WatchResult, String> {
+pub fn watch_inputs(link: Box<dyn RawLink>, how_long: Duration, on_update: impl FnMut(&[DataEntry], &[u8])) -> Result<WatchResult, String> {
+    watch_while(link, |watched| watched < how_long, on_update)
+}
+
+/// watch_inputs for as long as `keep_going` says, given how long it has been watching.
+pub fn watch_while(
+    link: Box<dyn RawLink>,
+    mut keep_going: impl FnMut(Duration) -> bool,
+    mut on_update: impl FnMut(&[DataEntry], &[u8]),
+) -> Result<WatchResult, String> {
     let mut coupler = Coupler { device: RegisterReader::new(link), mailbox_counter: 0 };
 
     coupler.reset()?;
@@ -297,7 +326,7 @@ pub fn watch_inputs(link: Box<dyn RawLink>, how_long: Duration, mut on_update: i
     let mut updates: Vec<Vec<u8>> = Vec::new();
     let mut failure = None;
     let mut good_reads = 0u64;
-    while started.elapsed() < how_long {
+    while keep_going(started.elapsed()) {
         match coupler.device.read_logical(0, input_bytes as usize) {
             Ok(Some(inputs)) => {
                 good_reads += 1;
@@ -420,6 +449,8 @@ pub(crate) mod fake {
         pub miss_read: Option<usize>,
         pub status_code: Option<u16>,
         pub input_reads: usize,
+        /// Report a product code that isn't a BK1120
+        pub other_product: bool,
         pub seen: Arc<Mutex<Seen>>,
         replies: VecDeque<Vec<u8>>,
         mailbox_reply: Option<Vec<u8>>,
@@ -456,6 +487,7 @@ pub(crate) mod fake {
             miss_read: None,
             status_code: None,
             input_reads: 0,
+            other_product: false,
             seen: Default::default(),
             replies: VecDeque::new(),
             mailbox_reply: None,
@@ -615,6 +647,9 @@ pub(crate) mod fake {
                         0x0502 => {
                             let word = u16::from_le_bytes([data[2], data[3]]);
                             self.registers[0x0508..0x050C].copy_from_slice(&eeprom(word));
+                            if self.other_product && word == 0x0A {
+                                self.registers[0x0508] = 0x99;
+                            }
                             self.registers[0x0502..0x0504].copy_from_slice(&[0, 0]);
                             return 1;
                         }

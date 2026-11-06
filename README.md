@@ -1363,19 +1363,27 @@ It reports what happened, including collisions with the printed part and cold ex
 It checks the control logic only. The heater values are typical figures rather than measurements, and plastic, belts and vibration are not modelled, so passing does not show a real machine will behave the same way.
 ## Checking EtherCAT hardware
 
-A read-only check of real EtherCAT hardware, from the `printer-host` folder. On Windows it needs
-[Npcap](https://npcap.com) installed. The Npcap SDK isn't needed to build.
+A read-only check of real EtherCAT hardware. On Windows it needs [Npcap](https://npcap.com)
+installed. The Npcap SDK isn't needed to build.
+
+In the app, open the Fieldbus page with EtherCAT selected, choose the adapter wired to the coupler,
+and press **Find modules**, then **Watch inputs** to see each input's light live. The watch stops if
+you leave the page.
+
+From the `printer-host` folder, the same tools are on the command line. Adapter numbers can change
+between runs, so use the full name, or check the `Using` line before trusting a number:
 
 ```
 cargo run -- --ethercat list                  # show network adapters
-cargo run -- --ethercat scan 3                # find devices on adapter 3 from the list
-cargo run -- --ethercat inspect 3             # what the first device reports about itself
-cargo run -- --ethercat layout 3              # a BK1120's inputs and outputs, as it describes them
-cargo run -- --ethercat watch 3 30            # show inputs as they change, for 30 seconds
+cargo run -- --ethercat scan "ADAPTER NAME"   # find devices on that adapter
+cargo run -- --ethercat inspect "ADAPTER NAME"  # what the first device reports about itself
+cargo run -- --ethercat layout "ADAPTER NAME"   # a BK1120's inputs and outputs, as it describes them
+cargo run -- --ethercat watch "ADAPTER NAME" 30 # show inputs as they change, for 30 seconds
 ```
 
 Add `--trace` to print every frame. You choose the adapter, because these frames don't belong on an
-ordinary network. `scan` and `inspect` don't change what a device is doing.
+ordinary network. `scan` and `inspect` don't change what a device is doing. Only one run can use
+EtherCAT at a time: a second is refused, because each one's reset would stop the other.
 
 `watch` never writes outputs. On a BK1120 it stays in SAFE-OP, where outputs stay in their safe
 state, and stops if the coupler has any output other than its own control word (object 0xF200). The

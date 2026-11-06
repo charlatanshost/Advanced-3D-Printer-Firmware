@@ -1,3 +1,4 @@
+mod ui_ethercat;
 mod ui_motors;
 mod ui_printer;
 mod ui_shell;
@@ -1171,6 +1172,7 @@ struct MyApp {
     parsed_result_receiver: Option<mpsc::Receiver<(String, Option<GCodeFile>, Vec<[f64; 2]>)>>,
     is_parsing: bool,
     selected_tab: Tab,
+    ethercat_page: ui_ethercat::EthercatPage,
     nav_filter: String,
     status_panel_open: bool,
     // Rendering cache for performance
@@ -1468,6 +1470,7 @@ impl MyApp {
             plot_points,
             selected_gcode_line: None,
             selected_tab: Tab::Overview,
+            ethercat_page: Default::default(),
             nav_filter: String::new(),
             status_panel_open: true,
             show_status_panel: true,
@@ -2713,6 +2716,10 @@ impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Request repaint only at reasonable intervals instead of every frame
         ctx.request_repaint_after(std::time::Duration::from_millis(33)); // ~30 FPS
+        // A watch on real hardware only runs while its card is on screen
+        if self.selected_tab != Tab::FieldbusConfig || self.communication_mode != CommunicationMode::EtherCAT {
+            self.ethercat_page.check.stop();
+        }
         // Check for completed parsing tasks
         if self.is_parsing {
             if let Some(ref receiver) = self.parsed_result_receiver {
@@ -4983,22 +4990,14 @@ impl eframe::App for MyApp {
                         // Protocol-specific settings in scrollable area
                         match self.communication_mode {
                             CommunicationMode::EtherCAT => {
-                                ui.group(|ui| {
-                                    ui.label("🔌 EtherCAT Master Settings");
-                                    ui.label("✓ EtherCAT master initialized");
-                                    #[cfg(target_os = "linux")]
-                                    ui.label(format!("Slaves discovered: {}", if self.group.is_empty() { 0 } else { "Connected" }));
-                                    #[cfg(all(windows, feature = "windows-ethercat"))]
-                                    ui.label(format!("Slaves discovered: {}", self.group.len()));
-                                    #[cfg(all(not(target_os = "linux"), not(all(windows, feature = "windows-ethercat"))))]
-                                    ui.label("⚠ EtherCAT not available on this platform");
-                                });
+                                self.ethercat_page.show(ui);
                                 
                                 ui.separator();
                                 
                                 // EtherCAT Network Connection Management
                                 ui.group(|ui| {
-                                    ui.label("🌐 EtherCAT Network Connection");
+                                    ui.label("🌐 Simulated network: not real hardware");
+                                    ui.colored_label(ui_shell::muted(), "A list for planning only. The hardware check above is what talks to real devices.");
 
                                     // Connection status indicator
                                     ui.horizontal_wrapped(|ui| {
