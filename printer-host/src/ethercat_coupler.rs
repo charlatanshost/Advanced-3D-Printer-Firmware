@@ -104,6 +104,22 @@ impl Coupler {
         }
     }
 
+    /// What state the coupler says it's in, in words. For explaining a failure, so it can't fail.
+    fn describe_state(&mut self) -> String {
+        let status = match self.status() {
+            Ok(status) => status,
+            Err(e) => return format!("Its state couldn't be read: {}", e),
+        };
+        if status & ERROR_FLAG == 0 {
+            return format!("It reports {}, with no error.", state_name(status));
+        }
+        let code = match self.device.read(0x0134, 2) {
+            Ok(Some(code)) => format!(", status code {:#06x}", u16::from_le_bytes([code[0], code[1]])),
+            _ => ", and its status code wasn't readable".to_string(),
+        };
+        format!("It reports {} with an error{}.", state_name(status), code)
+    }
+
     /// Back to a clean INIT, clearing any error left from before.
     fn reset(&mut self) -> Result<(), String> {
         self.write_register(REG_AL_CONTROL, &[STATE_INIT | ERROR_FLAG, 0], "a reset")?;
@@ -280,16 +296,24 @@ pub fn watch_inputs(link: Box<dyn RawLink>, how_long: Duration, mut on_update: i
     let started = Instant::now();
     let mut updates: Vec<Vec<u8>> = Vec::new();
     let mut failure = None;
+    let mut good_reads = 0u64;
     while started.elapsed() < how_long {
         match coupler.device.read_logical(0, input_bytes as usize) {
             Ok(Some(inputs)) => {
+                good_reads += 1;
                 if updates.last() != Some(&inputs) {
                     on_update(&layout, &inputs);
                     updates.push(inputs);
                 }
             }
             Ok(None) => {
-                failure = Some("The coupler stopped answering input reads".to_string());
+                // Ask now: the reset below wipes the evidence
+                failure = Some(format!(
+                    "The coupler stopped answering input reads after {:.2} s and {} good reads. {}",
+                    started.elapsed().as_secs_f64(),
+                    good_reads,
+                    coupler.describe_state()
+                ));
                 break;
             }
             Err(e) => {
@@ -390,6 +414,12 @@ pub(crate) mod fake {
         pub input_now: u8,
         pub input_byte: usize,
         pub refuse_state: Option<u8>,
+        /// After this many input reads, drop to PRE-OP with an error, as a faulting coupler does
+        pub fall_after_reads: Option<usize>,
+        /// Don't acknowledge this input read, but carry on
+        pub miss_read: Option<usize>,
+        pub status_code: Option<u16>,
+        pub input_reads: usize,
         pub seen: Arc<Mutex<Seen>>,
         replies: VecDeque<Vec<u8>>,
         mailbox_reply: Option<Vec<u8>>,
@@ -422,6 +452,10 @@ pub(crate) mod fake {
             input_now: 0,
             input_byte: 0,
             refuse_state: None,
+            fall_after_reads: None,
+            miss_read: None,
+            status_code: None,
+            input_reads: 0,
             seen: Default::default(),
             replies: VecDeque::new(),
             mailbox_reply: None,
@@ -528,7 +562,12 @@ pub(crate) mod fake {
                         if let Some(next) = self.input_sequence.pop_front() {
                             self.input_now = next;
                         }
-                        if self.state != STATE_OP && self.state != STATE_SAFE_OP {
+                        self.input_reads += 1;
+                        if self.fall_after_reads == Some(self.input_reads) {
+                            self.state = STATE_PRE_OP;
+                            self.error = true;
+                        }
+                        if self.state != STATE_OP && self.state != STATE_SAFE_OP || self.miss_read == Some(self.input_reads) {
                             return 0;
                         }
                         data.fill(0);
@@ -537,6 +576,10 @@ pub(crate) mod fake {
                     }
                     match register {
                         // The real coupler has no such registers, and doesn't acknowledge them
+                        0x0134 if self.status_code.is_some() => {
+                            data[..2].copy_from_slice(&self.status_code.unwrap_or(0).to_le_bytes());
+                            return 1;
+                        }
                         0x0012 | 0x0134 => return 0,
                         0x0130 => {
                             data[0] = self.state | if self.error { ERROR_FLAG } else { 0 };
@@ -678,6 +721,39 @@ mod tests {
         coupler.objects.insert((0x1600, 1), vec![4, 1, 0x00, 0x70]);
         let error = watch(coupler).unwrap_err();
         assert!(error.contains("0x7000"), "{}", error);
+    }
+
+    #[test]
+    fn a_coupler_that_drops_out_is_asked_why_before_it_gets_reset() {
+        let mut coupler = real_layout();
+        coupler.fall_after_reads = Some(4);
+        coupler.status_code = Some(0x001B);
+        let seen = coupler.seen.clone();
+
+        let error = watch(coupler).unwrap_err();
+
+        assert!(error.contains("3 good reads"), "{}", error);
+        assert!(error.contains("PRE-OP with an error"), "{}", error);
+        assert!(error.contains("0x001b"), "{}", error);
+        assert_eq!(seen.lock().unwrap().states_requested.last(), Some(&STATE_INIT), "and it's still left in INIT");
+    }
+
+    #[test]
+    fn a_missed_read_with_the_coupler_still_running_says_so() {
+        let mut coupler = real_layout();
+        coupler.miss_read = Some(2);
+        let error = watch(coupler).unwrap_err();
+        assert!(error.contains("1 good reads"), "{}", error);
+        assert!(error.contains("SAFE-OP, with no error"), "{}", error);
+    }
+
+    #[test]
+    fn an_unreadable_status_code_doesnt_hide_the_state() {
+        let mut coupler = real_layout();
+        coupler.fall_after_reads = Some(1);
+        let error = watch(coupler).unwrap_err();
+        assert!(error.contains("PRE-OP with an error"), "{}", error);
+        assert!(error.contains("status code wasn't readable"), "{}", error);
     }
 
     #[test]

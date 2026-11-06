@@ -756,6 +756,24 @@ Usage:
                                             device has any beyond a coupler's control word";
 
 /// The command line for this check. Returns the exit code: 0 worked, 1 didn't, 2 couldn't try.
+/// Two copies on one bus wreck each other: each one's reset stops the other's run. The system
+/// lets go of this lock when the program ends, however it ends.
+fn claim_bus(lock_file: &std::path::Path) -> Result<std::fs::File, String> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_file)
+        .map_err(|e| format!("Couldn't check whether EtherCAT is in use: {}", e))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            Err("Another printer-host is already using EtherCAT. Wait for it to finish, or stop it, and try again.".to_string())
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("Couldn't check whether EtherCAT is in use: {}", e)),
+    }
+}
+
 pub async fn run_cli(args: &[String]) -> i32 {
     let adapters = |action: &str| -> Result<Vec<Adapter>, i32> {
         list_adapters().map_err(|e| {
@@ -775,6 +793,13 @@ pub async fn run_cli(args: &[String]) -> i32 {
             let Some(wanted) = args.get(1) else {
                 eprintln!("{}", USAGE);
                 return 2;
+            };
+            let _bus = match claim_bus(&std::env::temp_dir().join("printer-host-ethercat.lock")) {
+                Ok(bus) => bus,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    return 2;
+                }
             };
             let found = match adapters("open an adapter") {
                 Ok(found) => found,
@@ -971,6 +996,21 @@ mod tests {
     async fn watching_a_bus_with_no_devices_stops_cleanly() {
         let error = watch(Box::new(LoopbackLink(Default::default())), 1).await.unwrap_err();
         assert!(error.contains("No EtherCAT devices"), "{}", error);
+    }
+
+    #[test]
+    fn only_one_run_can_hold_the_bus_at_a_time() {
+        let folder = std::env::temp_dir().join(format!("printer-host-bus-test-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let lock_file = folder.join("bus.lock");
+
+        let first = claim_bus(&lock_file).unwrap();
+        let error = claim_bus(&lock_file).unwrap_err();
+        assert!(error.contains("already using EtherCAT"), "{}", error);
+
+        drop(first);
+        assert!(claim_bus(&lock_file).is_ok(), "free again once the first run has gone");
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[test]
